@@ -11,6 +11,9 @@
  =============================================================================*/
 
 /* End-to-end decision tests: the walkthroughs from the project proposal. */
+#include <stdlib.h>
+#include <unistd.h>
+
 #include "engine.h"
 #include "log.h"
 #include "parser.h"
@@ -667,6 +670,47 @@ static void test_expire_log_counts_to_last_packet_not_sweep_time(void)
     engine_destroy(e);
 }
 
+/* ---- creating an engine from a rules file --------------------------------- */
+
+static void test_engine_create_from_the_shipped_config(void)
+{
+    char err[128] = "";
+    engine_t *e = engine_create("config/rules.example.conf", err, sizeof err);
+    CHECK(e != NULL);
+    if (!e) return;
+    drop_reason_t w;
+    uint32_t a = IP(10,0,1,2), b = IP(10,0,1,3), web = IP(93,184,216,34),
+             attacker = IP(10,0,2,3);
+    CHECK(send_pkt(e, mk_tcp(a, 40000, web, 443, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(attacker, 4444, b, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(attacker, 4444, b, 3389, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_NO_RULE);
+    CHECK(send_pkt(e, mk_tcp(a, 4444, b, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_BAD_SRC);                      /* the file declares `inside` */
+    engine_destroy(e);
+}
+
+static void test_engine_create_reports_bad_files(void)
+{
+    char err[128] = "";
+    CHECK(engine_create("/nonexistent/rules.conf", err, sizeof err) == NULL);
+    CHECK(strstr(err, "cannot open") != NULL);
+
+    char path[512];
+    const char *dir = getenv("TMPDIR");
+    snprintf(path, sizeof path, "%s/fw_engine_test_XXXXXX", dir && *dir ? dir : "/tmp");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd < 0) return;
+    const char *bad = "allow tcp 10.0.1.0/24 any 80\nallow bogus\n";
+    CHECK(write(fd, bad, strlen(bad)) == (ssize_t)strlen(bad));
+    close(fd);
+    err[0] = '\0';
+    CHECK(engine_create(path, err, sizeof err) == NULL);   /* refuses to start */
+    CHECK(strncmp(err, "line 2:", 7) == 0);                /* says which line */
+    unlink(path);
+}
+
 int main(void)
 {
     RUN(test_web_fetch_allowed);
@@ -702,5 +746,7 @@ int main(void)
     RUN(test_table_full_recovers_after_expiry);
     RUN(test_flow_close_log_has_duration_packets_bytes);
     RUN(test_expire_log_counts_to_last_packet_not_sweep_time);
+    RUN(test_engine_create_from_the_shipped_config);
+    RUN(test_engine_create_reports_bad_files);
     TEST_DONE();
 }

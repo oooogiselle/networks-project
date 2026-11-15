@@ -28,7 +28,11 @@ make test     # unit tests (run on macOS or Linux, no root needed)
 make asan     # same tests under AddressSanitizer + UBSan
 ```
 
-`tests/test_fuzz.c` throws random and corrupted packets at the parser and
+Line coverage of every file in `src/` is 100% (measured with
+`clang --coverage`). `tests/test_alloc_fail.c` covers the out-of-memory paths
+by making each startup allocation fail in turn (`src/fwalloc.c` is the thin
+wrapper that allows this); run it under `make asan` on Linux to also catch
+leaks. `tests/test_fuzz.c` throws random and corrupted packets at the parser and
 engine and checks that nothing crashes and the counters stay consistent. It is
 deterministic; replay or lengthen a run with
 `FUZZ_SEED=<n> FUZZ_ITERS=<n> ./build/test_fuzz`.

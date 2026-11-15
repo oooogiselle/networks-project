@@ -11,6 +11,8 @@
 
 #include "rules.h"
 
+#include "fwalloc.h"
+
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -226,7 +228,7 @@ static bool rules_push(rules_t *rs, const rule_t *r)
 {
     if (rs->n == rs->cap) {
         size_t nc = rs->cap ? rs->cap * 2 : 16;
-        rule_t *nv = realloc(rs->v, nc * sizeof *nv);
+        rule_t *nv = fw_realloc(rs->v, nc * sizeof *nv);
         if (!nv) return false;
         rs->v = nv;
         rs->cap = nc;
@@ -237,10 +239,10 @@ static bool rules_push(rules_t *rs, const rule_t *r)
 
 rules_t *rules_parse_string(const char *text, char *err, size_t errlen)
 {
-    rules_t *rs = calloc(1, sizeof *rs);
+    rules_t *rs = fw_calloc(1, sizeof *rs);
     if (!rs) return NULL;
 
-    char *copy = strdup(text);
+    char *copy = fw_strdup(text);
     if (!copy) { free(rs); return NULL; }
 
     /* Split on '\n' by hand: strtok would skip blank lines and corrupt the
@@ -285,7 +287,7 @@ rules_t *rules_load_file(const char *path, char *err, size_t errlen)
     while ((got = fread(chunk, 1, sizeof chunk, fp)) > 0) {
         if (len + got + 1 > cap) {
             cap = (len + got + 1) * 2;
-            char *nt = realloc(text, cap);
+            char *nt = fw_realloc(text, cap);
             if (!nt) { free(text); fclose(fp); return NULL; }
             text = nt;
         }
@@ -293,8 +295,12 @@ rules_t *rules_load_file(const char *path, char *err, size_t errlen)
         len += got;
     }
     fclose(fp);
-    if (!text) text = calloc(1, 1);
-    else text[len] = '\0';
+    if (!text) {                       /* empty file */
+        text = fw_calloc(1, 1);
+        if (!text) return NULL;
+    } else {
+        text[len] = '\0';
+    }
     rules_t *rs = rules_parse_string(text, err, errlen);
     free(text);
     return rs;

@@ -12,6 +12,8 @@
 
 #include "flowtable.h"
 
+#include "fwalloc.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -80,10 +82,10 @@ flowtable_t *ft_create(size_t nbuckets, size_t max_flows)
 {
     size_t n = 16;
     while (n < nbuckets) n <<= 1;
-    flowtable_t *ft = calloc(1, sizeof *ft);
+    flowtable_t *ft = fw_calloc(1, sizeof *ft);
     if (!ft) return NULL;
-    ft->buckets = calloc(n, sizeof *ft->buckets);
-    ft->pool = max_flows ? calloc(max_flows, sizeof *ft->pool) : NULL;
+    ft->buckets = fw_calloc(n, sizeof *ft->buckets);
+    ft->pool = max_flows ? fw_calloc(max_flows, sizeof *ft->pool) : NULL;
     if (!ft->buckets || (max_flows && !ft->pool)) {
         free(ft->buckets);
         free(ft->pool);

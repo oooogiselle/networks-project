@@ -180,6 +180,37 @@ static void test_timeouts_match_the_spec(void)
     CHECK(flow_timeout_ns(&i) == 30 * SEC);
 }
 
+static void test_syn_recv_retransmits_and_illegal_packets(void)
+{
+    flow_t f = new_flow();
+    tcp_track(&f, SYN, ORIG);
+    CHECK(tcp_track(&f, SYNACK, RESP) && f.tcp_state == TCPS_SYN_RECV);
+
+    /* the server's SYN-ACK is retransmitted (our ACK was lost): fine */
+    CHECK(tcp_track(&f, SYNACK, RESP));
+    CHECK(f.tcp_state == TCPS_SYN_RECV);
+    /* but nothing else from the server makes sense before the handshake ends */
+    CHECK(!tcp_track(&f, ACK, RESP));
+    CHECK(!tcp_track(&f, ACK | TCP_PSH, RESP));
+    /* the client may retransmit its SYN, but cannot send SYN-ACK or bare PSH */
+    CHECK(tcp_track(&f, SYN, ORIG));
+    CHECK(!tcp_track(&f, SYNACK, ORIG));
+    CHECK(!tcp_track(&f, TCP_PSH, ORIG));
+    CHECK(f.tcp_state == TCPS_SYN_RECV);          /* illegal packets: no change */
+    CHECK(tcp_track(&f, ACK, ORIG) && f.tcp_state == TCPS_ESTABLISHED);
+}
+
+static void test_corrupt_state_is_never_allowed(void)
+{
+    flow_t f = new_flow();
+    f.tcp_state = (tcp_state_t)99;
+    CHECK(!tcp_track(&f, ACK, ORIG));
+    CHECK(!tcp_track(&f, ACK, RESP));
+    f.tcp_state = TCPS_NONE;
+    CHECK(!tcp_track(&f, ACK, ORIG));
+    CHECK(flow_timeout_ns(&f) == 30 * SEC);       /* TCP flow with no state */
+}
+
 int main(void)
 {
     RUN(test_three_way_handshake);
@@ -196,5 +227,7 @@ int main(void)
     RUN(test_pure_syn_helper);
     RUN(test_timeouts_depend_on_state);
     RUN(test_timeouts_match_the_spec);
+    RUN(test_syn_recv_retransmits_and_illegal_packets);
+    RUN(test_corrupt_state_is_never_allowed);
     TEST_DONE();
 }

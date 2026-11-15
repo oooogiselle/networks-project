@@ -18,11 +18,11 @@ BUILD := build
 # Firewall core library: packet parser + decision engine (flow table, TCP
 # state, rules, engine, logging). tun I/O and main() link against this.
 LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
-           src/engine.c src/log.c
+           src/engine.c src/log.c src/fwalloc.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
-TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz
+TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 .PHONY: all test asan clean

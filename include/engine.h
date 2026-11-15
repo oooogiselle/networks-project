@@ -111,7 +111,7 @@ typedef struct rules rules_t;
 
 /* Load rules from a file. Returns NULL and fills err on failure. */
 engine_t *engine_create(const char *rules_path, char *err, size_t errlen);
-/* Takes ownership of rules (used by tests). */
+/* Takes ownership of rules, including when it fails (returns NULL). */
 engine_t *engine_create_with_rules(rules_t *rules);
 /* Same, with an explicit flow table capacity (all slots allocated up front). */
 engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows);

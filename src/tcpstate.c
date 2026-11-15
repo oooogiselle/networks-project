@@ -87,10 +87,9 @@ bool tcp_track(flow_t *f, uint8_t fl, bool from_orig)
 
     case TCPS_CLOSED:
     case TCPS_NONE:
+    default:                       /* corrupt state value: never allow */
         return false;
     }
-    (void)fin;
-    return false;
 }
 
 uint64_t flow_timeout_ns(const flow_t *f)
