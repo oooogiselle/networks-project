@@ -299,7 +299,11 @@ static void fuzz_all(void)
     const unsigned long iters = env_ul("FUZZ_ITERS", DEFAULT_ITERS);
     /* a big table (the default) and a tiny one that is always full */
     engine_t *big = make(POLICY, 0);
-    engine_t *small = make("allow any any any\n", SMALL_TABLE);
+    /* every address is "inside", so anything arriving on the inside interface
+     * may open a flow and the 8-slot table stays under pressure */
+    engine_t *small = make("inside 0.0.0.0/0\nallow any any any\n", SMALL_TABLE);
+    CHECK(big != NULL && small != NULL);
+    if (!big || !small) { engine_destroy(big); engine_destroy(small); return; }
 
     phase_random_bytes(big, iters);
     phase_mutated(big, iters);

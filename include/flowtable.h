@@ -48,6 +48,9 @@ typedef struct flow {
     tcp_state_t tcp_state;
     uint8_t     fin_seen;       /* bit0: originator sent FIN, bit1: responder */
     bool        seen_reply;
+    bool        close_logged;   /* the CLOSE line was written; EXPIRE is then skipped */
+    uint16_t    icmp_err_count;       /* related ICMP errors allowed in the current window */
+    uint64_t    icmp_err_window_ns;   /* start of that one-second window */
     int         rule_line;      /* rules-file line that allowed it (0 = n/a) */
     uint64_t    created_ns, last_seen_ns, expires_ns;
     uint64_t    pkts[2], bytes[2];   /* [0] originator, [1] responder */
@@ -56,16 +59,29 @@ typedef struct flow {
 
 typedef struct flowtable flowtable_t;
 
-/* nbuckets is rounded up to a power of two. max_flows bounds memory. */
+/* Upper bounds, so a bad size is refused instead of overflowing. */
+#define FT_MAX_BUCKETS ((size_t)1 << 26)
+#define FT_MAX_FLOWS   ((size_t)1 << 26)
+
+/*
+ * nbuckets is rounded up to a power of two. max_flows bounds memory. The hash
+ * is keyed with a random per-table secret, so an attacker cannot work out
+ * offline which flows share a bucket. NULL if a size is above the limits
+ * above, or on allocation / random-source failure.
+ */
 flowtable_t *ft_create(size_t nbuckets, size_t max_flows);
+/* Same with a given 16-byte hash key (tests only; NULL key = random). */
+flowtable_t *ft_create_keyed(size_t nbuckets, size_t max_flows, const uint8_t key[16]);
+/* The bucket a key hashes to (tests only). */
+size_t       ft_bucket_of(const flowtable_t *ft, const flow_key_t *k);
 void         ft_destroy(flowtable_t *ft);
 
 flow_key_t   ft_reverse(const flow_key_t *k);
 
 /*
  * Find the flow for key k (either direction). *is_reply is true if k matched
- * the reverse of the stored key. A flow past its expiry is removed and NULL
- * returned.
+ * the reverse of the stored key. A flow past its expiry is removed (the hook
+ * set with ft_set_expire_hook() sees it first) and NULL returned.
  */
 flow_t *ft_lookup(flowtable_t *ft, const flow_key_t *k, uint64_t now_ns,
                   bool *is_reply);
@@ -78,6 +94,10 @@ void    ft_remove(flowtable_t *ft, flow_t *f);
 /* Remove every flow with expires_ns <= now. cb (optional) sees each first. */
 typedef void (*ft_expire_cb)(const flow_t *f, void *ud);
 size_t ft_expire(flowtable_t *ft, uint64_t now_ns, ft_expire_cb cb, void *ud);
+
+/* Called for a flow that ft_lookup() finds already expired and removes, so a
+ * flow that times out between sweeps is still reported. */
+void   ft_set_expire_hook(flowtable_t *ft, ft_expire_cb hook, void *ud);
 
 size_t ft_count(const flowtable_t *ft);
 uint64_t ft_expired_total(const flowtable_t *ft);

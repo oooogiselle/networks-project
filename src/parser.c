@@ -93,16 +93,50 @@ static uint32_t pseudo_sum(uint32_t src, uint32_t dst, uint8_t proto,
 
 /* ---- address sanity ------------------------------------------------------ */
 
+/* Addresses that are never valid on a routed path, as source or destination. */
+static int martian(uint32_t a)
+{
+    return (a >> 24) == 0 ||         /* 0.0.0.0/8, "this network" */
+           (a >> 24) == 127 ||       /* loopback */
+           (a >> 16) == 0xa9fe;      /* 169.254.0.0/16, link-local */
+}
+
 static int bad_source(uint32_t a)
 {
-    return a == 0 ||                 /* 0.0.0.0 */
-           (a >> 24) == 127 ||       /* loopback */
+    return martian(a) ||
            (a >> 28) >= 0xe;         /* multicast 224/4, class E, broadcast */
 }
 
 static int bad_dest(uint32_t a)
 {
-    return a == 0 || (a >> 24) == 127;
+    return martian(a);
+}
+
+#define IPOPT_END  0
+#define IPOPT_NOP  1
+#define IPOPT_LSRR 131               /* loose source route  */
+#define IPOPT_SSRR 137               /* strict source route */
+
+/*
+ * Walk the IP options. The list must be well formed (every option's length
+ * fits), and source-routing options are refused: they let the sender pick
+ * the path, which a firewall must not honour or forward. Bytes after the
+ * end-of-list marker are padding and are not looked at.
+ */
+static parse_result_t check_ip_options(const uint8_t *opt, unsigned len)
+{
+    unsigned i = 0;
+    while (i < len) {
+        const uint8_t type = opt[i];
+        if (type == IPOPT_END) break;
+        if (type == IPOPT_NOP) { i++; continue; }
+        if (i + 1 >= len) return PARSE_MALFORMED;      /* no room for the length byte */
+        const unsigned olen = opt[i + 1];
+        if (olen < 2 || i + olen > len) return PARSE_MALFORMED;
+        if (type == IPOPT_LSRR || type == IPOPT_SSRR) return PARSE_UNSUPPORTED;
+        i += olen;
+    }
+    return PARSE_OK;
 }
 
 static int multicast_or_broadcast(uint32_t a)
@@ -211,12 +245,19 @@ parse_result_t parse_packet(const uint8_t *buf, size_t len, pkt_t *out)
 
     if (csum_fold(csum_partial(buf, ihl, 0)) != 0)
         return PARSE_BAD_CSUM;
+    if (buf[8] == 0)                   /* TTL 0 must never have been forwarded */
+        return PARSE_MALFORMED;
 
     uint16_t frag = rd16(buf + 6);
     if (frag & IP_FLAG_RESERVED)
         return PARSE_MALFORMED;
     if (frag & (IP_FLAG_MF | IP_OFFSET_MASK))
         return PARSE_FRAGMENT;
+
+    if (ihl > IPV4_MIN_HDR) {
+        parse_result_t opts = check_ip_options(buf + IPV4_MIN_HDR, ihl - IPV4_MIN_HDR);
+        if (opts != PARSE_OK) return opts;
+    }
 
     memset(out, 0, sizeof *out);
     out->ip_len = (uint16_t)total;

@@ -30,6 +30,8 @@
  *
  *   <addr>  := any | a.b.c.d | a.b.c.d/len
  *   <ports> := <item>[,<item>...]   with <item> := N | N-M
+ *              Only tcp and udp rules may name ports; a port on an icmp or
+ *              any rule is a syntax error (it would silently widen the rule).
  *              e.g. 80   443   1024-65535   80,443   80,8000-8100,8443
  *              (no spaces around commas; at most 8 items)
  *   out|in  := direction of the connection, as in the spec (default: out).
@@ -42,10 +44,12 @@
  *
  *   inside <a.b.c.d/len>      (repeatable, up to 8; "any" is not allowed)
  *
- * When at least one `inside` network is declared, the engine enforces
- * address anti-spoofing: packets arriving from the outside must NOT have an
+ * At least one `inside` network is REQUIRED. The engine enforces address
+ * anti-spoofing with it: packets arriving from the outside must NOT have an
  * inside source address, and packets arriving from the inside MUST have one.
- * With no `inside` line the check is off.
+ * A rules file with no `inside` line parses, but the engine refuses to start
+ * with it (engine_create* fail): without it there is no way to tell a spoofed
+ * source from a real one.
  *
  * Rules are evaluated in file order, first match wins, and if nothing
  * matches the policy is DENY. Rules are only consulted for the first packet

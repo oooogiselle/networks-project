@@ -1,8 +1,23 @@
+# ============================================================================
+# File Name:   ci.yml
+# Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+# Course:      CS60: Computer Networks
+# Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+# Date:        November 15, 2026
+#
+# Description: GitHub Actions: build and run the unit tests (plain and under
+#              ASan + UBSan) with gcc and clang on every push and pull request.
+# ============================================================================
+
 name: CI
 
 on:
   push:
   pull_request:
+
+# The workflow only needs to read the repository.
+permissions:
+  contents: read
 
 jobs:
   unit:
@@ -37,7 +52,7 @@ jobs:
   #     - name: Build
   #       run: make tunwall
   #     - name: Integration tests
-  #       run: sudo REQUIRE_INTEGRATION=1 tests/integration/run_all.sh
+  #       run: sudo LOGDIR=$PWD/build/integration REQUIRE_INTEGRATION=1 tests/integration/run_all.sh
   #     - name: Upload firewall log
   #       if: always()
   #       uses: actions/upload-artifact@v4
