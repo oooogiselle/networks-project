@@ -21,3 +21,6 @@ perf.data*
 bench/results/
 config/*.conf
 !config/rules.example.conf
+
+# Local copy of the spec text (the PDF is the tracked version)
+requirements-spec.txt
