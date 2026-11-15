@@ -35,16 +35,23 @@ make tunwall  # builds build/tunwall, the firewall program (Linux only)
 
 ```
 sudo scripts/netns.sh up                       # inside / firewall / outside namespaces
-sudo ip netns exec firewall build/tunwall -r config/rules.example.conf -d
+sudo ip netns exec firewall build/tunwall -r config/rules.example.conf
 sudo ip netns exec inside curl http://10.0.2.2/   # in another terminal
 sudo scripts/netns.sh down
 ```
 
-`tunwall -r <rules> [-i tun-in] [-o tun-out] [-d | -q]`: `-d` also logs every
-dropped packet with its reason, `-q` logs only errors. SIGUSR1 prints the
-counters; SIGINT/SIGTERM stop it and print them. It refuses to start on a rules
-syntax error (printing the line number), on a missing `inside` network, or if a
-tun device does not exist.
+`tunwall -r <rules> [-i tun-in] [-o tun-out] [-f | -q]`. By default every flow
+open/close and every dropped packet (with its reason) is logged to stderr. The
+logging is rate-limited to 1000 lines per second (bursts of 1000, shared by all
+kinds of line) so a flood or a scan cannot turn into a flood of log writes; when
+lines had to be dropped a `N log lines suppressed` line says how many, and the
+counters are never limited. `-f` logs flows only, `-q` logs only errors, `-d` is
+accepted for old scripts. SIGUSR1 prints the counters; SIGINT/SIGTERM stop it
+and print them (exit status 0). It refuses to start, naming the file, on a rules
+syntax error (with the line number), on a missing `inside` network, or if a tun
+device does not exist. Restarting `tunwall` forgets all flow state, so
+connections that were established before the restart stall (their packets are
+dropped as "no flow" and no RST is sent, as the spec requires).
 
 How the topology works: `scripts/netns.sh` creates two **persistent** tun
 devices in the firewall namespace and uses `ip rule` so that every packet
@@ -76,9 +83,9 @@ DNS, ping, blocked inbound traffic that must be silently dropped rather than
 refused, nmap SYN/ACK/FIN/NULL/Xmas scans, exact log lines, flow expiry,
 kill-the-firewall). They need root, `nmap` and `python3`. CI sets
 `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
-`SKIP_SLOW=1` to skip the 40 s expiry test. The suite fails when the firewall
-is wrong: against an allow-nothing policy 14 checks fail and against an
-allow-everything policy 13 do.
+`SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. The suite fails when the firewall
+is wrong: with the slow tests skipped, an allow-nothing policy fails 18 checks and an
+allow-everything policy fails 16.
 
 ### Benchmarks
 
@@ -92,15 +99,27 @@ sudo ip netns exec firewall build/tunwall -r /tmp/many.conf -q &
 sudo bench/run_bench.sh many-rules
 ```
 
-The script refuses to run if the topology or the running firewall does not match
-its label. First measurements (one 10 s iperf3 TCP run each, 2-CPU / 4 GB VM, so
-treat as rough): kernel forwarding 8.75 Gbit/s, `tunwall` with one rule
-1.11 Gbit/s, `tunwall` with 2000 rules 1.61 Gbit/s (not slower: rules are only
-consulted for a new flow). Average ping RTT (200 pings): kernel 0.04 ms,
-`tunwall` with 2000 rules 0.14 ms, `tunwall` with one rule 1.03 ms (a few
-outliers up to 16.7 ms dominate that average; the spec's goal is under 0.5 ms
-added). More and longer runs are needed before trusting these, and profiling
-with `perf` to explain the gap is still to do (`PERF=1` records it).
+The script refuses to run if the topology, the running firewall or its rules
+file (by rule count) does not match its label. `RUNS=5 SECS=10` repeats the
+iperf3 run and reports the median.
+
+Measured on the 2-CPU / 4 GB course VM (5 runs of 10 s each, median of the
+receiver rate; the VM is shared by iperf3's client and server and `tunwall`,
+so the spread is large):
+
+| Setup | Median | Range over 5 runs | Avg ping (200) |
+|---|---|---|---|
+| (a) kernel forwarding | 8.94 Gbit/s | 8.32 - 9.06 | 0.04 ms |
+| (b) `tunwall`, one allow-all rule | 1.74 Gbit/s | 0.52 - 1.77 | 0.11 ms |
+| (c) `tunwall`, 2000 rules | 1.08 Gbit/s | 0.77 - 1.45 | 0.77 ms (outliers to 20 ms) |
+
+`tunwall` is far above the 200 Mbit/s goal but about 5 to 8 times slower than
+kernel forwarding (it does a read and a write per packet, no GSO/GRO batching).
+The ranges of (b) and (c) overlap, so these runs do not show whether the rule
+count matters (rules are only consulted for a new flow, so it should not). The
+latency goal (under 0.5 ms added) is not demonstrated on this VM because of the
+outliers. A `perf` profile to explain the gap is still to do (`PERF=1` records
+one).
 
 On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
 
@@ -132,19 +151,36 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
      an ICMP echo flow the originator may only send echo requests and its
      peer only echo replies (`DROP_ICMP_TYPE`), and a rejected packet never
      refreshes the flow's timer.
-   - **No flow** (slow path): only a pure TCP SYN, a UDP datagram, or an ICMP
-     echo request may start a flow; the rule list is evaluated in order
-     (first match wins). No match means drop. On allow, a flow is created.
+   - **No flow** (slow path): only a pure TCP SYN (ECN bits allowed; PSH/URG
+     or any other flag is not a SYN), a UDP datagram, or an ICMP echo request
+     may start a flow. A SYN may carry data (TCP Fast Open). A flow must run
+     between an inside and an outside host: inside-to-inside,
+     outside-to-outside, or anything aimed at an inside network's broadcast
+     address is dropped as `wrong-destination` whatever the rules say. Then the
+     rule list is evaluated in order (first match wins). No match means drop.
+     On allow, a flow is created.
    The flow table holds 65,536 flows by default (`FW_DEFAULT_MAX_FLOWS`). All
    slots are allocated once at startup, so no memory is allocated per
-   connection or per packet. When it is full, flows that already timed out are
+   connection or per packet. Two caps stop one party starving the rest:
+   a single source address may hold at most 1/16 of the table (4096 flows,
+   `per-source-limit`), and flows started from the outside at most 3/4 of it
+   (`outside-quota`), so inside users keep a reserve even against a flood from
+   many spoofed sources, which a per-source cap alone cannot stop. When the
+   table is full, flows that already timed out are
    swept out first (at most once per second, so a flood cannot make every
    packet pay for a scan); if it is still full, new connections are refused and
-   existing ones keep working. The flow hash is SipHash-2-4 with a random
+   existing ones keep working. A finished TCP connection (TIME_WAIT or CLOSED)
+   is not kept alive by traffic and cannot carry data.
+   A packet that was allowed but could not be written to the other side does
+   not leave a flow behind (`write-failed`). Because the kernel takes 1 off
+   the TTL when it routes a packet into the tun device and again when it routes
+   it out, the forwarder adds 1 (with an incremental checksum update) so the
+   firewall counts as one hop, as traceroute expects. The flow hash is SipHash-2-4 with a random
    per-run key, so an attacker cannot craft flows that all share one bucket.
    Every flow close is logged once (`CLOSE` when TCP closes, `EXPIRE` when an
    idle flow times out, including one found expired by a lookup). Idle timeouts: half-open TCP 30 s, established
-   TCP 1 hour, UDP 30 s (120 s once answered), ICMP echo 30 s.
+   TCP 1 hour, half-closed (one FIN seen) 1 hour, TIME_WAIT 30 s, after a RST
+   5 s, UDP 30 s (120 s once answered), ICMP echo 30 s.
 3. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, and calls
    `engine_expire()` about once a second.
 
@@ -169,7 +205,8 @@ from the outside (exposed services).
 ## Not done yet / ideas
 
 - TCP sequence-number validation (blind RST/injection protection)
-- SYN-flood protection (SYN cookies / half-open limits)
+- Full SYN-flood protection: a per-source cap and an outside-flow quota keep
+  inside users working, but there are no SYN cookies and no half-open limit
 - Application identification (HTTP/DNS by payload) or source NAT
 - NAT from the outside namespace to the real Internet (the tests use a local web
   server in the outside namespace, which the spec allows)

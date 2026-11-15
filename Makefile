@@ -15,6 +15,11 @@ CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 
 BUILD := build
 
+# Objects and binaries are rebuilt whenever the compiler or its flags change
+# (for example after `make asan`, which leaves sanitizer-instrumented objects
+# that a plain `make tunwall` would otherwise silently link).
+FLAGS_STAMP := $(BUILD)/.flags
+
 # Firewall core library: packet parser + decision engine (flow table, TCP
 # state, rules, engine, logging). tun I/O and main() link against this.
 LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
@@ -32,7 +37,12 @@ TEST_BINS := $(TESTS:%=$(BUILD)/%)
 .PHONY: all test asan clean tunwall
 all: $(LIB)
 
-$(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
+.PHONY: FORCE
+FORCE:
+$(FLAGS_STAMP): FORCE | $(BUILD)
+	@echo "$(CC) $(CPPFLAGS) $(CFLAGS)" | cmp -s - $@ || echo "$(CC) $(CPPFLAGS) $(CFLAGS)" > $@
+
+$(BUILD)/%.o: src/%.c $(wildcard include/*.h) $(FLAGS_STAMP) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(LIB): $(LIB_OBJ)
@@ -40,17 +50,17 @@ $(LIB): $(LIB_OBJ)
 
 # The firewall program itself (Linux only: it opens tun devices).
 tunwall: $(BUILD)/tunwall
-$(BUILD)/tunwall: src/main.c src/tun_io.c include/tun_io.h $(LIB) | $(BUILD)
+$(BUILD)/tunwall: src/main.c src/tun_io.c include/tun_io.h $(LIB) $(FLAGS_STAMP) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c src/tun_io.c $(LIB) -o $@
 
 # The parser, engine and fuzz tests also need the test packet builder.
-$(BUILD)/test_parser $(BUILD)/test_engine $(BUILD)/test_fuzz $(BUILD)/test_forwarder: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
+$(BUILD)/test_parser $(BUILD)/test_engine $(BUILD)/test_fuzz $(BUILD)/test_forwarder: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB) $(FLAGS_STAMP)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/$*.c tests/pktbuild.c $(LIB) -o $@
 
-$(BUILD)/test_tun_io: tests/test_tun_io.c src/tun_io.c include/tun_io.h tests/testutil.h
+$(BUILD)/test_tun_io: tests/test_tun_io.c src/tun_io.c include/tun_io.h tests/testutil.h $(FLAGS_STAMP) | $(BUILD)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_tun_io.c src/tun_io.c -o $@
 
-$(BUILD)/test_%: tests/test_%.c tests/testutil.h $(LIB)
+$(BUILD)/test_%: tests/test_%.c tests/testutil.h $(LIB) $(FLAGS_STAMP)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) $< $(LIB) -o $@
 
 $(BUILD):
@@ -64,7 +74,7 @@ test: $(TEST_BINS)
 # (On macOS use clang: `make CC=clang asan`. Homebrew gcc has no ASan runtime.)
 asan:
 	$(MAKE) clean
-	$(MAKE) test CFLAGS="-std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer"
+	$(MAKE) test CFLAGS="-std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
 
 clean:
 	rm -rf $(BUILD)
