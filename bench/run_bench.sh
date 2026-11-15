@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# ============================================================================
+# File Name:   run_bench.sh
+# Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+# Course:      CS60: Computer Networks
+# Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+# Date:        November 15, 2026
+#
+# Description: iperf3 throughput and ping latency from inside to outside in
+#              the test topology. Run once per setup and label the run:
+#                sudo bench/run_bench.sh kernel     (plain kernel forwarding)
+#                sudo bench/run_bench.sh allow-all  (tunwall, one allow rule)
+#                sudo bench/run_bench.sh many-rules (tunwall, many rules)
+#              Results go to bench/results/<label>.txt (git-ignored).
+#              Set PERF=1 to also record a perf profile of tunwall.
+# ============================================================================
+set -eu
+cd "$(dirname "$0")/.."
+label=${1:?usage: run_bench.sh <label>}
+secs=${SECS:-10}
+out=bench/results; mkdir -p "$out"
+for c in iperf3 ping; do command -v $c >/dev/null || { echo "need $c"; exit 1; }; done
+
+ip netns exec outside iperf3 -s -1 -B 10.0.2.2 >/dev/null 2>&1 &
+srv=$!; sleep 1
+if [ "${PERF:-0}" = 1 ] && pgrep -x tunwall >/dev/null; then
+    perf record -o "$out/$label.perf.data" -g -p "$(pgrep -x tunwall | head -1)" -- sleep $((secs+3)) >/dev/null 2>&1 &
+fi
+{
+  echo "# $label  $(date -Is)"
+  echo "## ping (200 packets)"
+  ip netns exec inside ping -c 200 -i 0.01 -q 10.0.2.2 | tail -2
+  echo "## iperf3 TCP, ${secs}s"
+  ip netns exec inside iperf3 -c 10.0.2.2 -t "$secs" | tail -4
+} | tee "$out/$label.txt"
+wait $srv 2>/dev/null || true
