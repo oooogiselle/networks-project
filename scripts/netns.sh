@@ -26,7 +26,7 @@
 # Usage: sudo scripts/netns.sh up [kernel] | down | status
 # Start the firewall with: sudo ip netns exec firewall build/tunwall -r <rules>
 # ============================================================================
-set -eu
+set -euE      # -E: the ERR trap in up() also fires inside functions
 
 IN=inside; FW=firewall; OUT=outside
 
@@ -41,6 +41,9 @@ down() {
 up() {
     local mode=${1:-firewall}
     down
+    # Never leave a half-built topology behind: a failure anywhere tears it all
+    # down again instead of leaving, say, forwarding on and the rules missing.
+    trap 'echo "netns.sh: setup failed, tearing down" >&2; down' ERR
     for ns in "$IN" "$FW" "$OUT"; do ip netns add "$ns"; ip -n "$ns" link set lo up; done
 
     # veth pairs: client side in its namespace, firewall side in the firewall's
@@ -65,15 +68,15 @@ up() {
     ip -n "$FW" link set veth-in up
     ip -n "$FW" link set veth-out up
     for t in tun-in tun-out; do
-        fw ip tuntap add dev "$t" mode tun       # persistent: outlives tunwall
+        # Persistent (outlives tunwall) and owned by root, so no other user can
+        # attach to it while tunwall is down.
+        fw ip tuntap add dev "$t" mode tun user root group root
         ip -n "$FW" link set "$t" up
     done
 
-    # Forward packets, but do not let the kernel's reverse-path filter drop the
-    # ones tunwall writes back (their source is not "reachable" via the tun
-    # device they arrive on), and never answer pings aimed at the firewall's own
-    # addresses: those would bypass the rules.
-    fw sysctl -qw net.ipv4.ip_forward=1
+    # Do not let the kernel's reverse-path filter drop the packets tunwall
+    # writes back (their source is not "reachable" via the tun device they
+    # arrive on), and never answer pings aimed at the firewall's own addresses.
     fw sysctl -qw net.ipv4.icmp_echo_ignore_all=1
     # IPv4 only (the firewall drops IPv6): without this the kernel sends IPv6
     # neighbour discovery into the tun devices, which only clutters the log.
@@ -89,11 +92,36 @@ up() {
     # Everything arriving from a side goes to that side's tun device (unless
     # this is the kernel-forwarding baseline).
     if [ "$mode" != kernel ]; then
-        ip -n "$FW" rule add iif veth-in  lookup 100 pref 100
-        ip -n "$FW" rule add iif veth-out lookup 200 pref 101
         ip -n "$FW" route add default dev tun-in  table 100
         ip -n "$FW" route add default dev tun-out table 200
+        ip -n "$FW" rule add iif veth-in  lookup 100 pref 100
+        ip -n "$FW" rule add iif veth-out lookup 200 pref 101
+        # Fail closed: if a tun device is deleted or goes down, its table has no
+        # route and a plain "lookup" rule would fall through to the main table,
+        # where the kernel would forward straight between the two sides. These
+        # terminal rules drop (silently) whatever the lookups did not take.
+        ip -n "$FW" rule add iif veth-in  blackhole pref 102
+        ip -n "$FW" rule add iif veth-out blackhole pref 103
+        # The kernel's "local" table (addresses of the firewall itself) is
+        # consulted first by default, so packets aimed at 10.0.1.1 / 10.0.2.1
+        # would be answered by the kernel and never reach tunwall (ports there
+        # would show as closed, not filtered). Consult it after the iif rules.
+        ip -n "$FW" rule add from all lookup local pref 1000
+        ip -n "$FW" rule del pref 0
+        # ...but the kernel answers ARP for its own address only when its input
+        # route lookup says "local", which the iif rules now pre-empt. So the
+        # hosts get their gateway's MAC as a permanent neighbour entry instead
+        # of asking for it. (The firewall still resolves the hosts normally.)
+        local mac_in mac_out
+        mac_in=$(ip -n "$FW" link show veth-in  | awk '/link\/ether/ {print $2}')
+        mac_out=$(ip -n "$FW" link show veth-out | awk '/link\/ether/ {print $2}')
+        ip -n "$IN"  neigh replace 10.0.1.1 lladdr "$mac_in"  dev veth-cin  nud permanent
+        ip -n "$OUT" neigh replace 10.0.2.1 lladdr "$mac_out" dev veth-sout nud permanent
     fi
+
+    # Forwarding goes on LAST, once everything that must govern it is in place.
+    fw sysctl -qw net.ipv4.ip_forward=1
+    trap - ERR
 
     # Offloads would hand tunwall oversized or half-checksummed packets.
     for pair in "$IN:veth-cin" "$FW:veth-in" "$FW:veth-out" "$OUT:veth-sout"; do

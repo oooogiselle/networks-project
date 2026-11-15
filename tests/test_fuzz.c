@@ -35,7 +35,7 @@
 
 #define DEFAULT_SEED  0x5eed1234abcdULL
 #define DEFAULT_ITERS 100000UL
-#define SMALL_TABLE   8
+#define SMALL_TABLE   2
 
 /* ---- deterministic PRNG (xorshift64*) ----------------------------------- */
 
@@ -294,14 +294,66 @@ static unsigned long kinds_seen(const unsigned long *a, int n)
     return k;
 }
 
+/* ---- phase D: the rules-file parser ---------------------------------------- */
+
+static const char *RULE_SEEDS[] = {
+    "inside 10.0.1.0/24\n", "inside 192.168.0.0/16\n",
+    "allow out tcp 10.0.1.0/24 any 80,443\n", "deny in udp any 10.0.1.3 53\n",
+    "allow tcp from any port 1024-65535 to 10.0.0.0/8 port 22\n",
+    "allow out icmp 10.0.1.0/24 any echo\n", "allow any from any to any\n",
+    "deny out any 10.0.1.0/24 any\n", "# a comment\n\n", "allow in tcp any 10.0.1.3 22,8000-8100\n",
+};
+
+/* Random and mutated rule text must be refused with a message or accepted
+ * cleanly, never crash or read out of bounds (the text is an exact-size heap
+ * copy, so AddressSanitizer sees any over-read). */
+static void phase_rules(unsigned long iters)
+{
+    const size_t nseed = sizeof RULE_SEEDS / sizeof *RULE_SEEDS;
+    for (unsigned long i = 0; i < iters; i++) {
+        char text[2048];
+        size_t len = 0;
+        for (unsigned k = 1 + below(6); k > 0; k--) {
+            const char *seed = RULE_SEEDS[below((uint32_t)nseed)];
+            const size_t sl = strlen(seed);
+            if (len + sl < sizeof text - 1) { memcpy(text + len, seed, sl); len += sl; }
+        }
+        for (unsigned m = below(8); m > 0 && len; m--) {         /* mutate a few bytes */
+            const size_t at = below((uint32_t)len);
+            switch (below(4)) {
+            case 0: text[at] = (char)(1 + below(255)); break;     /* any byte but NUL */
+            case 1: text[at] = " \t\r\n#,-/:+x9"[below(13)]; break;
+            case 2: if (len > 1) { memmove(text + at, text + at + 1, len - at - 1); len--; } break;
+            default: if (len < sizeof text - 2) { memmove(text + at + 1, text + at, len - at); text[at] = "0:/,-"[below(5)]; len++; }
+            }
+        }
+        if (chance(3)) {                                          /* occasionally a huge line */
+            const size_t extra = sizeof text - 1 - len;
+            memset(text + len, 'a' + (int)below(26), extra);
+            len += extra;
+        }
+        char *exact = malloc(len + 1);
+        memcpy(exact, text, len);
+        exact[len] = '\0';
+        char err[128] = "";
+        rules_t *r = rules_parse_string(exact, err, sizeof err);
+        CHECK(r != NULL || err[0] != '\0');                       /* a refusal always says why */
+        if (r) {
+            CHECK(r->n <= len);
+            rules_free(r);
+        }
+        free(exact);
+    }
+}
+
 static void fuzz_all(void)
 {
     const unsigned long iters = env_ul("FUZZ_ITERS", DEFAULT_ITERS);
     /* a big table (the default) and a tiny one that is always full */
     engine_t *big = make(POLICY, 0);
-    /* every address is "inside", so anything arriving on the inside interface
-     * may open a flow and the 8-slot table stays under pressure */
-    engine_t *small = make("inside 0.0.0.0/0\nallow any any any\n", SMALL_TABLE);
+    /* a 2-slot table with no caps and an allow-everything policy: flows that
+     * start inside and go outside fill it at once and it stays under pressure */
+    engine_t *small = make("inside 10.0.1.0/24\nallow any any any\nallow in any any any\n", SMALL_TABLE);
     CHECK(big != NULL && small != NULL);
     if (!big || !small) { engine_destroy(big); engine_destroy(small); return; }
 
@@ -312,6 +364,7 @@ static void fuzz_all(void)
     phase_mutated(small, iters / 4);
     phase_random_pkts(small, iters / 4);
 
+    phase_rules(iters / 5);
     check_stats(big, FW_DEFAULT_MAX_FLOWS);
     check_stats(small, SMALL_TABLE);
 

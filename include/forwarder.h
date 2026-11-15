@@ -16,6 +16,7 @@
 #ifndef FW_FORWARDER_H
 #define FW_FORWARDER_H
 
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -49,10 +50,19 @@ void         fwd_destroy(forwarder_t *f);
 void fwd_set_clock(forwarder_t *f, fwd_clock_fn clock);
 
 /*
+ * Wait with this signal mask installed atomically (ppoll), so a program that
+ * keeps its stop/stats signals blocked everywhere else cannot lose one that
+ * arrives just before the wait begins. NULL = ordinary poll (the default).
+ * The mask is copied. Where ppoll does not exist this is a no-op.
+ */
+void fwd_set_sigmask(forwarder_t *f, const sigset_t *mask);
+
+/*
  * One loop iteration: wait up to timeout_ms for packets, forward up to
  * FWD_BURST from each side, then sweep expired flows if a second has passed.
  * Returns 0 normally (including timeouts and signals), -1 if a descriptor has
- * failed (closed, or a read error), in which case the caller should stop.
+ * failed (closed, a read error, end of file, hang-up), with errno set to say
+ * why, in which case the caller should stop.
  */
 int fwd_step(forwarder_t *f, int timeout_ms);
 
