@@ -63,6 +63,8 @@ const char *drop_reason_str(drop_reason_t r)
     case DROP_UNSUPPORTED: return "unsupported";
     case DROP_BAD_SRC:     return "bad-source-address(anti-spoof)";
     case DROP_ICMP_ERR:    return "icmp-error-unrelated";
+    case DROP_ICMP_TYPE:   return "icmp-bad-type";
+    case DROP_ICMP_RATE:   return "icmp-error-rate-limited";
     case DROP_REASON_COUNT: break;
     }
     return "?";

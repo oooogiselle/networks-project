@@ -32,10 +32,19 @@ static const char *RULES =
     "allow udp from 10.0.0.0/24 to any port 53\n"
     "allow icmp from 10.0.0.0/24 to any\n";
 
+/* The engine requires an `inside` network (anti-spoofing is not optional), so
+ * fixtures get one unless they declare their own. Clients are 10.0.0.0/24. */
+static char *with_inside(const char *rules)
+{
+    static char buf[2048];
+    snprintf(buf, sizeof buf, "%s%s", strstr(rules, "inside ") ? "" : "inside 10.0.0.0/24\n", rules);
+    return buf;
+}
+
 static engine_t *make_engine(const char *rules)
 {
     char err[128];
-    rules_t *r = rules_parse_string(rules, err, sizeof err);
+    rules_t *r = rules_parse_string(with_inside(rules), err, sizeof err);
     return engine_create_with_rules(r);
 }
 
@@ -150,11 +159,26 @@ static void test_spoofed_direction_dropped(void)
     engine_t *e = make_engine(RULES);
     drop_reason_t w;
     send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w);
-    /* same tuple as the inside client's packets, but arriving from outside */
+    /* same tuple as the inside client's packets, but arriving from outside:
+     * the address check catches it first (an inside source on the outside) */
     CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_OUT, SEC+1, &w) == VERDICT_DROP);
-    CHECK(w == DROP_SPOOF);
+    CHECK(w == DROP_BAD_SRC);
     /* and the server's reply tuple arriving from inside */
     CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN|TCP_ACK), DIR_IN, SEC+2, &w) == VERDICT_DROP);
+    CHECK(w == DROP_BAD_SRC);
+    engine_destroy(e);
+}
+
+static void test_flow_checks_the_interface_even_when_addresses_pass(void)
+{
+    /* Defence in depth behind the address check: both hosts are inside, so
+     * every source address is acceptable on the inside interface, but a
+     * flow's reply must still arrive on the opposite interface. */
+    engine_t *e = make_engine("allow tcp from 10.0.0.0/24 to 10.0.0.0/24\n");
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, CLIENT_B, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    /* the "reply" arrives on the same interface the request came from */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 80, CLIENT_A, 50000, TCP_SYN|TCP_ACK), DIR_IN, SEC+1, &w) == VERDICT_DROP);
     CHECK(w == DROP_SPOOF);
     engine_destroy(e);
 }
@@ -396,6 +420,120 @@ static void test_icmp_error_wrong_direction_dropped(void)
     engine_destroy(e);
 }
 
+static void test_icmp_echo_type_must_match_direction(void)
+{
+    /* On an existing echo flow the originator may only send requests and the
+     * peer may only send replies. Otherwise a host that spoofs the peer could
+     * send echo REQUESTS inward with no `allow in icmp` rule. */
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_icmp(CLIENT_A, SERVER, ICMP_ECHO_REQUEST, 7), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+
+    /* request travelling inward on the flow's own tuple */
+    CHECK(send_pkt(e, mk_icmp(SERVER, CLIENT_A, ICMP_ECHO_REQUEST, 7), DIR_OUT, SEC+1, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_TYPE);
+    /* reply "from the originator" outward */
+    CHECK(send_pkt(e, mk_icmp(CLIENT_A, SERVER, ICMP_ECHO_REPLY, 7), DIR_IN, SEC+2, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_TYPE);
+    /* any other ICMP type on the tuple, either way */
+    CHECK(send_pkt(e, mk_icmp(SERVER, CLIENT_A, 13, 7), DIR_OUT, SEC+3, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_TYPE);
+    CHECK(send_pkt(e, mk_icmp(CLIENT_A, SERVER, 13, 7), DIR_IN, SEC+4, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_TYPE);
+
+    /* the legitimate request/reply pairs (ping repeats the id) still work */
+    CHECK(send_pkt(e, mk_icmp(CLIENT_A, SERVER, ICMP_ECHO_REQUEST, 7), DIR_IN, SEC+5, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_icmp(SERVER, CLIENT_A, ICMP_ECHO_REPLY, 7), DIR_OUT, SEC+6, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_icmp_rejected_packets_do_not_refresh_flow(void)
+{
+    /* Wrong-type packets must not extend the flow's life (they used to). */
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_icmp(CLIENT_A, SERVER, ICMP_ECHO_REQUEST, 9), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    for (int i = 1; i <= 5; i++)       /* one every 20 s: would keep it alive */
+        CHECK(send_pkt(e, mk_icmp(SERVER, CLIENT_A, ICMP_ECHO_REQUEST, 9), DIR_OUT,
+                       SEC + (uint64_t)i * 20 * SEC, &w) == VERDICT_DROP);
+    /* original flow expired 30 s after its only accepted packet */
+    CHECK(send_pkt(e, mk_icmp(SERVER, CLIENT_A, ICMP_ECHO_REPLY, 9), DIR_OUT, 101 * SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_NO_FLOW);
+    engine_destroy(e);
+}
+
+static void test_icmp_error_must_be_addressed_to_the_embedded_senders(void)
+{
+    /* An error about a packet from A is sent TO A. One addressed to anyone
+     * else cannot be a genuine error about that packet. */
+    engine_t *e = make_engine(RULES_IN);
+    drop_reason_t w;
+    uint8_t syn[128], err[256];
+    size_t n = pb_tcp(syn, sizeof syn, NULL, CLIENT_A, 50000, SERVER, 80, TCP_SYN, NULL, 0);
+    CHECK(send_pkt(e, parsed(syn, n), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+
+    pkt_t to_b = icmp_error(err, ROUTER_OUT, CLIENT_B, ICMP_DEST_UNREACH, syn);
+    CHECK(send_pkt(e, to_b, DIR_OUT, SEC+1, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_ERR);
+    pkt_t to_attacker = icmp_error(err, ROUTER_OUT, ATTACKER, ICMP_DEST_UNREACH, syn);
+    CHECK(send_pkt(e, to_attacker, DIR_OUT, SEC+2, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_ERR);
+
+    pkt_t to_a = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_DEST_UNREACH, syn);
+    CHECK(send_pkt(e, to_a, DIR_OUT, SEC+3, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_icmp_errors_only_for_active_tcp_flows(void)
+{
+    engine_t *e = make_engine(RULES_IN);
+    drop_reason_t w;
+    uint8_t syn[128], err[256];
+    size_t n = pb_tcp(syn, sizeof syn, NULL, CLIENT_A, 50000, SERVER, 80, TCP_SYN, NULL, 0);
+    CHECK(send_pkt(e, parsed(syn, n), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN|TCP_ACK), DIR_OUT, 2*SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, 3*SEC, &w) == VERDICT_ALLOW);
+
+    pkt_t live = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_DEST_UNREACH, syn);
+    CHECK(send_pkt(e, live, DIR_OUT, 4*SEC, &w) == VERDICT_ALLOW);      /* established */
+
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_RST), DIR_OUT, 5*SEC, &w) == VERDICT_ALLOW);
+    pkt_t dead = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_DEST_UNREACH, syn);
+    CHECK(send_pkt(e, dead, DIR_OUT, 6*SEC, &w) == VERDICT_DROP);       /* CLOSED */
+    CHECK(w == DROP_ICMP_ERR);
+    engine_destroy(e);
+}
+
+static void test_icmp_errors_are_rate_limited_per_flow(void)
+{
+    /* A forger who knows a flow's tuple must not be able to pour errors into
+     * it at wire speed. Budget: ICMP_ERRORS_PER_FLOW_PER_SEC per flow. */
+    engine_t *e = make_engine(RULES_IN);
+    drop_reason_t w;
+    uint8_t syn1[128], syn2[128], err[256];
+    size_t n1 = pb_tcp(syn1, sizeof syn1, NULL, CLIENT_A, 50000, SERVER, 80, TCP_SYN, NULL, 0);
+    size_t n2 = pb_tcp(syn2, sizeof syn2, NULL, CLIENT_A, 50001, SERVER, 80, TCP_SYN, NULL, 0);
+    CHECK(send_pkt(e, parsed(syn1, n1), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, parsed(syn2, n2), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    pkt_t err1 = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_TIME_EXCEEDED, syn1);
+
+    const uint64_t MS = SEC / 1000;
+    for (int i = 0; i < ICMP_ERRORS_PER_FLOW_PER_SEC; i++)
+        CHECK(send_pkt(e, err1, DIR_OUT, 2*SEC + (uint64_t)i * MS, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, err1, DIR_OUT, 2*SEC + 500*MS, &w) == VERDICT_DROP);   /* over budget */
+    CHECK(w == DROP_ICMP_RATE);
+    CHECK(send_pkt(e, err1, DIR_OUT, 2*SEC + 999*MS, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_RATE);
+
+    /* another flow has its own budget */
+    pkt_t err2 = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_TIME_EXCEEDED, syn2);
+    CHECK(send_pkt(e, err2, DIR_OUT, 2*SEC + 600*MS, &w) == VERDICT_ALLOW);
+    /* the window rolls over after a second */
+    pkt_t again = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_TIME_EXCEEDED, syn1);
+    CHECK(send_pkt(e, again, DIR_OUT, 3*SEC + 1*MS, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
 static void test_icmp_error_about_echo(void)
 {
     engine_t *e = make_engine(RULES_IN);
@@ -492,14 +630,19 @@ static void test_antispoof_covers_icmp_errors(void)
     engine_destroy(e);
 }
 
-static void test_antispoof_off_without_inside_directive(void)
+static void test_engine_refuses_rules_without_an_inside_network(void)
 {
-    engine_t *e = make_engine(RULES);          /* no `inside` line */
-    drop_reason_t w;
-    send_pkt(e, mk_tcp(CLIENT_A, 4444, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w);
-    CHECK(w != DROP_BAD_SRC);
-    send_pkt(e, mk_tcp(IP(8,8,8,8), 5, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w);
-    CHECK(w != DROP_BAD_SRC);
+    /* Anti-spoofing is a requirement, not an option: with no `inside` network
+     * there is no way to tell a spoofed source from a real one, so the engine
+     * must not start rather than quietly run without the check. */
+    char err[128];
+    rules_t *r = rules_parse_string(RULES, err, sizeof err);      /* no inside */
+    CHECK(r != NULL && r->ninside == 0);
+    CHECK(engine_create_with_rules(r) == NULL);                   /* frees r */
+    r = rules_parse_string(RULES, err, sizeof err);
+    CHECK(engine_create_with_rules_sized(r, 16) == NULL);
+    engine_t *e = make_engine(RULES);                             /* with one: fine */
+    CHECK(e != NULL);
     engine_destroy(e);
 }
 
@@ -564,7 +707,7 @@ static void test_parse_failures_counted_and_logged(void)
 static rules_t *rules_of(const char *text)
 {
     char err[128];
-    return rules_parse_string(text, err, sizeof err);
+    return rules_parse_string(with_inside(text), err, sizeof err);
 }
 
 static void test_default_capacity_is_65536_and_full_table_keeps_flows(void)
@@ -670,6 +813,113 @@ static void test_expire_log_counts_to_last_packet_not_sweep_time(void)
     engine_destroy(e);
 }
 
+static int count_str(const char *hay, const char *needle)
+{
+    int n = 0;
+    for (const char *p = hay; (p = strstr(p, needle)) != NULL; p += strlen(needle)) n++;
+    return n;
+}
+
+static void test_lazy_expiry_is_logged(void)
+{
+    /* A flow found expired when its tuple shows up again (no sweep ran in
+     * between) must still get its EXPIRE line: every flow close is logged. */
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    send_pkt(e, mk_udp(CLIENT_A, 6000, SERVER, 53), DIR_IN, 1*SEC, &w);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 6000, SERVER, 53), DIR_IN, 100*SEC, &w) == VERDICT_ALLOW);
+    fw_log_set(NULL, LOG_OFF);
+    const char *out = slurp(log);
+    CHECK(count_str(out, "FLOW NEW") == 2);
+    CHECK(count_str(out, "FLOW EXPIRE") == 1);
+    const char *x = strstr(out, "FLOW EXPIRE");
+    CHECK(x && strstr(x, "10.0.0.2:6000 -> 93.184.216.34:53") != NULL);
+    CHECK(x && out < x && strstr(out, "FLOW NEW") < x);        /* expire comes before the 2nd NEW */
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.flows_expired == 1);
+    fclose(log);
+    engine_destroy(e);
+}
+
+static void test_close_is_logged_once_per_flow(void)
+{
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    /* handshake, RST (-> CLOSED), a second RST, then the same tuple reused */
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, 1*SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN|TCP_ACK), DIR_OUT, 2*SEC, &w);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, 3*SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_RST), DIR_OUT, 4*SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_RST), DIR_OUT, 5*SEC, &w);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, 6*SEC, &w) == VERDICT_ALLOW);
+    char *out = slurp(log);
+    CHECK(count_str(out, "FLOW CLOSE") == 1);                  /* not again on reuse */
+    CHECK(count_str(out, "FLOW NEW") == 2);
+
+    /* the closed flow is gone; only the new one is still open and expires */
+    CHECK(engine_expire(e, 1000*SEC) == 1);
+    fw_log_set(NULL, LOG_OFF);
+    out = slurp(log);
+    CHECK(count_str(out, "FLOW CLOSE") == 1);
+    CHECK(count_str(out, "FLOW EXPIRE") == 1);
+
+    /* a TIME_WAIT flow that times out was already logged as closed */
+    rewind(log);
+    CHECK(ftruncate(fileno(log), 0) == 0);
+    fw_log_set(log, LOG_INFO);
+    send_pkt(e, mk_tcp(CLIENT_B, 51000, SERVER, 80, TCP_SYN), DIR_IN, 2000*SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_B, 51000, TCP_SYN|TCP_ACK), DIR_OUT, 2001*SEC, &w);
+    send_pkt(e, mk_tcp(CLIENT_B, 51000, SERVER, 80, TCP_ACK), DIR_IN, 2002*SEC, &w);
+    send_pkt(e, mk_tcp(CLIENT_B, 51000, SERVER, 80, TCP_FIN|TCP_ACK), DIR_IN, 2003*SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_B, 51000, TCP_FIN|TCP_ACK), DIR_OUT, 2004*SEC, &w);
+    CHECK(engine_expire(e, 9000*SEC) == 1);
+    fw_log_set(NULL, LOG_OFF);
+    out = slurp(log);
+    CHECK(count_str(out, "FLOW CLOSE") == 1);
+    CHECK(count_str(out, "FLOW EXPIRE") == 0);
+    fclose(log);
+    engine_destroy(e);
+}
+
+static void test_table_full_reclaims_expired_flows_on_insert(void)
+{
+    /* Both slots hold flows that timed out but no sweep ran: a new flow must
+     * get a slot instead of being refused as table-full. */
+    engine_t *e = engine_create_with_rules_sized(rules_of("allow udp any any\n"), 2);
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 1, SERVER, 53), DIR_IN, 1*SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 2, SERVER, 53), DIR_IN, 1*SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, 1000*SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.drops[DROP_TABLE_FULL] == 0);
+    CHECK(s.flows_expired == 2);
+    CHECK(s.flows_active == 1);
+    engine_destroy(e);
+}
+
+static void test_table_full_reclaim_is_rate_limited(void)
+{
+    /* A flood into a table of live flows must not make every packet scan the
+     * whole table: at most one reclaim sweep per second. */
+    engine_t *e = engine_create_with_rules_sized(rules_of("allow udp any any\n"), 2);
+    drop_reason_t w;
+    const uint64_t MS = SEC / 1000;
+    send_pkt(e, mk_udp(CLIENT_A, 1, SERVER, 53), DIR_IN, 0, &w);        /* expire at 30 s */
+    send_pkt(e, mk_udp(CLIENT_A, 2, SERVER, 53), DIR_IN, 0, &w);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, 29*SEC + 900*MS, &w) == VERDICT_DROP);  /* sweep: nothing yet */
+    CHECK(w == DROP_TABLE_FULL);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, 30*SEC + 200*MS, &w) == VERDICT_DROP);  /* < 1 s: no sweep */
+    CHECK(w == DROP_TABLE_FULL);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, 31*SEC, &w) == VERDICT_ALLOW);          /* sweep runs */
+    engine_destroy(e);
+}
+
 /* ---- creating an engine from a rules file --------------------------------- */
 
 static void test_engine_create_from_the_shipped_config(void)
@@ -709,6 +959,19 @@ static void test_engine_create_reports_bad_files(void)
     CHECK(engine_create(path, err, sizeof err) == NULL);   /* refuses to start */
     CHECK(strncmp(err, "line 2:", 7) == 0);                /* says which line */
     unlink(path);
+
+    /* a valid file with no `inside` line is refused, and says why */
+    snprintf(path, sizeof path, "%s/fw_engine_test_XXXXXX", dir && *dir ? dir : "/tmp");
+    fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd < 0) return;
+    const char *noinside = "allow out tcp 10.0.1.0/24 any 80\n";
+    CHECK(write(fd, noinside, strlen(noinside)) == (ssize_t)strlen(noinside));
+    close(fd);
+    err[0] = '\0';
+    CHECK(engine_create(path, err, sizeof err) == NULL);
+    CHECK(strstr(err, "inside") != NULL);
+    unlink(path);
 }
 
 int main(void)
@@ -722,6 +985,7 @@ int main(void)
     RUN(test_tcp_reply_without_flow_dropped);
     RUN(test_inbound_data_before_handshake_dropped);
     RUN(test_spoofed_direction_dropped);
+    RUN(test_flow_checks_the_interface_even_when_addresses_pass);
     RUN(test_half_open_flow_expires);
     RUN(test_established_flow_idle_timeout_and_refresh);
     RUN(test_sweep_expires_flows);
@@ -734,18 +998,27 @@ int main(void)
     RUN(test_icmp_error_after_reply_direction);
     RUN(test_icmp_error_unrelated_dropped);
     RUN(test_icmp_error_wrong_direction_dropped);
+    RUN(test_icmp_echo_type_must_match_direction);
+    RUN(test_icmp_rejected_packets_do_not_refresh_flow);
+    RUN(test_icmp_error_must_be_addressed_to_the_embedded_senders);
+    RUN(test_icmp_errors_only_for_active_tcp_flows);
+    RUN(test_icmp_errors_are_rate_limited_per_flow);
     RUN(test_icmp_error_about_echo);
     RUN(test_icmp_error_does_not_refresh_flow);
     RUN(test_icmp_error_never_matches_echo_id_zero);
     RUN(test_antispoof_outside_claiming_inside_address);
     RUN(test_antispoof_inside_with_foreign_address);
     RUN(test_antispoof_covers_icmp_errors);
-    RUN(test_antispoof_off_without_inside_directive);
+    RUN(test_engine_refuses_rules_without_an_inside_network);
     RUN(test_parse_failures_counted_and_logged);
     RUN(test_default_capacity_is_65536_and_full_table_keeps_flows);
     RUN(test_table_full_recovers_after_expiry);
     RUN(test_flow_close_log_has_duration_packets_bytes);
     RUN(test_expire_log_counts_to_last_packet_not_sweep_time);
+    RUN(test_lazy_expiry_is_logged);
+    RUN(test_close_is_logged_once_per_flow);
+    RUN(test_table_full_reclaims_expired_flows_on_insert);
+    RUN(test_table_full_reclaim_is_rate_limited);
     RUN(test_engine_create_from_the_shipped_config);
     RUN(test_engine_create_reports_bad_files);
     TEST_DONE();

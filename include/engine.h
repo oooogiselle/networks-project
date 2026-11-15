@@ -72,6 +72,9 @@ typedef enum {
 
 typedef enum { VERDICT_DROP = 0, VERDICT_ALLOW = 1 } verdict_t;
 
+/* Related ICMP errors allowed per flow per second; more are dropped. */
+#define ICMP_ERRORS_PER_FLOW_PER_SEC 8
+
 typedef enum {
     DROP_NONE = 0,
     DROP_NO_RULE,          /* new flow, no rule matched: default deny       */
@@ -84,6 +87,8 @@ typedef enum {
     DROP_UNSUPPORTED,      /* e.g. ICMP type we don't track                 */
     DROP_BAD_SRC,          /* anti-spoofing: source address on wrong side   */
     DROP_ICMP_ERR,         /* ICMP error not about any tracked flow         */
+    DROP_ICMP_TYPE,        /* ICMP type wrong for this direction of an echo flow */
+    DROP_ICMP_RATE,        /* too many ICMP errors for one flow this second */
     DROP_REASON_COUNT
 } drop_reason_t;
 

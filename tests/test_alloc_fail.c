@@ -48,11 +48,11 @@ static void test_flowtable_create_survives_each_failure(void)
         failures++;
         CHECK(ft == NULL);
     }
-    CHECK(failures == 3);              /* table, buckets, pool */
+    CHECK(failures == 4);              /* table, buckets, pool, hash key */
     fw_alloc_fail_nth(0);
 
-    /* a zero-capacity table has no pool, so only two allocations */
-    fw_alloc_fail_nth(3);
+    /* a zero-capacity table has no pool, so one allocation fewer */
+    fw_alloc_fail_nth(4);
     flowtable_t *z = ft_create(8, 0);
     CHECK(z != NULL && !fw_alloc_failure_fired());
     ft_destroy(z);
@@ -65,6 +65,7 @@ static void test_rules_parse_survives_each_failure(void)
     char err[128];
     int failures = 0;
     for (long k = 1; k < MAX_SWEEP; k++) {
+        strcpy(err, "UNSET");
         fw_alloc_fail_nth(k);
         rules_t *r = rules_parse_string(text, err, sizeof err);
         if (!fw_alloc_failure_fired()) {
@@ -74,6 +75,7 @@ static void test_rules_parse_survives_each_failure(void)
         }
         failures++;
         CHECK(r == NULL);
+        CHECK(strstr(err, "out of memory") != NULL);     /* never left untouched */
     }
     CHECK(failures >= 4);     /* rules_t, copy, and at least two array growths */
     fw_alloc_fail_nth(0);
@@ -108,6 +110,7 @@ static void test_rules_load_file_survives_each_failure(void)
     char err[128];
     int failures = 0;
     for (long k = 1; k < MAX_SWEEP; k++) {
+        strcpy(err, "UNSET");
         fw_alloc_fail_nth(k);
         rules_t *r = rules_load_file(path, err, sizeof err);
         if (!fw_alloc_failure_fired()) {
@@ -117,6 +120,7 @@ static void test_rules_load_file_survives_each_failure(void)
         }
         failures++;
         CHECK(r == NULL);
+        CHECK(strstr(err, "out of memory") != NULL);
     }
     CHECK(failures >= 4);          /* two buffer growths + parse allocations */
     fw_alloc_fail_nth(0);
@@ -124,9 +128,11 @@ static void test_rules_load_file_survives_each_failure(void)
     /* an empty file takes the calloc(1,1) path */
     FILE *f = fopen(path, "w");
     fclose(f);
+    strcpy(err, "UNSET");
     fw_alloc_fail_nth(1);
     rules_t *r = rules_load_file(path, err, sizeof err);
     CHECK(fw_alloc_failure_fired() && r == NULL);
+    CHECK(strstr(err, "out of memory") != NULL);
     fw_alloc_fail_nth(0);
     r = rules_load_file(path, err, sizeof err);
     CHECK(r && r->n == 0);
@@ -139,7 +145,7 @@ static void test_engine_create_survives_each_failure(void)
     char err[128];
     int failures = 0;
     for (long k = 1; k < MAX_SWEEP; k++) {
-        rules_t *rules = rules_parse_string("allow udp any any\n", err, sizeof err);
+        rules_t *rules = rules_parse_string("inside 10.0.0.0/8\nallow udp any any\n", err, sizeof err);
         CHECK(rules != NULL);
         fw_alloc_fail_nth(k);
         /* the engine owns the rules even when it fails: no leak, no double free */
@@ -152,7 +158,7 @@ static void test_engine_create_survives_each_failure(void)
         failures++;
         CHECK(e == NULL);
     }
-    CHECK(failures == 4);       /* engine, then the flow table's three */
+    CHECK(failures == 5);       /* engine, then the flow table's four */
     fw_alloc_fail_nth(0);
 
     CHECK(engine_create_with_rules(NULL) == NULL);
@@ -163,6 +169,7 @@ static void test_engine_create_from_file_survives_each_failure(void)
     char err[128];
     int failures = 0;
     for (long k = 1; k < MAX_SWEEP; k++) {
+        strcpy(err, "UNSET");
         fw_alloc_fail_nth(k);
         engine_t *e = engine_create("config/rules.example.conf", err, sizeof err);
         if (!fw_alloc_failure_fired()) {
@@ -172,6 +179,7 @@ static void test_engine_create_from_file_survives_each_failure(void)
         }
         failures++;
         CHECK(e == NULL);
+        CHECK(strstr(err, "out of memory") != NULL);
     }
     CHECK(failures >= 8);
     fw_alloc_fail_nth(0);

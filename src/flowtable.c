@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "siphash.h"
+
 /*
  * All flow slots are allocated once, in ft_create(), as one array. Free slots
  * form a singly linked list (through flow_t.next), so inserting and removing
@@ -30,6 +32,9 @@ struct flowtable {
     size_t    mask;          /* nbuckets - 1 */
     size_t    count, max;
     uint64_t  expired_total;
+    uint8_t   hash_key[16];     /* secret: attackers cannot predict buckets */
+    ft_expire_cb expire_hook;   /* sees flows removed lazily by ft_lookup */
+    void     *expire_hook_ud;
 };
 
 const char *tcp_state_str(tcp_state_t s)
@@ -46,23 +51,33 @@ const char *tcp_state_str(tcp_state_t s)
     return "?";
 }
 
-static uint32_t fnv_mix(uint32_t h, uint32_t v)
+static void put32(uint8_t *p, uint32_t v)
 {
-    for (int i = 0; i < 4; i++) {
-        h ^= (v >> (8 * i)) & 0xff;
-        h *= 16777619u;
-    }
-    return h;
+    for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
 }
 
-static uint32_t hash_key(const flow_key_t *k)
+/* SipHash-2-4 of the 13-byte key tuple under the table's secret key. */
+static uint64_t hash_key(const flowtable_t *ft, const flow_key_t *k)
 {
-    uint32_t h = 2166136261u;
-    h = fnv_mix(h, k->src_ip);
-    h = fnv_mix(h, k->dst_ip);
-    h = fnv_mix(h, ((uint32_t)k->src_port << 16) | k->dst_port);
-    h = fnv_mix(h, k->proto);
-    return h;
+    uint8_t buf[13];
+    put32(buf, k->src_ip);
+    put32(buf + 4, k->dst_ip);
+    buf[8]  = (uint8_t)k->src_port;
+    buf[9]  = (uint8_t)(k->src_port >> 8);
+    buf[10] = (uint8_t)k->dst_port;
+    buf[11] = (uint8_t)(k->dst_port >> 8);
+    buf[12] = k->proto;
+    return fw_siphash24(ft->hash_key, buf, sizeof buf);
+}
+
+static size_t bucket_of(const flowtable_t *ft, const flow_key_t *k)
+{
+    return (size_t)hash_key(ft, k) & ft->mask;
+}
+
+size_t ft_bucket_of(const flowtable_t *ft, const flow_key_t *k)
+{
+    return bucket_of(ft, k);
 }
 
 static bool key_eq(const flow_key_t *a, const flow_key_t *b)
@@ -80,13 +95,23 @@ flow_key_t ft_reverse(const flow_key_t *k)
 
 flowtable_t *ft_create(size_t nbuckets, size_t max_flows)
 {
+    return ft_create_keyed(nbuckets, max_flows, NULL);
+}
+
+flowtable_t *ft_create_keyed(size_t nbuckets, size_t max_flows, const uint8_t key[16])
+{
+    /* Refuse absurd sizes: rounding nbuckets up to a power of two would
+     * overflow (and loop forever) above 2^63. */
+    if (nbuckets > FT_MAX_BUCKETS || max_flows > FT_MAX_FLOWS) return NULL;
     size_t n = 16;
     while (n < nbuckets) n <<= 1;
     flowtable_t *ft = fw_calloc(1, sizeof *ft);
     if (!ft) return NULL;
     ft->buckets = fw_calloc(n, sizeof *ft->buckets);
     ft->pool = max_flows ? fw_calloc(max_flows, sizeof *ft->pool) : NULL;
-    if (!ft->buckets || (max_flows && !ft->pool)) {
+    const bool keyed = key ? (memcpy(ft->hash_key, key, 16), true)
+                           : fw_random(ft->hash_key, sizeof ft->hash_key);
+    if (!ft->buckets || (max_flows && !ft->pool) || !keyed) {
         free(ft->buckets);
         free(ft->pool);
         free(ft);
@@ -119,7 +144,7 @@ static void release(flowtable_t *ft, flow_t *f)
 
 void ft_remove(flowtable_t *ft, flow_t *f)
 {
-    flow_t **pp = &ft->buckets[hash_key(&f->key) & ft->mask];
+    flow_t **pp = &ft->buckets[bucket_of(ft, &f->key)];
     while (*pp && *pp != f) pp = &(*pp)->next;
     if (!*pp) return;
     *pp = f->next;
@@ -128,7 +153,7 @@ void ft_remove(flowtable_t *ft, flow_t *f)
 
 static flow_t *find_exact(flowtable_t *ft, const flow_key_t *k)
 {
-    for (flow_t *f = ft->buckets[hash_key(k) & ft->mask]; f; f = f->next)
+    for (flow_t *f = ft->buckets[bucket_of(ft, k)]; f; f = f->next)
         if (key_eq(&f->key, k)) return f;
     return NULL;
 }
@@ -142,6 +167,7 @@ flow_t *ft_lookup(flowtable_t *ft, const flow_key_t *k, uint64_t now_ns,
     if (!f) { f = find_exact(ft, &rev); reply = (f != NULL); }
     if (!f) return NULL;
     if (now_ns >= f->expires_ns) {          /* lazily expire */
+        if (ft->expire_hook) ft->expire_hook(f, ft->expire_hook_ud);
         ft->expired_total++;
         ft_remove(ft, f);
         return NULL;
@@ -160,7 +186,7 @@ flow_t *ft_insert(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
     f->key = *k;
     f->orig_dir = orig_dir;
     f->created_ns = f->last_seen_ns = f->expires_ns = now_ns;
-    flow_t **head = &ft->buckets[hash_key(k) & ft->mask];
+    flow_t **head = &ft->buckets[bucket_of(ft, k)];
     f->next = *head;
     *head = f;
     ft->count++;
@@ -186,6 +212,12 @@ size_t ft_expire(flowtable_t *ft, uint64_t now_ns, ft_expire_cb cb, void *ud)
     }
     ft->expired_total += removed;
     return removed;
+}
+
+void ft_set_expire_hook(flowtable_t *ft, ft_expire_cb hook, void *ud)
+{
+    ft->expire_hook = hook;
+    ft->expire_hook_ud = ud;
 }
 
 size_t ft_count(const flowtable_t *ft) { return ft->count; }

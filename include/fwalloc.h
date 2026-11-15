@@ -17,6 +17,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Fill buf with n bytes from the operating system's random source. Counts as
+ * one allocation point for fw_alloc_fail_nth(), so tests can make it fail. */
+bool fw_random(void *buf, size_t n);
+
 void *fw_calloc(size_t n, size_t size);
 void *fw_realloc(void *p, size_t size);
 char *fw_strdup(const char *s);

@@ -11,6 +11,7 @@
 
 #include "fwalloc.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,6 +35,15 @@ void fw_alloc_fail_nth(long n)
 }
 
 bool fw_alloc_failure_fired(void) { return g_fired; }
+
+bool fw_random(void *buf, size_t n)
+{
+    if (inject_failure()) return false;
+    FILE *f = fopen("/dev/urandom", "rb");
+    const bool ok = f != NULL && fread(buf, 1, n, f) == n;
+    if (f) fclose(f);
+    return ok;
+}
 
 void *fw_calloc(size_t n, size_t size)
 {
