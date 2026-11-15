@@ -1,7 +1,20 @@
+/*=============================================================================
+ * File Name:   log.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Logging implementation. Flow open/close lines include duration,
+ *              packets and bytes; drops are logged with a reason; counters are
+ *              printed on demand.
+ =============================================================================*/
+
 #include "log.h"
 
 #include <inttypes.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "parser.h"
 
@@ -59,13 +72,17 @@ void log_flow(const char *event, const flow_t *f, uint64_t now_ns)
 {
     if (!fw_log_enabled(LOG_INFO)) return;
     char a[16], b[16];
+    /* Duration = how long the flow was active. An EXPIRE is logged at sweep
+     * time, which is after the idle timeout; count up to the last packet. */
+    const uint64_t end = strcmp(event, "EXPIRE") == 0 ? f->last_seen_ns : now_ns;
+    const double dur = end > f->created_ns ? (end - f->created_ns) / 1e9 : 0.0;
     fprintf(g_out,
-            "[%10.6f] FLOW %-6s %s %s:%u -> %s:%u state=%s rule=%d "
+            "[%10.6f] FLOW %-6s %s %s:%u -> %s:%u state=%s rule=%d dur=%.3fs "
             "pkts=%" PRIu64 "/%" PRIu64 " bytes=%" PRIu64 "/%" PRIu64 "\n",
             now_ns / 1e9, event, proto_str(f->key.proto),
             ip_str(f->key.src_ip, a, sizeof a), f->key.src_port,
             ip_str(f->key.dst_ip, b, sizeof b), f->key.dst_port,
-            tcp_state_str(f->tcp_state), f->rule_line,
+            tcp_state_str(f->tcp_state), f->rule_line, dur,
             f->pkts[0], f->pkts[1], f->bytes[0], f->bytes[1]);
 }
 
