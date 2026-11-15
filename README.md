@@ -37,6 +37,11 @@ engine and checks that nothing crashes and the counters stay consistent. It is
 deterministic; replay or lengthen a run with
 `FUZZ_SEED=<n> FUZZ_ITERS=<n> ./build/test_fuzz`.
 
+`sudo tests/integration/run_all.sh` runs the namespace tests (curl, DNS, ping,
+blocked inbound traffic, nmap, logging, kill-the-firewall). They skip until
+`build/tunwall` and `scripts/netns.sh` exist. `sudo bench/run_bench.sh <label>`
+records iperf3 and ping numbers for the comparison in the spec.
+
 On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
 
 ## How a packet is decided
