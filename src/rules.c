@@ -26,6 +26,16 @@ static void set_err(char *err, size_t n, int line, const char *msg)
     if (err && n) snprintf(err, n, "line %d: %s", line, msg);
 }
 
+/* Ports mean nothing to ICMP, and on an `any` rule they would apply to TCP and
+ * UDP while silently leaving ICMP open, so such rules are refused outright. */
+#define NOT_PORT_PROTO "ports are only valid for tcp and udp rules"
+
+/* A message that is not about a particular line. */
+static void set_msg(char *err, size_t n, const char *msg)
+{
+    if (err && n) snprintf(err, n, "%s", msg);
+}
+
 static bool parse_addr(const char *s, addr_match_t *out)
 {
     if (strcmp(s, "any") == 0) { out->any = true; out->net = out->mask = 0; return true; }
@@ -126,6 +136,10 @@ static bool parse_compact(char **tok, int n, int i, rule_t *r, int lineno,
                 set_err(err, errlen, lineno, "icmp rules take 'echo', not ports");
                 return false;
             }
+            if (r->proto != FW_PROTO_TCP && r->proto != FW_PROTO_UDP) {
+                set_err(err, errlen, lineno, NOT_PORT_PROTO);
+                return false;
+            }
             if (!parse_ports(tok[i], &r->dport)) {
                 set_err(err, errlen, lineno, "bad port list");
                 return false;
@@ -212,6 +226,10 @@ static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errle
         }
         i++;
         if (i < n && strcmp(tok[i], "port") == 0) {
+            if (r->proto != FW_PROTO_TCP && r->proto != FW_PROTO_UDP) {
+                set_err(err, errlen, lineno, NOT_PORT_PROTO);
+                return -1;
+            }
             i++;
             if (i >= n || !parse_ports(tok[i], p)) {
                 set_err(err, errlen, lineno, "bad port or port range");
@@ -240,10 +258,10 @@ static bool rules_push(rules_t *rs, const rule_t *r)
 rules_t *rules_parse_string(const char *text, char *err, size_t errlen)
 {
     rules_t *rs = fw_calloc(1, sizeof *rs);
-    if (!rs) return NULL;
+    if (!rs) { set_msg(err, errlen, "out of memory"); return NULL; }
 
     char *copy = fw_strdup(text);
-    if (!copy) { free(rs); return NULL; }
+    if (!copy) { free(rs); set_msg(err, errlen, "out of memory"); return NULL; }
 
     /* Split on '\n' by hand: strtok would skip blank lines and corrupt the
      * line numbers we report in errors and logs. */
@@ -288,16 +306,36 @@ rules_t *rules_load_file(const char *path, char *err, size_t errlen)
         if (len + got + 1 > cap) {
             cap = (len + got + 1) * 2;
             char *nt = fw_realloc(text, cap);
-            if (!nt) { free(text); fclose(fp); return NULL; }
+            if (!nt) {
+                free(text); fclose(fp);
+                set_msg(err, errlen, "out of memory");
+                return NULL;
+            }
             text = nt;
         }
         memcpy(text + len, chunk, got);
         len += got;
     }
+    /* fread() returns 0 both at end of file and on a read error (a directory,
+     * a failing disk). An error must not look like a short or empty file: the
+     * lines lost might include `inside` or a deny rule. */
+    const bool read_failed = ferror(fp) != 0;
     fclose(fp);
+    if (read_failed) {
+        free(text);
+        if (err && errlen) snprintf(err, errlen, "error reading %s", path);
+        return NULL;
+    }
+    /* The parser works on a C string, so a NUL would silently end the file
+     * there and drop every later rule. */
+    if (text && memchr(text, '\0', len)) {
+        free(text);
+        if (err && errlen) snprintf(err, errlen, "%s contains a NUL byte", path);
+        return NULL;
+    }
     if (!text) {                       /* empty file */
         text = fw_calloc(1, 1);
-        if (!text) return NULL;
+        if (!text) { set_msg(err, errlen, "out of memory"); return NULL; }
     } else {
         text[len] = '\0';
     }

@@ -503,6 +503,88 @@ static void fragments_rejected(void)
     CHECK_EQ(parse_exact(b, n), PARSE_OK);
 }
 
+static void martian_this_network_and_link_local(void)
+{
+    uint8_t b[64];
+    /* 0.0.0.0/8 ("this network") and 169.254.0.0/16 (link-local) are never
+     * valid across a router, as source or destination. */
+    const uint32_t bad[] = {IP4(0, 1, 2, 3), IP4(0, 255, 255, 255),
+                            IP4(169, 254, 0, 1), IP4(169, 254, 255, 254)};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        size_t n = pb_udp(b, sizeof b, NULL, bad[i], 1, SERVER, 2, NULL, 0);
+        CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+        n = pb_udp(b, sizeof b, NULL, CLIENT_A, 1, bad[i], 2, NULL, 0);
+        CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+    }
+    /* the neighbouring ranges are ordinary */
+    size_t n = pb_udp(b, sizeof b, NULL, IP4(1, 0, 0, 1), 1, IP4(169, 253, 1, 1), 2, NULL, 0);
+    CHECK_EQ(parse_exact(b, n), PARSE_OK);
+    n = pb_udp(b, sizeof b, NULL, IP4(169, 255, 0, 1), 1, SERVER, 2, NULL, 0);
+    CHECK_EQ(parse_exact(b, n), PARSE_OK);
+}
+
+static void ttl_zero_is_rejected(void)
+{
+    uint8_t b[64];
+    size_t n = pb_udp(b, sizeof b, NULL, CLIENT_A, 1, SERVER, 2, NULL, 0);
+    b[8] = 0;
+    pb_fix_csums(b, n);
+    CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+    b[8] = 1;                                   /* TTL 1 is still forwardable */
+    pb_fix_csums(b, n);
+    CHECK_EQ(parse_exact(b, n), PARSE_OK);
+}
+
+/* Build a UDP packet with `optlen` bytes of IP options copied from opts. */
+static size_t with_ip_options(uint8_t *b, size_t cap, const uint8_t *opts, size_t optlen)
+{
+    struct pb_opts o = {.ip_opt_len = (uint8_t)optlen};
+    size_t n = pb_udp(b, cap, &o, CLIENT_A, 1, SERVER, 2, NULL, 0);
+    memcpy(b + 20, opts, optlen);
+    pb_fix_csums(b, n);
+    return n;
+}
+
+static void ip_options_are_validated_and_source_routing_dropped(void)
+{
+    uint8_t b[96];
+    /* loose and strict source route let the sender choose the path */
+    const uint8_t lsrr[8] = {131, 7, 4, 10, 0, 0, 1, 0};
+    const uint8_t ssrr[8] = {137, 7, 4, 10, 0, 0, 1, 0};
+    size_t n = with_ip_options(b, sizeof b, lsrr, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_UNSUPPORTED);
+    n = with_ip_options(b, sizeof b, ssrr, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_UNSUPPORTED);
+    /* source route hidden behind NOPs */
+    const uint8_t nops_lsrr[12] = {1, 1, 1, 1, 131, 7, 4, 10, 0, 0, 1, 0};
+    n = with_ip_options(b, sizeof b, nops_lsrr, 12);
+    CHECK_EQ(parse_exact(b, n), PARSE_UNSUPPORTED);
+
+    /* ordinary options still pass: timestamp, then end-of-list + padding */
+    const uint8_t ts[8] = {68, 4, 5, 0, 0, 0, 0, 0};
+    n = with_ip_options(b, sizeof b, ts, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_OK);
+    /* bytes after the end-of-list marker are padding and are not parsed */
+    const uint8_t eol[8] = {0, 131, 99, 99, 99, 99, 99, 99};
+    n = with_ip_options(b, sizeof b, eol, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_OK);
+
+    /* a broken option list is malformed: length below 2, past the end, or a
+     * type byte with no room for its length byte */
+    const uint8_t len0[8] = {7, 0, 0, 0, 0, 0, 0, 0};
+    const uint8_t len1[8] = {7, 1, 0, 0, 0, 0, 0, 0};
+    const uint8_t toolong[8] = {7, 40, 4, 0, 0, 0, 0, 0};
+    const uint8_t nolen[4] = {1, 1, 1, 7};
+    n = with_ip_options(b, sizeof b, len0, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+    n = with_ip_options(b, sizeof b, len1, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+    n = with_ip_options(b, sizeof b, toolong, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+    n = with_ip_options(b, sizeof b, nolen, 4);
+    CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+}
+
 static void martian_addresses(void)
 {
     const uint32_t bad_src[] = {IP4(0, 0, 0, 0), IP4(127, 0, 0, 1),
@@ -612,7 +694,8 @@ static engine_t *engine_from(const char *text)
 /* Real wire packets, parsed and then decided, behave like the spec examples. */
 static void parsed_packets_drive_engine(void)
 {
-    engine_t *e = engine_from("allow out tcp from 10.0.1.0/24 to any port 80\n"
+    engine_t *e = engine_from("inside 10.0.1.0/24\n"
+                              "allow out tcp from 10.0.1.0/24 to any port 80\n"
                               "allow in  tcp from any to 10.0.1.3 port 22\n");
     CHECK(e != NULL);
     if (!e)
@@ -747,6 +830,9 @@ int main(void)
     RUN(pseudo_header_covers_addresses);
     RUN(fragments_rejected);
     RUN(martian_addresses);
+    RUN(martian_this_network_and_link_local);
+    RUN(ttl_zero_is_rejected);
+    RUN(ip_options_are_validated_and_source_routing_dropped);
     RUN(unknown_protocol);
     RUN(tcp_bad_data_offset);
     RUN(udp_length_mismatch);

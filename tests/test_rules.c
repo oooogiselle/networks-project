@@ -10,6 +10,9 @@
  *              syntax errors.
  =============================================================================*/
 
+#include <stdlib.h>
+#include <unistd.h>
+
 #include "rules.h"
 #include "testutil.h"
 
@@ -329,6 +332,76 @@ static void test_shipped_example_config_loads(void)
     rules_free(r);
 }
 
+static void test_load_directory_is_an_error_not_an_empty_ruleset(void)
+{
+    /* fopen() succeeds on a directory and fread() then fails: that must not
+     * look like an empty (deny-all, spoof-check-less) rules file. */
+    char err[128] = "";
+    CHECK(rules_load_file("/tmp", err, sizeof err) == NULL);
+    CHECK(strstr(err, "error reading") != NULL);
+}
+
+static void test_load_file_with_nul_byte_is_an_error(void)
+{
+    /* A NUL would silently cut the file there, dropping every later line
+     * (including `inside` and deny rules). */
+    char path[512];
+    const char *dir = getenv("TMPDIR");
+    snprintf(path, sizeof path, "%s/fw_rules_nul_XXXXXX", dir && *dir ? dir : "/tmp");
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd < 0) return;
+    const char text[] = "allow out tcp any any 80\n\0deny out tcp any any 22\ngarbage\n";
+    CHECK(write(fd, text, sizeof text - 1) == (ssize_t)(sizeof text - 1));
+    close(fd);
+    char err[128] = "";
+    CHECK(rules_load_file(path, err, sizeof err) == NULL);
+    CHECK(strstr(err, "NUL") != NULL);
+    unlink(path);
+}
+
+static bool parse_fails_with(const char *text, const char *line_prefix, const char *msg)
+{
+    char err[128] = "";
+    rules_t *r = rules_parse_string(text, err, sizeof err);
+    if (r) { rules_free(r); return false; }
+    return strncmp(err, line_prefix, strlen(line_prefix)) == 0 && strstr(err, msg) != NULL;
+}
+
+static void test_ports_only_allowed_on_tcp_and_udp_rules(void)
+{
+    /* ICMP has no ports and an `any` rule would apply them to TCP/UDP only,
+     * silently opening ICMP too. Refuse such rules instead of widening them. */
+    const char *m = "only valid for tcp and udp";
+    /* compact form */
+    CHECK(parse_fails_with("allow out any 10.0.1.0/24 any 80\n", "line 1:", m));
+    CHECK(parse_fails_with("deny in any any 10.0.1.3 22,8000-8100\n", "line 1:", m));
+    CHECK(parse_fails_with("# c\n\nallow out any any any 443\n", "line 3:", m));
+    /* verbose form: a `port` clause on either side */
+    CHECK(parse_fails_with("allow icmp from any to any port 80\n", "line 1:", m));
+    CHECK(parse_fails_with("allow any from any to any port 22\n", "line 1:", m));
+    CHECK(parse_fails_with("allow any from any port 53 to any\n", "line 1:", m));
+    CHECK(parse_fails_with("allow icmp from any port 8 to any\n", "line 1:", m));
+    /* the existing icmp compact message still applies */
+    CHECK(parse_fails_with("allow out icmp any any 80\n", "line 1:", "echo"));
+
+    /* everything that does not use a port is still fine on any/icmp ... */
+    rules_t *r = parse("allow out any 10.0.0.0/24 any\n"
+                       "allow out any 10.0.0.0/24 any any\n"
+                       "allow any from any to any\n"
+                       "allow icmp from any to any\n"
+                       "allow out icmp 10.0.0.0/24 any echo\n");
+    CHECK(r != NULL && r->n == 5);
+    rules_free(r);
+    /* ... and ports are still fine on tcp and udp, both forms */
+    r = parse("allow out tcp 10.0.0.0/24 any 80,443\n"
+              "allow out udp 10.0.0.0/24 any 53\n"
+              "allow tcp from any port 1024-65535 to any port 80\n"
+              "allow udp from any to any port 53\n");
+    CHECK(r != NULL && r->n == 4);
+    rules_free(r);
+}
+
 static void test_load_missing_file(void)
 {
     char err[128];
@@ -356,5 +429,8 @@ int main(void)
     RUN(test_compact_syntax_errors);
     RUN(test_shipped_example_config_loads);
     RUN(test_load_missing_file);
+    RUN(test_ports_only_allowed_on_tcp_and_udp_rules);
+    RUN(test_load_directory_is_an_error_not_an_empty_ruleset);
+    RUN(test_load_file_with_nul_byte_is_an_error);
     TEST_DONE();
 }
