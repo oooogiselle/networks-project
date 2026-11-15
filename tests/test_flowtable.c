@@ -9,6 +9,8 @@
  *              expiry, capacity limits, and slot reuse.
  =============================================================================*/
 
+#include <stdio.h>
+
 #include "flowtable.h"
 #include "siphash.h"
 #include "testutil.h"
@@ -39,14 +41,78 @@ static void test_insert_and_lookup_both_directions(void)
     ft_destroy(ft);
 }
 
-static void test_protocol_is_part_of_key(void)
+/* Find a key that differs from base ONLY in the field `which`, yet lands in the
+ * same bucket, so a lookup has to rely on the key comparison itself (not on a
+ * lucky difference in the hash) to tell the two apart. */
+static bool colliding_variant(const flowtable_t *ft, const flow_key_t *base, int which, flow_key_t *out)
 {
-    flowtable_t *ft = ft_create(64, 100);
+    for (uint32_t v = 1; v < 5000; v++) {
+        flow_key_t k = *base;
+        switch (which) {
+        case 0: k.src_ip   = base->src_ip + v; break;
+        case 1: k.dst_ip   = base->dst_ip + v; break;
+        case 2: k.src_port = (uint16_t)(base->src_port + v); break;
+        case 3: k.dst_port = (uint16_t)(base->dst_port + v); break;
+        default: k.proto   = (uint8_t)(base->proto + v); break;
+        }
+        if (v >= 250 && which == 4) return false;                  /* proto is 8 bits */
+        if (ft_bucket_of(ft, &k) == ft_bucket_of(ft, base)) { *out = k; return true; }
+    }
+    return false;
+}
+
+static void test_every_field_is_part_of_the_key(void)
+{
+    /* A 16-bucket table makes same-bucket variants easy to find; each field
+     * must then be compared, or a flow would answer for a different one. */
+    uint8_t hk[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    const char *names[] = { "src ip", "dst ip", "src port", "dst port", "protocol" };
+    for (int which = 0; which < 5; which++) {
+        flowtable_t *ft = ft_create_keyed(16, 100, hk);
+        flow_key_t base = K(IP(10,0,0,2), 5000, IP(1,2,3,4), 53), other;
+        ft_insert(ft, &base, DIR_IN, 0)->expires_ns = 10 * SEC;
+        const bool found = colliding_variant(ft, &base, which, &other);
+        CHECK(found);
+        if (found) {
+            bool r;
+            if (!(ft_lookup(ft, &other, SEC, &r) == NULL))
+                fprintf(stderr, "  the %s is not compared\n", names[which]);
+            CHECK(ft_lookup(ft, &other, SEC, &r) == NULL);
+            /* and the real flow is still found */
+            CHECK(ft_lookup(ft, &base, SEC, &r) != NULL && !r);
+        }
+        ft_destroy(ft);
+    }
+}
+
+static void test_removing_a_flow_twice_does_nothing_the_second_time(void)
+{
+    flowtable_t *ft = ft_create(16, 4);
     flow_key_t k = K(IP(10,0,0,2), 5000, IP(1,2,3,4), 53);
-    ft_insert(ft, &k, DIR_IN, 0)->expires_ns = 10 * SEC;
-    k.proto = FW_PROTO_UDP;
-    bool r;
-    CHECK(ft_lookup(ft, &k, SEC, &r) == NULL);
+    flow_t *f = ft_insert(ft, &k, DIR_IN, 0);
+    ft_remove(ft, f);
+    CHECK(ft_count(ft) == 0);
+    ft_remove(ft, f);                                  /* already gone: no effect */
+    CHECK(ft_count(ft) == 0);
+    for (int i = 0; i < 4; i++) {                      /* the free list is intact: exactly 4 slots */
+        flow_key_t n = K(IP(10,0,0,2), (uint16_t)(6000 + i), IP(1,2,3,4), 53);
+        CHECK(ft_insert(ft, &n, DIR_IN, 0) != NULL);
+    }
+    flow_key_t extra = K(IP(10,0,0,2), 7000, IP(1,2,3,4), 53);
+    CHECK(ft_insert(ft, &extra, DIR_IN, 0) == NULL);
+    ft_destroy(ft);
+}
+
+static void test_both_directions_can_be_stored_as_separate_flows(void)
+{
+    flowtable_t *ft = ft_create(64, 10);
+    flow_key_t ab = K(IP(10,0,0,2), 5000, IP(1,2,3,4), 80);
+    flow_key_t ba = ft_reverse(&ab);
+    flow_t *f1 = ft_insert(ft, &ab, DIR_IN, 0), *f2 = ft_insert(ft, &ba, DIR_OUT, 0);
+    f1->expires_ns = f2->expires_ns = 10 * SEC;
+    bool r = true;
+    CHECK(ft_lookup(ft, &ab, SEC, &r) == f1 && !r);     /* an exact match wins ... */
+    CHECK(ft_lookup(ft, &ba, SEC, &r) == f2 && !r);     /* ... in both directions */
     ft_destroy(ft);
 }
 
@@ -71,6 +137,107 @@ static void test_lazy_expiry_calls_the_hook_once(void)
     CHECK(calls == 1);                                /* removed on touch: reported */
     CHECK(ft_lookup(ft, &k, 6 * SEC, &r) == NULL);
     CHECK(calls == 1);                                /* gone: not reported again */
+    ft_destroy(ft);
+}
+
+/* ---- limits: no single party may starve the rest ------------------------ */
+
+static flow_key_t from_src(uint32_t src, uint16_t sport)
+{
+    return K(src, sport, IP(10,0,2,2), 80);
+}
+
+static void test_outside_started_flows_have_a_quota(void)
+{
+    flowtable_t *ft = ft_create(64, 100);
+    CHECK(ft_set_limits(ft, 0, 3));
+    ft_status_t st;
+    flow_t *out[3];
+    for (int i = 0; i < 3; i++) {
+        flow_key_t k = from_src(IP(198,51,100,i + 1), 1000);
+        out[i] = ft_insert_ex(ft, &k, DIR_OUT, 0, &st);
+        CHECK(out[i] != NULL && st == FT_OK);
+    }
+    flow_key_t k4 = from_src(IP(198,51,100,9), 1000);
+    CHECK(ft_insert_ex(ft, &k4, DIR_OUT, 0, &st) == NULL && st == FT_OUTSIDE_QUOTA);
+    CHECK(ft_insert(ft, &k4, DIR_OUT, 0) == NULL);             /* plain form: just NULL */
+    /* flows started from the inside are not affected by the outside quota */
+    for (int i = 0; i < 10; i++) {
+        flow_key_t k = from_src(IP(10,0,1,i + 1), 2000);
+        CHECK(ft_insert_ex(ft, &k, DIR_IN, 0, &st) != NULL && st == FT_OK);
+    }
+    /* a freed outside slot can be used again */
+    ft_remove(ft, out[1]);
+    CHECK(ft_insert_ex(ft, &k4, DIR_OUT, 0, &st) != NULL && st == FT_OK);
+    CHECK(ft_insert_ex(ft, &k4, DIR_OUT, 0, &st) == NULL && st == FT_OUTSIDE_QUOTA);
+    /* expiry frees quota too */
+    CHECK(ft_expire(ft, 1, NULL, NULL) == 13);
+    for (int i = 0; i < 3; i++) {
+        flow_key_t k = from_src(IP(198,51,100,i + 20), 1000);
+        CHECK(ft_insert_ex(ft, &k, DIR_OUT, 5, &st) != NULL);
+    }
+    ft_destroy(ft);
+}
+
+static void test_one_source_cannot_hold_more_than_its_share(void)
+{
+    flowtable_t *ft = ft_create(64, 100);
+    CHECK(ft_set_limits(ft, 2, 0));
+    ft_status_t st;
+    const uint32_t a = IP(203,0,113,5), b = IP(203,0,113,6);
+    flow_key_t a1 = from_src(a, 1), a2 = from_src(a, 2), a3 = from_src(a, 3);
+    flow_t *f1 = ft_insert_ex(ft, &a1, DIR_OUT, 0, &st);
+    CHECK(f1 && st == FT_OK);
+    CHECK(ft_insert_ex(ft, &a2, DIR_OUT, 0, &st) && st == FT_OK);
+    CHECK(ft_insert_ex(ft, &a3, DIR_OUT, 0, &st) == NULL && st == FT_SRC_LIMIT);
+    flow_key_t b1 = from_src(b, 1);                              /* others unaffected */
+    CHECK(ft_insert_ex(ft, &b1, DIR_OUT, 0, &st) && st == FT_OK);
+    ft_remove(ft, f1);                                           /* a slot frees up */
+    CHECK(ft_insert_ex(ft, &a3, DIR_OUT, 0, &st) && st == FT_OK);
+    CHECK(ft_insert_ex(ft, &a1, DIR_OUT, 0, &st) == NULL && st == FT_SRC_LIMIT);
+    /* the source is whoever STARTED the flow, not the replying side */
+    flow_key_t reply_view = K(IP(10,0,2,2), 80, a, 1);
+    CHECK(ft_insert_ex(ft, &reply_view, DIR_IN, 0, &st) && st == FT_OK);
+    /* a full table reports FT_FULL, not a limit */
+    ft_set_limits(ft, 0, 0);
+    flowtable_t *tiny = ft_create(16, 1);
+    flow_key_t t1 = from_src(a, 7), t2 = from_src(b, 7);
+    CHECK(ft_insert(tiny, &t1, DIR_IN, 0));
+    CHECK(ft_insert_ex(tiny, &t2, DIR_IN, 0, &st) == NULL && st == FT_FULL);
+    ft_destroy(tiny);
+    /* limits can be turned off again */
+    CHECK(ft_set_limits(ft, 0, 0));
+    for (int i = 10; i < 20; i++) {
+        flow_key_t k = from_src(a, (uint16_t)i);
+        CHECK(ft_insert(ft, &k, DIR_OUT, 0) != NULL);
+    }
+    ft_destroy(ft);
+}
+
+static void test_per_source_counters_stay_exact_under_churn(void)
+{
+    /* Randomly add and remove one flow per source against a model. A wrong
+     * count (a lost entry after a backward shift, a leaked slot) shows up as
+     * a source that is wrongly refused or wrongly admitted. */
+    enum { SOURCES = 60, OPS = 30000 };
+    uint8_t key[16] = {9, 8, 7, 6, 5, 4, 3, 2, 1};
+    flowtable_t *ft = ft_create_keyed(16, 64, key);              /* tiny: long probe runs */
+    CHECK(ft_set_limits(ft, 1, 0));
+    flow_t *live[SOURCES] = {0};
+    unsigned seed = 12345;
+    for (int i = 0; i < OPS; i++) {
+        seed = seed * 1103515245u + 12345u;
+        const int s = (int)((seed >> 8) % SOURCES);
+        flow_key_t k = from_src(IP(100,64,s / 250, s % 250 + 1), 4000);
+        ft_status_t st;
+        if (live[s]) {
+            CHECK(ft_insert_ex(ft, &k, DIR_OUT, 0, &st) == NULL && st == FT_SRC_LIMIT);
+            if ((seed >> 20) & 1) { ft_remove(ft, live[s]); live[s] = NULL; }
+        } else {
+            live[s] = ft_insert_ex(ft, &k, DIR_OUT, 0, &st);
+            CHECK(live[s] != NULL && st == FT_OK);
+        }
+    }
     ft_destroy(ft);
 }
 
@@ -283,11 +450,16 @@ static void test_zero_capacity_table_refuses_everything(void)
 int main(void)
 {
     RUN(test_insert_and_lookup_both_directions);
-    RUN(test_protocol_is_part_of_key);
+    RUN(test_every_field_is_part_of_the_key);
+    RUN(test_removing_a_flow_twice_does_nothing_the_second_time);
+    RUN(test_both_directions_can_be_stored_as_separate_flows);
     RUN(test_siphash_matches_the_published_vectors);
     RUN(test_precomputed_collisions_do_not_survive_a_different_key);
     RUN(test_each_table_gets_its_own_random_key);
     RUN(test_absurd_sizes_are_refused_not_looped_on);
+    RUN(test_outside_started_flows_have_a_quota);
+    RUN(test_one_source_cannot_hold_more_than_its_share);
+    RUN(test_per_source_counters_stay_exact_under_churn);
     RUN(test_sweep_removes_a_flow_exactly_at_its_expiry);
     RUN(test_lazy_expiry);
     RUN(test_lazy_expiry_calls_the_hook_once);

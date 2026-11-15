@@ -14,9 +14,11 @@
 
 #define SEC 1000000000ull
 
+/* A connection starts with a SYN. ECE and CWR may ride along (ECN setup); any
+ * other flag (ACK, FIN, RST, PSH, URG) makes it something else. */
 bool tcp_is_pure_syn(uint8_t flags)
 {
-    return (flags & (TCP_SYN | TCP_ACK | TCP_FIN | TCP_RST)) == TCP_SYN;
+    return (flags & (uint8_t)~(TCP_ECE | TCP_CWR)) == TCP_SYN;
 }
 
 void tcp_flow_init(flow_t *f)
@@ -36,6 +38,11 @@ static bool flags_sane(uint8_t fl)
 }
 
 bool tcp_track(flow_t *f, uint8_t fl, bool from_orig)
+{
+    return tcp_track_ex(f, fl, from_orig, 0);
+}
+
+bool tcp_track_ex(flow_t *f, uint8_t fl, bool from_orig, size_t payload_len)
 {
     if (!flags_sane(fl)) return false;
 
@@ -59,8 +66,9 @@ bool tcp_track(flow_t *f, uint8_t fl, bool from_orig)
 
     case TCPS_SYN_RECV:
         if (from_orig) {
-            if (syn && !ack) return true;               /* SYN retransmit    */
-            if (!syn && ack) { f->tcp_state = TCPS_ESTABLISHED; return true; }
+            if (syn) return true;       /* SYN retransmit, or SYN-ACK when both
+                                           ends opened at once               */
+            if (ack) { f->tcp_state = TCPS_ESTABLISHED; return true; }
             return false;
         }
         return syn;                                     /* SYN-ACK retransmit*/
@@ -83,7 +91,10 @@ bool tcp_track(flow_t *f, uint8_t fl, bool from_orig)
         return true;
 
     case TCPS_TIME_WAIT:
-        return !syn && ack;                             /* last ACKs / retx  */
+        /* Both sides have closed: only payload-free ACKs (the last ACK, FIN
+         * retransmits) make sense. Data here would let a closed connection
+         * carry traffic indefinitely. */
+        return !syn && ack && payload_len == 0;
 
     case TCPS_CLOSED:
     case TCPS_NONE:
@@ -100,7 +111,10 @@ uint64_t flow_timeout_ns(const flow_t *f)
         case TCPS_SYN_SENT:
         case TCPS_SYN_RECV:    return 30 * SEC;
         case TCPS_ESTABLISHED: return 3600 * SEC;   /* 1 hour, per the spec */
-        case TCPS_FIN_WAIT:    return 60 * SEC;
+        /* One side has sent FIN, the other may keep sending for as long as it
+         * likes (ssh, rsync, a remote command after shutdown(WR)), so the
+         * half-closed connection lives as long as an established one. */
+        case TCPS_FIN_WAIT:    return 3600 * SEC;
         case TCPS_TIME_WAIT:   return 30 * SEC;
         case TCPS_CLOSED:      return 5 * SEC;
         case TCPS_NONE:        break;

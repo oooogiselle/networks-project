@@ -41,6 +41,9 @@ void tcp_flow_init(flow_t *f);
  * advanced); false if it must be dropped (state unchanged).
  */
 bool tcp_track(flow_t *f, uint8_t flags, bool from_orig);
+/* Same, also told the TCP payload length: once both sides have closed
+ * (TIME_WAIT) a packet carrying data is refused. tcp_track() means "no data". */
+bool tcp_track_ex(flow_t *f, uint8_t flags, bool from_orig, size_t payload_len);
 
 /* Idle timeout for a flow in its current state, in nanoseconds. */
 uint64_t flow_timeout_ns(const flow_t *f);
