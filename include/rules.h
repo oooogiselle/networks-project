@@ -7,12 +7,23 @@
  *       from <addr> [port <ports>] to <addr> [port <ports>]
  *
  *   <addr>  := any | a.b.c.d | a.b.c.d/len
- *   <ports> := N | N-M
+ *   <ports> := <item>[,<item>...]   with <item> := N | N-M
+ *              e.g. 80   443   1024-65535   80,443   80,8000-8100,8443
+ *              (no spaces around commas; at most 8 items)
  *   out|in  := direction of the connection, as in the spec (default: out).
  *              "out" = initiated from the inside (first packet arrives on
  *              tun-in, rule->dir == DIR_IN);
  *              "in"  = initiated from the outside, for deliberately exposed
  *              services (first packet arrives on tun-out, DIR_OUT).
+ *
+ * Besides rules, the file may declare which networks are the trusted side:
+ *
+ *   inside <a.b.c.d/len>      (repeatable, up to 8; "any" is not allowed)
+ *
+ * When at least one `inside` network is declared, the engine enforces
+ * address anti-spoofing: packets arriving from the outside must NOT have an
+ * inside source address, and packets arriving from the inside MUST have one.
+ * With no `inside` line the check is off.
  *
  * Rules are evaluated in file order, first match wins, and if nothing
  * matches the policy is DENY. Rules are only consulted for the first packet
@@ -28,23 +39,38 @@ typedef enum { ACT_DENY = 0, ACT_ALLOW = 1 } action_t;
 typedef struct { bool any; uint32_t net, mask; } addr_match_t;
 typedef struct { uint16_t lo, hi; } port_range_t;
 
+/* A rule's port list: matches if the port falls in ANY of the ranges. */
+#define MAX_PORT_RANGES 8
+typedef struct {
+    port_range_t r[MAX_PORT_RANGES];
+    uint8_t      n;                 /* always >= 1 (omitted = 0-65535) */
+} port_set_t;
+
+/* Max `inside` networks a rules file may declare. */
+#define MAX_INSIDE_NETS 8
+
 typedef struct rule {
     action_t     action;
     dir_t        dir;
     uint8_t      proto;          /* 0 = any */
     addr_match_t src, dst;
-    port_range_t sport, dport;
+    port_set_t   sport, dport;
     int          line;           /* source line number, for logs */
 } rule_t;
 
 struct rules {
     rule_t *v;
     size_t  n, cap;
+    addr_match_t inside[MAX_INSIDE_NETS];   /* `inside` directives */
+    size_t       ninside;
 };
 
 rules_t *rules_load_file(const char *path, char *err, size_t errlen);
 rules_t *rules_parse_string(const char *text, char *err, size_t errlen);
 void     rules_free(rules_t *r);
+
+/* True if ip is in one of the declared inside networks. */
+bool rules_is_inside(const rules_t *r, uint32_t ip);
 
 /* First matching rule for a new-flow packet, or NULL (=> default deny). */
 const rule_t *rules_match(const rules_t *r, const pkt_t *p, dir_t dir);

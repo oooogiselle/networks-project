@@ -26,6 +26,9 @@ void log_flow(const char *event, const flow_t *f, uint64_t now_ns);
 /* DEBUG: a dropped packet. */
 void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns);
 
+/* DEBUG: a packet that failed parsing (result is a parse_result_t). */
+void log_parse_fail(unsigned result, dir_t dir, size_t len, uint64_t now_ns);
+
 void engine_stats_print(const engine_stats_t *s, FILE *out);
 
 #endif

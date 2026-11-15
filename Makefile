@@ -23,9 +23,9 @@ $(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
 $(LIB): $(LIB_OBJ)
 	$(AR) rcs $@ $^
 
-# The parser tests also need the test packet builder.
-$(BUILD)/test_parser: tests/test_parser.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
-	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_parser.c tests/pktbuild.c $(LIB) -o $@
+# The parser and engine tests also need the test packet builder.
+$(BUILD)/test_parser $(BUILD)/test_engine: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
+	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/$*.c tests/pktbuild.c $(LIB) -o $@
 
 $(BUILD)/test_%: tests/test_%.c tests/testutil.h $(LIB)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) $< $(LIB) -o $@

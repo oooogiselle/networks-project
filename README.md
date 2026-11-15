@@ -37,7 +37,17 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
    addresses. On failure it returns a `parse_result_t` (malformed, fragment,
    unsupported, bad checksum) and the packet is dropped without reaching the
    engine. On success it fills a `pkt_t` (contract in `engine.h`).
+   A rejected packet is reported with `engine_parse_failed(e, result, dir,
+   len, now_ns)`, so it is counted (per `parse_result_t`) and logged next to
+   the engine's own drop reasons.
 2. `engine_decide(e, &pkt, dir, now_ns, &reason)`:
+   - **Anti-spoofing** (when the rules declare `inside` networks): outside
+     packets may not carry an inside source address, and inside packets must
+     (`DROP_BAD_SRC`).
+   - **ICMP errors** (unreachable, time exceeded, parameter problem) are
+     allowed only if the packet they embed belongs to a tracked flow and the
+     error travels back toward that packet's sender. They never change the
+     flow or refresh its timer.
    - **Flow exists** (fast path): update TCP state / timers, no rules evaluated.
      Packets travelling the wrong way for the flow (spoofing) are dropped.
    - **No flow** (slow path): only a pure TCP SYN, a UDP datagram, or an ICMP
@@ -46,24 +56,22 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
 3. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, and calls
    `engine_expire()` about once a second.
 
-For ICMP errors (unreachable, time exceeded, parameter problem), `pkt.payload`
-is the embedded original packet; `parse_icmp_inner()` extracts its 5-tuple so
-it can be matched against an existing flow.
+For ICMP errors, `pkt.payload` is the embedded original packet;
+`parse_icmp_inner()` extracts its 5-tuple, which the engine matches against
+the flow table.
 
 ## Rules
 
 See `config/rules.example.conf` and the syntax comment in `include/rules.h`.
+Ports may be a list of numbers and ranges (`80,443`, `22,8000-8100`; up to 8
+items). `inside <cidr>` declares the trusted network(s) and turns on
+address anti-spoofing; without it that check is off.
 `out` = connection initiated from the inside (the default); `in` = initiated
 from the outside (exposed services).
 
 ## Not done yet / ideas
 
-- ICMP error messages matched against existing flows (spec item 6; parser
-  side done via `parse_icmp_inner()`, engine side TODO)
-- Address-based anti-spoofing: outside packets claiming an inside source, and
-  inside packets with a non-inside source (spec item 7)
-- Parse failures counted/logged alongside engine drop reasons (spec item 8)
-- Comma-separated port lists in rules (`80,443`, as in the spec example)
 - TCP sequence-number validation (blind RST/injection protection)
 - SYN-flood protection (SYN cookies / half-open limits)
+- Rate limiting of related ICMP errors
 - Application identification (HTTP/DNS by payload) or source NAT

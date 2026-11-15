@@ -11,11 +11,15 @@
 
 #include "flowtable.h"
 #include "log.h"
+#include "parser.h"
 #include "rules.h"
 #include "tcpstate.h"
 
 #define DEFAULT_BUCKETS  (1u << 16)
 #define DEFAULT_MAX_FLOWS (1u << 18)
+
+_Static_assert(PARSE_RESULT_COUNT <= ENGINE_PARSE_KINDS,
+               "grow ENGINE_PARSE_KINDS in engine.h");
 
 struct engine {
     rules_t     *rules;
@@ -68,10 +72,63 @@ static verdict_t do_allow(engine_t *e, drop_reason_t *out)
     return VERDICT_ALLOW;
 }
 
+void engine_parse_failed(engine_t *e, unsigned result, dir_t dir, size_t len,
+                         uint64_t now_ns)
+{
+    if (result == PARSE_OK || result >= PARSE_RESULT_COUNT) return;
+    e->st.pkts_total++;
+    e->st.pkts_dropped++;
+    e->st.parse_fail[result]++;
+    log_parse_fail(result, dir, len, now_ns);
+}
+
+/*
+ * ICMP error (unreachable, time exceeded, ...): allowed only if the packet it
+ * embeds belongs to a tracked flow AND the error is travelling back toward
+ * that packet's sender. The flow itself is not touched (no state change, no
+ * counters, no timer refresh), so errors cannot keep a flow alive.
+ */
+static verdict_t decide_icmp_error(engine_t *e, const pkt_t *p, dir_t dir,
+                                   uint64_t now, drop_reason_t *reason)
+{
+    pkt_t in;
+    if (parse_icmp_inner(p, &in) != PARSE_OK)
+        return do_drop(e, p, dir, now, DROP_ICMP_ERR, reason);
+
+    /* The embedded packet, as its sender wrote it. */
+    const flow_key_t key = { in.src_ip, in.dst_ip, in.src_port, in.dst_port,
+                             in.proto };
+    bool inner_is_reply = false;
+    const flow_t *f = ft_lookup(e->ft, &key, now, &inner_is_reply);
+    if (!f)
+        return do_drop(e, p, dir, now, DROP_ICMP_ERR, reason);
+
+    /* The offending packet came from the originator (or the responder, if
+     * inner_is_reply); the error must arrive from the opposite side. */
+    const dir_t inner_sent_on = inner_is_reply ? !f->orig_dir : f->orig_dir;
+    if (dir == inner_sent_on)
+        return do_drop(e, p, dir, now, DROP_SPOOF, reason);
+
+    e->st.icmp_related++;
+    return do_allow(e, reason);
+}
+
 verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
                         uint64_t now_ns, drop_reason_t *reason)
 {
     e->st.pkts_total++;
+
+    /* Anti-spoofing (only when the rules declare `inside` networks): the
+     * outside may not use inside addresses, the inside must use them. */
+    if (e->rules->ninside &&
+        rules_is_inside(e->rules, p->src_ip) != (dir == DIR_IN))
+        return do_drop(e, p, dir, now_ns, DROP_BAD_SRC, reason);
+
+    if (p->proto == FW_PROTO_ICMP && icmp_is_error(p->icmp_type)) {
+        /* Checked before the flow lookup: an error's own (ip, ip, 0, 0)
+         * tuple must never be mistaken for an echo flow with identifier 0. */
+        return decide_icmp_error(e, p, dir, now_ns, reason);
+    }
 
     const flow_key_t key = { p->src_ip, p->dst_ip, p->src_port, p->dst_port,
                              p->proto };
