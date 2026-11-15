@@ -6,7 +6,8 @@
 # Date:        November 15, 2026
 #
 # Description: GitHub Actions: build and run the unit tests (plain and under
-#              ASan + UBSan) with gcc and clang on every push and pull request.
+#              ASan + UBSan) with gcc and clang, then the end-to-end tests in
+#              network namespaces, on every push and pull request.
 # ============================================================================
 
 name: CI
@@ -36,26 +37,27 @@ jobs:
       - name: Unit tests (ASan + UBSan)
         run: make CC=${{ matrix.cc }} asan
 
-  # Integration tests are NOT run in CI yet: they need build/tunwall and
-  # scripts/netns.sh (tun I/O and namespace setup), which don't exist yet. Once
-  # they do, uncomment the job below. It deliberately fails (never skips) if a
-  # piece is missing, so a green check means the tests really ran.
-  #
-  # integration:
-  #   name: integration tests
-  #   runs-on: ubuntu-latest
-  #   needs: unit
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Install tools
-  #       run: sudo apt-get update && sudo apt-get install -y nmap
-  #     - name: Build
-  #       run: make tunwall
-  #     - name: Integration tests
-  #       run: sudo LOGDIR=$PWD/build/integration REQUIRE_INTEGRATION=1 tests/integration/run_all.sh
-  #     - name: Upload firewall log
-  #       if: always()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: integration-logs
-  #         path: build/integration/
+  # End-to-end tests in network namespaces against the real build/tunwall.
+  # REQUIRE_INTEGRATION=1 makes a missing piece (binary, script, nmap) a
+  # failure, never a skip, so a green check means the tests really ran.
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y nmap
+      - name: Build
+        run: make tunwall
+      - name: Integration tests
+        run: sudo LOGDIR=$PWD/build/integration REQUIRE_INTEGRATION=1 tests/integration/run_all.sh
+      - name: Make logs readable for upload
+        if: always()
+        run: sudo chmod -R a+rX build/integration || true
+      - name: Upload firewall log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: build/integration/

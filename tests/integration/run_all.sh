@@ -7,16 +7,18 @@
 # Date:        November 15, 2026
 #
 # Description: End-to-end tests for the firewall in the three-namespace test
-#              topology (spec section 6). Needs root. Skips (exit 0) until
-#              the tun I/O program and namespace script exist.
+#              topology (spec section 6). Needs root. Skips locally (exit 0)
+#              if build/tunwall or scripts/netns.sh is missing; with
+#              REQUIRE_INTEGRATION=1 (CI) a missing piece is a failure.
 #
-# Assumed interface with Giselle's pieces (change here if hers differs):
+# Uses:
 #   scripts/netns.sh up|down   creates/removes namespaces "inside" (10.0.1.2,
-#                              10.0.1.3) and "outside" (10.0.2.2, 10.0.2.3)
-#                              routed only through the firewall namespace
-#   build/tunwall -r <rules>   runs in the "firewall" namespace; SIGUSR1
-#                              prints counters; logs to stderr
-# Override with TUNWALL=, NETNS_SCRIPT=, RULES=.
+#                              10.0.1.3), "firewall" and "outside" (10.0.2.2,
+#                              10.0.2.3), routed only through the firewall
+#   build/tunwall -r <rules> -d  runs in the "firewall" namespace; -d logs
+#                              every drop; SIGUSR1 prints counters; logs go
+#                              to stderr
+# Override with TUNWALL=, NETNS_SCRIPT=, RULES=, TUNWALL_ARGS=, LOGDIR=.
 # ============================================================================
 set -u
 cd "$(dirname "$0")/../.."

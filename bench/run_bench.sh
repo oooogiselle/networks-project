@@ -8,7 +8,8 @@
 #
 # Description: iperf3 throughput and ping latency from inside to outside in
 #              the test topology. Run once per setup and label the run:
-#                sudo bench/run_bench.sh kernel     (plain kernel forwarding)
+#                sudo scripts/netns.sh up kernel; sudo bench/run_bench.sh kernel
+#                sudo scripts/netns.sh up; (tunwall -r bench/allow-all.conf -q &)
 #                sudo bench/run_bench.sh allow-all  (tunwall, one allow rule)
 #                sudo bench/run_bench.sh many-rules (tunwall, many rules)
 #              Results go to bench/results/<label>.txt (git-ignored).
@@ -24,9 +25,13 @@ for c in iperf3 ping; do command -v $c >/dev/null || { echo "need $c"; exit 1; }
 # The label must match what is actually running, or the numbers are misleading.
 case "$label" in
     kernel)
-        pgrep -x tunwall >/dev/null && { echo "label 'kernel' but tunwall is running; stop it first"; exit 1; } ;;
+        pgrep -x tunwall >/dev/null && { echo "label 'kernel' but tunwall is running; stop it first"; exit 1; }
+        ip -n firewall rule 2>/dev/null | grep -q "iif veth-in" &&
+            { echo "label 'kernel' needs the baseline topology: sudo scripts/netns.sh up kernel"; exit 1; } ;;
     allow-all|many-rules)
         pgrep -x tunwall >/dev/null || { echo "label '$label' but tunwall is not running; start it with the matching rules"; exit 1; }
+        ip -n firewall rule 2>/dev/null | grep -q "iif veth-in" ||
+            { echo "label '$label' needs the firewall topology: sudo scripts/netns.sh up"; exit 1; }
         # Record which rules file the running firewall was started with.
         echo "tunwall command line: $(tr '\0' ' ' < /proc/"$(pgrep -x tunwall | head -1)"/cmdline)" ;;
     *) echo "label must be kernel, allow-all or many-rules"; exit 1 ;;
