@@ -21,12 +21,16 @@
 set -u
 cd "$(dirname "$0")/../.."
 TUNWALL=${TUNWALL:-build/tunwall}
+TUNWALL_ARGS=${TUNWALL_ARGS:--d}   # -d = debug logging (per-packet DROP lines)
 NETNS_SCRIPT=${NETNS_SCRIPT:-scripts/netns.sh}
 RULES=${RULES:-config/rules.example.conf}
 LOGDIR=${LOGDIR:-build/integration}
 
 if [ ! -x "$TUNWALL" ] || [ ! -x "$NETNS_SCRIPT" ]; then
-    echo "SKIP: $TUNWALL or $NETNS_SCRIPT not present yet (tun I/O and namespace setup)"
+    echo "$TUNWALL or $NETNS_SCRIPT not present yet (tun I/O and namespace setup)"
+    # CI sets REQUIRE_INTEGRATION=1 so a missing piece is a failure, not a pass.
+    if [ -n "${REQUIRE_INTEGRATION:-}" ]; then echo "FAIL: integration tests required but cannot run"; exit 1; fi
+    echo "SKIP (set REQUIRE_INTEGRATION=1 to make this an error)"
     exit 0
 fi
 if [ "$(id -u)" -ne 0 ]; then echo "must run as root (sudo)"; exit 1; fi
@@ -41,12 +45,31 @@ check(){ # check <name> <expected: pass|fail> <cmd...>
     if "$@" >/dev/null 2>&1; then got=pass; else got=fail; fi
     if [ "$got" = "$want" ]; then ok "$name"; else bad "$name (wanted $want)"; fi
 }
+expect(){ # expect <name> <wanted outcome> <command printing an outcome...>
+    local name=$1 want=$2; shift 2
+    local got; got=$("$@" 2>/dev/null | tail -1)
+    if [ "$got" = "$want" ]; then ok "$name"; else bad "$name (wanted '$want', got '${got:-nothing}')"; fi
+}
+logged(){ # logged <name> <extended regex>: the firewall log must contain a matching line
+    if grep -Eq "$2" "$LOGDIR/tunwall.log"; then ok "log: $1"; else bad "log: $1 (no line matching: $2)"; fi
+}
+not_logged(){ # not_logged <name> <regex>
+    if grep -Eq "$2" "$LOGDIR/tunwall.log"; then bad "log: $1 (unexpected line matching: $2)"; else ok "log: $1"; fi
+}
+probe(){ ip netns exec "$1" python3 tests/integration/probe.py "$2" "$3" "$4"; }
+icmp_probe(){ # reply | refused (ICMP unreachable) | timeout (silent drop)
+    local out; out=$(ip netns exec "$1" ping -c 2 -W 2 "$2" 2>&1)
+    if echo "$out" | grep -qiE "unreachable|prohibited"; then echo refused
+    elif echo "$out" | grep -qE " 0% packet loss"; then echo reply
+    elif echo "$out" | grep -qE "100% packet loss"; then echo timeout
+    else echo "mixed"; fi
+}
 inside()  { ip netns exec inside  "$@"; }
 outside() { ip netns exec outside "$@"; }
 bg()      { "$@" >/dev/null 2>&1 & BG_PIDS="$BG_PIDS $!"; }
 
 start_fw() {
-    ip netns exec firewall "$TUNWALL" -r "$RULES" 2>"$LOGDIR/tunwall.log" &
+    ip netns exec firewall "$TUNWALL" -r "$RULES" $TUNWALL_ARGS 2>"$LOGDIR/tunwall.log" &
     FW_PID=$!; sleep 1
     kill -0 "$FW_PID" 2>/dev/null
 }
@@ -100,53 +123,69 @@ sys.exit(0 if ra and not rb else 1)' >/dev/null 2>&1 &
     EXPIRY_PID=$!
 fi
 
-udp_echo() { # udp_echo <ns> <dst> <port> : send one datagram, expect it back
-    ip netns exec "$1" python3 -c '
-import socket,sys
-s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2)
-s.sendto(b"hello",(sys.argv[1],int(sys.argv[2]))); assert s.recv(16)==b"hello"' "$2" "$3"
+# Note on the expectations below: "timeout" means the packet was silently
+# dropped. "refused" or "unreachable" would mean the firewall answered with a
+# RST or ICMP error, which the spec forbids (ports must look filtered).
+need_tool() { # in CI (REQUIRE_INTEGRATION) a missing tool is a failure, not a skip
+    command -v "$1" >/dev/null && return 0
+    if [ -n "${REQUIRE_INTEGRATION:-}" ]; then bad "$1 is not installed"; else echo "skip: $1 not installed"; fi
+    return 1
 }
-tcp_open() { ip netns exec "$1" timeout 3 bash -c "exec 3<>/dev/tcp/$2/$3"; }
 
 echo "== allowed traffic from inside"
-check "inside curl downloads page"      pass inside curl -sf --max-time 5 -o "$LOGDIR/got.bin" http://10.0.2.2/index.bin
-check "downloaded bytes match (sha256)" pass bash -c "[ \"\$(sha256sum < $SRV/index.bin)\" = \"\$(sha256sum < $LOGDIR/got.bin)\" ]"
-check "inside ping outside"             pass inside ping -c 2 -W 2 10.0.2.2
-check "inside DNS to trusted resolver"  pass udp_echo inside 10.0.2.2 53
+check  "inside curl downloads page"      pass inside curl -sf --max-time 5 -o "$LOGDIR/got.bin" http://10.0.2.2/index.bin
+check  "downloaded bytes match (sha256)" pass bash -c "[ \"\$(sha256sum < $SRV/index.bin)\" = \"\$(sha256sum < $LOGDIR/got.bin)\" ]"
+expect "inside ping outside gets replies" reply icmp_probe inside 10.0.2.2
+expect "inside DNS to trusted resolver"   reply probe inside udp 10.0.2.2 53
 
-echo "== blocked traffic"
-check "outside ping inside fails"       fail outside ping -c 2 -W 2 10.0.1.2
-check "outside to inside port 3389 dropped" fail tcp_open outside 10.0.1.3 3389
-check "inside web to other port dropped"    fail tcp_open inside 10.0.2.2 8080
-check "inside DNS to other resolver dropped" fail udp_echo inside 10.0.2.3 53
+echo "== blocked traffic is silently dropped (not refused)"
+expect "outside ping to inside"            timeout icmp_probe outside 10.0.1.2
+expect "outside to inside port 3389"       timeout probe outside tcp 10.0.1.3 3389
+expect "inside web to non-allowed port"    timeout probe inside  tcp 10.0.2.2 8080
+expect "inside DNS to untrusted resolver"  timeout probe inside  udp 10.0.2.3 53
+expect "outside to ssh on client A (no rule)" timeout probe outside tcp 10.0.1.2 22
 
 echo "== exposed service"
-check "outside reaches ssh on client B" pass tcp_open outside 10.0.1.3 22
-check "outside cannot reach ssh on client A" fail tcp_open outside 10.0.1.2 22
+expect "outside reaches ssh on client B"   open probe outside tcp 10.0.1.3 22
 
 echo "== scans (nmap)"
-if command -v nmap >/dev/null; then
+if need_tool nmap; then
     open=$(outside nmap -n -Pn -p 22,80,443,3389 10.0.1.3 2>/dev/null | grep -c ' open ')
     [ "$open" = 1 ] && ok "nmap finds only the allowed port" || bad "nmap open ports = $open, wanted 1"
+    closed=$(outside nmap -n -Pn -p 80,443,3389 10.0.1.3 2>/dev/null | grep -c ' closed ')
+    [ "$closed" = 0 ] && ok "scanned ports are filtered, none report closed (no RST)" || bad "$closed ports reported closed"
     ack=$(outside nmap -n -Pn -sA -p 22,3389 10.0.1.3 2>/dev/null | grep -c ' unfiltered')
     [ "$ack" = 0 ] && ok "ACK scan finds nothing unfiltered" || bad "ACK scan sees $ack unfiltered ports"
-else echo "skip nmap tests (nmap not installed)"; fi
+fi
 
 echo "== logging and stats"
 kill -USR1 "$FW_PID"; sleep 1
-grep -qiE "drop|denied|no matching" "$LOGDIR/tunwall.log" && ok "drops are logged with a reason" || bad "no drop reasons in log"
-grep -qiE "flow" "$LOGDIR/tunwall.log" && ok "flow open/close logged" || bad "no flow lines in log"
+
+logged "flow opened for the allowed web request" 'FLOW NEW +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 '
+logged "flow opened for the exposed ssh connection" 'FLOW NEW +tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:22 '
+logged "inbound 3389 dropped for no matching rule" 'DROP tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:3389 .*why=no-rule\(default-deny\)'
+logged "outbound port 8080 dropped for no matching rule" 'DROP tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:8080 .*why=no-rule\(default-deny\)'
+logged "DNS to other resolver dropped by the deny rule" 'DROP udp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.3:53 .*why=rule-deny'
+logged "inbound ping dropped for no matching rule" 'DROP icmp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.2:[0-9]+ .*why=no-rule\(default-deny\)'
+not_logged "nothing allowed was logged as dropped (web port 80)" 'DROP tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 '
+not_logged "nothing allowed was logged as dropped (ssh on client B)" 'DROP tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:22 '
+logged "stats: default-deny count printed" '^drop\[no-rule\(default-deny\)\]=[1-9][0-9]*'
+logged "stats: rule-deny count printed" '^drop\[rule-deny\]=[1-9][0-9]*'
+logged "stats: flows were created" '^flows: +created=[1-9][0-9]* '
 
 echo "== idle flows expire"
 if [ -n "${EXPIRY_PID:-}" ]; then
     echo "   (waiting for the 40 s expiry test)"
     wait "$EXPIRY_PID" && ok "late reply on an expired UDP flow is dropped, timely reply allowed" \
                        || bad "flow expiry: late reply got through or timely reply was lost"
+    logged "the slow UDP flow was expired" 'FLOW EXPIRE +udp 10\.0\.1\.2:40035 -> 10\.0\.2\.2:53 '
+    logged "the late reply was dropped" 'DROP udp 10\.0\.2\.2:53 -> 10\.0\.1\.2:40035 .*why=no-rule\(default-deny\)'
 else echo "skip expiry test (SKIP_SLOW set)"; fi
 
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""
-check "no traffic once tunwall is gone" fail inside curl -sf --max-time 3 -o /dev/null http://10.0.2.2/index.bin
+expect "web connection times out once tunwall is gone" timeout probe inside tcp 10.0.2.2 80
+expect "ping times out once tunwall is gone"           timeout icmp_probe inside 10.0.2.2
 
 echo; echo "$pass passed, $failn failed"
 [ "$failn" -eq 0 ]
