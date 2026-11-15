@@ -24,7 +24,6 @@ TUNWALL=${TUNWALL:-build/tunwall}
 TUNWALL_ARGS=${TUNWALL_ARGS:--d}   # -d = debug logging (per-packet DROP lines)
 NETNS_SCRIPT=${NETNS_SCRIPT:-scripts/netns.sh}
 RULES=${RULES:-config/rules.example.conf}
-LOGDIR=${LOGDIR:-build/integration}
 
 if [ ! -x "$TUNWALL" ] || [ ! -x "$NETNS_SCRIPT" ]; then
     echo "$TUNWALL or $NETNS_SCRIPT not present yet (tun I/O and namespace setup)"
@@ -35,7 +34,13 @@ if [ ! -x "$TUNWALL" ] || [ ! -x "$NETNS_SCRIPT" ]; then
 fi
 if [ "$(id -u)" -ne 0 ]; then echo "must run as root (sudo)"; exit 1; fi
 
-mkdir -p "$LOGDIR"
+# Private scratch dir (mode 0700) so root never writes through a planted path.
+# Set LOGDIR to keep logs somewhere specific (it must not be a symlink).
+if [ -z "${LOGDIR:-}" ]; then LOGDIR=$(mktemp -d /tmp/tunwall-it.XXXXXX) || exit 1
+elif [ -L "$LOGDIR" ]; then echo "LOGDIR must not be a symlink"; exit 1
+else mkdir -p "$LOGDIR" || exit 1; fi
+chmod 700 "$LOGDIR"
+echo "logs: $LOGDIR"
 pass=0; failn=0; FW_PID=""; BG_PIDS=""
 
 ok()   { echo "ok   $1"; pass=$((pass+1)); }
@@ -98,8 +103,9 @@ while True:
         threading.Timer(int(d[4:]),lambda d=d,a=a:s.sendto(d,a)).start()
     else:
         s.sendto(d,a)'
-bg ip netns exec inside python3 -m http.server 22   --bind 10.0.1.3
-bg ip netns exec inside python3 -m http.server 3389 --bind 10.0.1.3
+EMPTY=$LOGDIR/empty; mkdir -p "$EMPTY"   # served directory: nothing sensitive
+bg ip netns exec inside python3 -m http.server 22   --bind 10.0.1.3 --directory "$EMPTY"
+bg ip netns exec inside python3 -m http.server 3389 --bind 10.0.1.3 --directory "$EMPTY"
 sleep 1
 
 # Flow expiry: an unanswered UDP flow times out after 30 s. Two flows send a
@@ -126,6 +132,7 @@ fi
 # Note on the expectations below: "timeout" means the packet was silently
 # dropped. "refused" or "unreachable" would mean the firewall answered with a
 # RST or ICMP error, which the spec forbids (ports must look filtered).
+same_sha256() { [ "$(sha256sum < "$1")" = "$(sha256sum < "$2")" ]; }
 need_tool() { # in CI (REQUIRE_INTEGRATION) a missing tool is a failure, not a skip
     command -v "$1" >/dev/null && return 0
     if [ -n "${REQUIRE_INTEGRATION:-}" ]; then bad "$1 is not installed"; else echo "skip: $1 not installed"; fi
@@ -134,7 +141,7 @@ need_tool() { # in CI (REQUIRE_INTEGRATION) a missing tool is a failure, not a s
 
 echo "== allowed traffic from inside"
 check  "inside curl downloads page"      pass inside curl -sf --max-time 5 -o "$LOGDIR/got.bin" http://10.0.2.2/index.bin
-check  "downloaded bytes match (sha256)" pass bash -c "[ \"\$(sha256sum < $SRV/index.bin)\" = \"\$(sha256sum < $LOGDIR/got.bin)\" ]"
+check  "downloaded bytes match (sha256)" pass same_sha256 "$SRV/index.bin" "$LOGDIR/got.bin"
 expect "inside ping outside gets replies" reply icmp_probe inside 10.0.2.2
 expect "inside DNS to trusted resolver"   reply probe inside udp 10.0.2.2 53
 
@@ -149,13 +156,29 @@ echo "== exposed service"
 expect "outside reaches ssh on client B"   open probe outside tcp 10.0.1.3 22
 
 echo "== scans (nmap)"
+# Each scan must finish ("Nmap done") so empty output cannot pass, and the
+# counts below are exact: every probed port is filtered / open|filtered
+# (silent drop) and none is "closed" (which would mean a RST came back).
+nmap_scan() { # nmap_scan <nmap flags...> -> output on stdout, fails if nmap did not finish
+    local out; out=$(outside nmap -n -Pn "$@" 10.0.1.3 2>&1)
+    echo "$out" | grep -q "Nmap done" || return 1
+    echo "$out"
+}
+scan_expect() { # scan_expect <name> <state regex> <count wanted> <nmap flags...>
+    local name=$1 state=$2 want=$3; shift 3
+    local out; out=$(nmap_scan "$@") || { bad "$name (nmap did not finish)"; return; }
+    local got; got=$(echo "$out" | grep -cE "$state")
+    local closed; closed=$(echo "$out" | grep -cE '[0-9]+/(tcp|udp) +closed')
+    if [ "$got" = "$want" ] && [ "$closed" = 0 ]; then ok "$name"
+    else bad "$name (wanted $want x '$state', got $got; $closed closed)"; fi
+}
 if need_tool nmap; then
-    open=$(outside nmap -n -Pn -p 22,80,443,3389 10.0.1.3 2>/dev/null | grep -c ' open ')
-    [ "$open" = 1 ] && ok "nmap finds only the allowed port" || bad "nmap open ports = $open, wanted 1"
-    closed=$(outside nmap -n -Pn -p 80,443,3389 10.0.1.3 2>/dev/null | grep -c ' closed ')
-    [ "$closed" = 0 ] && ok "scanned ports are filtered, none report closed (no RST)" || bad "$closed ports reported closed"
-    ack=$(outside nmap -n -Pn -sA -p 22,3389 10.0.1.3 2>/dev/null | grep -c ' unfiltered')
-    [ "$ack" = 0 ] && ok "ACK scan finds nothing unfiltered" || bad "ACK scan sees $ack unfiltered ports"
+    scan_expect "SYN scan: only the allowed port is open" '[0-9]+/tcp +open +' 1 -sS -p 22,80,443,3389
+    scan_expect "SYN scan: the other 3 ports are filtered" '[0-9]+/tcp +filtered' 3 -sS -p 22,80,443,3389
+    scan_expect "ACK scan: both ports filtered, none unfiltered" '[0-9]+/tcp +filtered' 2 -sA -p 22,3389
+    scan_expect "FIN scan: open|filtered, no RST" '[0-9]+/tcp +open\|filtered' 2 -sF -p 22,3389
+    scan_expect "NULL scan: open|filtered, no RST" '[0-9]+/tcp +open\|filtered' 2 -sN -p 22,3389
+    scan_expect "Xmas scan: open|filtered, no RST" '[0-9]+/tcp +open\|filtered' 2 -sX -p 22,3389
 fi
 
 echo "== logging and stats"
@@ -167,8 +190,8 @@ logged "inbound 3389 dropped for no matching rule" 'DROP tcp 10\.0\.2\.[0-9]+:[0
 logged "outbound port 8080 dropped for no matching rule" 'DROP tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:8080 .*why=no-rule\(default-deny\)'
 logged "DNS to other resolver dropped by the deny rule" 'DROP udp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.3:53 .*why=rule-deny'
 logged "inbound ping dropped for no matching rule" 'DROP icmp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.2:[0-9]+ .*why=no-rule\(default-deny\)'
-not_logged "nothing allowed was logged as dropped (web port 80)" 'DROP tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 '
-not_logged "nothing allowed was logged as dropped (ssh on client B)" 'DROP tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:22 '
+not_logged "allowed web traffic is never dropped by a rule" 'DROP tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 .*why=(no-rule|rule-deny)'
+not_logged "allowed ssh is never dropped by a rule" 'DROP tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:22 .*why=(no-rule|rule-deny)'
 logged "stats: default-deny count printed" '^drop\[no-rule\(default-deny\)\]=[1-9][0-9]*'
 logged "stats: rule-deny count printed" '^drop\[rule-deny\]=[1-9][0-9]*'
 logged "stats: flows were created" '^flows: +created=[1-9][0-9]* '

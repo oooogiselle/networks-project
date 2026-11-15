@@ -21,6 +21,17 @@ secs=${SECS:-10}
 out=bench/results; mkdir -p "$out"
 for c in iperf3 ping; do command -v $c >/dev/null || { echo "need $c"; exit 1; }; done
 
+# The label must match what is actually running, or the numbers are misleading.
+case "$label" in
+    kernel)
+        pgrep -x tunwall >/dev/null && { echo "label 'kernel' but tunwall is running; stop it first"; exit 1; } ;;
+    allow-all|many-rules)
+        pgrep -x tunwall >/dev/null || { echo "label '$label' but tunwall is not running; start it with the matching rules"; exit 1; }
+        # Record which rules file the running firewall was started with.
+        echo "tunwall command line: $(tr '\0' ' ' < /proc/"$(pgrep -x tunwall | head -1)"/cmdline)" ;;
+    *) echo "label must be kernel, allow-all or many-rules"; exit 1 ;;
+esac
+
 ip netns exec outside iperf3 -s -1 -B 10.0.2.2 >/dev/null 2>&1 &
 srv=$!; sleep 1
 if [ "${PERF:-0}" = 1 ] && pgrep -x tunwall >/dev/null; then
