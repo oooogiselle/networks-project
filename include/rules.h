@@ -97,6 +97,9 @@ void     rules_free(rules_t *r);
 
 /* True if ip is in one of the declared inside networks. */
 bool rules_is_inside(const rules_t *r, uint32_t ip);
+/* True if ip is the directed-broadcast address of a declared inside network
+ * (e.g. 10.0.1.255 for 10.0.1.0/24). A /32 network has none. */
+bool rules_is_inside_broadcast(const rules_t *r, uint32_t ip);
 
 /* First matching rule for a new-flow packet, or NULL (=> default deny). */
 const rule_t *rules_match(const rules_t *r, const pkt_t *p, dir_t dir);

@@ -65,7 +65,17 @@ engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows)
 
 engine_t *engine_create_with_rules(rules_t *rules)
 {
-    return engine_create_with_rules_sized(rules, FW_DEFAULT_MAX_FLOWS);
+    engine_t *e = engine_create_with_rules_sized(rules, FW_DEFAULT_MAX_FLOWS);
+    if (e && !engine_set_limits(e, FW_DEFAULT_MAX_PER_SOURCE, FW_DEFAULT_MAX_OUTSIDE)) {
+        engine_destroy(e);
+        return NULL;
+    }
+    return e;
+}
+
+bool engine_set_limits(engine_t *e, size_t max_per_source, size_t max_outside)
+{
+    return ft_set_limits(e->ft, max_per_source, max_outside);
 }
 
 engine_t *engine_create(const char *rules_path, char *err, size_t errlen)
@@ -74,7 +84,7 @@ engine_t *engine_create(const char *rules_path, char *err, size_t errlen)
     if (!r) return NULL;
     if (r->ninside == 0) {
         if (err && errlen)
-            snprintf(err, errlen, "%s declares no inside network (add e.g. "
+            snprintf(err, errlen, "%s: declares no inside network (add e.g. "
                      "'inside 10.0.1.0/24'): anti-spoofing needs one", rules_path);
         rules_free(r);
         return NULL;
@@ -234,9 +244,12 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         e->st.fastpath++;
         const bool from_orig = !is_reply;
 
-        /* Tuple matches but it arrived on the wrong interface: spoofing. */
-        if (from_orig != (dir == f->orig_dir))
-            return do_drop(e, p, dir, now_ns, DROP_SPOOF, reason);
+        /* A packet on this flow's tuple always arrives on the right interface
+         * by now: the anti-spoofing check above makes every inside source
+         * arrive on the inside and every outside source on the outside, and a
+         * flow only ever starts between an inside and an outside host (see the
+         * destination check on the slow path). So there is no separate
+         * wrong-interface case left to test for here. */
 
         /* An echo flow carries requests from its originator and replies from
          * its peer, nothing else. Without this a host spoofing the peer could
@@ -246,10 +259,15 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
             p->icmp_type != (from_orig ? ICMP_ECHO_REQUEST : ICMP_ECHO_REPLY))
             return do_drop(e, p, dir, now_ns, DROP_ICMP_TYPE, reason);
 
+        /* A finished TCP connection (TIME_WAIT, CLOSED) must not be kept alive
+         * by traffic: only the packet that closed it starts its short timer. */
+        bool refresh = true;
         if (p->proto == FW_PROTO_TCP) {
             tcp_state_t before = f->tcp_state;
-            if (!tcp_track(f, p->tcp_flags, from_orig))
+            if (!tcp_track_ex(f, p->tcp_flags, from_orig, p->payload_len))
                 return do_drop(e, p, dir, now_ns, DROP_TCP_STATE, reason);
+            refresh = f->tcp_state != before ||
+                      (f->tcp_state != TCPS_TIME_WAIT && f->tcp_state != TCPS_CLOSED);
             if (f->tcp_state != before &&
                 (f->tcp_state == TCPS_TIME_WAIT || f->tcp_state == TCPS_CLOSED)) {
                 f->pkts[from_orig ? 0 : 1]++;     /* so the log line is current */
@@ -263,8 +281,10 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         f->pkts[side]++;
         f->bytes[side] += p->ip_len;
         if (!from_orig) f->seen_reply = true;
-        f->last_seen_ns = now_ns;
-        f->expires_ns = now_ns + flow_timeout_ns(f);
+        if (refresh) {
+            f->last_seen_ns = now_ns;
+            f->expires_ns = now_ns + flow_timeout_ns(f);
+        }
         return do_allow(e, reason);
     }
 
@@ -283,17 +303,30 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         return do_drop(e, p, dir, now_ns, DROP_UNSUPPORTED, reason);
     }
 
+    /* A flow runs between an inside and an outside host. A packet from the
+     * inside aimed at an inside address (or from the outside at an outside
+     * one) has no business crossing the firewall, and nothing may be sent to
+     * an inside network's broadcast address: whatever the rules say. */
+    const bool dst_inside = rules_is_inside(e->rules, p->dst_ip);
+    if (dst_inside == (dir == DIR_IN) ||
+        rules_is_inside_broadcast(e->rules, p->dst_ip))
+        return do_drop(e, p, dir, now_ns, DROP_BAD_DST, reason);
+
     const rule_t *r = rules_match(e->rules, p, dir);
     if (!r)
         return do_drop(e, p, dir, now_ns, DROP_NO_RULE, reason);
     if (r->action == ACT_DENY)
         return do_drop(e, p, dir, now_ns, DROP_RULE_DENY, reason);
 
-    f = ft_insert(e->ft, &key, dir, now_ns);
-    if (!f && reclaim_expired(e, now_ns))
-        f = ft_insert(e->ft, &key, dir, now_ns);
+    ft_status_t why = FT_OK;
+    f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);
+    if (!f && reclaim_expired(e, now_ns))     /* timed-out flows may be holding the room */
+        f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);
     if (!f)
-        return do_drop(e, p, dir, now_ns, DROP_TABLE_FULL, reason);
+        return do_drop(e, p, dir, now_ns,
+                       why == FT_SRC_LIMIT      ? DROP_SRC_LIMIT :
+                       why == FT_OUTSIDE_QUOTA  ? DROP_OUTSIDE_QUOTA : DROP_TABLE_FULL,
+                       reason);
 
     f->rule_line = r->line;
     if (p->proto == FW_PROTO_TCP) tcp_flow_init(f);
@@ -316,6 +349,26 @@ size_t engine_expire(engine_t *e, uint64_t now_ns)
 {
     e->clock_ns = now_ns;
     return ft_expire(e->ft, now_ns, expire_cb, e);
+}
+
+bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_ns)
+{
+    const flow_key_t key = { p->src_ip, p->dst_ip, p->src_port, p->dst_port, p->proto };
+    bool is_reply = false;
+    flow_t *f = ft_lookup(e->ft, &key, now_ns, &is_reply);
+    /* Only the very packet that created the flow: it was the first from its
+     * originator and nothing has come back. */
+    const bool created_by_it = f && !is_reply && dir == f->orig_dir &&
+                               f->pkts[0] == 1 && f->pkts[1] == 0;
+    if (created_by_it) {
+        ft_remove(e->ft, f);
+        e->st.flows_created--;
+    }
+    e->st.pkts_allowed--;                  /* it was never delivered */
+    e->st.pkts_dropped++;
+    e->st.drops[DROP_WRITE_FAILED]++;
+    log_drop(p, dir, DROP_WRITE_FAILED, now_ns);
+    return created_by_it;
 }
 
 void engine_get_stats(const engine_t *e, engine_stats_t *out)

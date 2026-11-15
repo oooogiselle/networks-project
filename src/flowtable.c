@@ -25,12 +25,21 @@
  * a flow never calls malloc/free: nothing is allocated per connection, let
  * alone per packet.
  */
+/* One counter per source address that currently owns flows. Open addressing
+ * with linear probing; a slot is empty when n == 0, and entries are removed
+ * by backward shifting, so no tombstones pile up. Allocated once. */
+typedef struct { uint32_t ip; uint32_t n; } src_slot_t;
+
 struct flowtable {
     flow_t  **buckets;
     flow_t   *pool;          /* max slots, allocated once */
     flow_t   *free_list;     /* unused slots */
     size_t    mask;          /* nbuckets - 1 */
     size_t    count, max;
+    size_t    count_out;        /* flows that were started from the outside */
+    size_t    max_out, max_src; /* limits, 0 = none (see ft_set_limits)     */
+    src_slot_t *src;            /* per-source counters, NULL if no per-source limit */
+    size_t    src_mask;
     uint64_t  expired_total;
     uint8_t   hash_key[16];     /* secret: attackers cannot predict buckets */
     ft_expire_cb expire_hook;   /* sees flows removed lazily by ft_lookup */
@@ -49,6 +58,47 @@ const char *tcp_state_str(tcp_state_t s)
     case TCPS_CLOSED:      return "CLOSED";
     }
     return "?";
+}
+
+static size_t src_home(const flowtable_t *ft, uint32_t ip)
+{
+    uint8_t b[4];
+    for (int i = 0; i < 4; i++) b[i] = (uint8_t)(ip >> (8 * i));
+    return (size_t)fw_siphash24(ft->hash_key, b, sizeof b) & ft->src_mask;
+}
+
+static size_t src_count(const flowtable_t *ft, uint32_t ip)
+{
+    for (size_t i = src_home(ft, ip); ft->src[i].n; i = (i + 1) & ft->src_mask)
+        if (ft->src[i].ip == ip) return ft->src[i].n;
+    return 0;
+}
+
+static void src_inc(flowtable_t *ft, uint32_t ip)
+{
+    size_t i = src_home(ft, ip);
+    while (ft->src[i].n && ft->src[i].ip != ip) i = (i + 1) & ft->src_mask;
+    ft->src[i].ip = ip;
+    ft->src[i].n++;
+}
+
+static void src_dec(flowtable_t *ft, uint32_t ip)
+{
+    size_t i = src_home(ft, ip);
+    while (ft->src[i].n && ft->src[i].ip != ip) i = (i + 1) & ft->src_mask;
+    if (!ft->src[i].n || --ft->src[i].n) return;       /* unknown, or still in use */
+    /* Count hit zero: remove the slot and shift the rest of the cluster back
+     * over it so every remaining entry stays reachable from its home slot. */
+    for (size_t j = i;;) {
+        j = (j + 1) & ft->src_mask;
+        if (!ft->src[j].n) break;
+        const size_t home = src_home(ft, ft->src[j].ip);
+        const bool stays = i <= j ? (i < home && home <= j) : (i < home || home <= j);
+        if (stays) continue;
+        ft->src[i] = ft->src[j];
+        i = j;
+    }
+    ft->src[i].n = 0;
 }
 
 static void put32(uint8_t *p, uint32_t v)
@@ -118,7 +168,7 @@ flowtable_t *ft_create_keyed(size_t nbuckets, size_t max_flows, const uint8_t ke
         return NULL;
     }
     ft->mask = n - 1;
-    ft->max = max_flows;
+    ft->max = max_flows;     /* sizes the per-source counters */
     for (size_t i = max_flows; i-- > 0; ) {     /* slot 0 is handed out first */
         ft->pool[i].next = ft->free_list;
         ft->free_list = &ft->pool[i];
@@ -129,6 +179,7 @@ flowtable_t *ft_create_keyed(size_t nbuckets, size_t max_flows, const uint8_t ke
 void ft_destroy(flowtable_t *ft)
 {
     if (!ft) return;
+    free(ft->src);
     free(ft->pool);
     free(ft->buckets);
     free(ft);
@@ -137,6 +188,8 @@ void ft_destroy(flowtable_t *ft)
 /* Return an already-unlinked slot to the free list. */
 static void release(flowtable_t *ft, flow_t *f)
 {
+    if (f->orig_dir == DIR_OUT && ft->count_out) ft->count_out--;
+    if (ft->src) src_dec(ft, f->key.src_ip);
     f->next = ft->free_list;
     ft->free_list = f;
     ft->count--;
@@ -176,11 +229,40 @@ flow_t *ft_lookup(flowtable_t *ft, const flow_key_t *k, uint64_t now_ns,
     return f;
 }
 
+bool ft_set_limits(flowtable_t *ft, size_t max_per_source, size_t max_outside)
+{
+    if (max_per_source && !ft->src) {
+        size_t n = 16;
+        while (n < 2 * ft->max) n <<= 1;       /* load factor <= 1/2: never full */
+        ft->src = fw_calloc(n, sizeof *ft->src);
+        if (!ft->src) return false;
+        ft->src_mask = n - 1;
+    }
+    ft->max_src = max_per_source;
+    ft->max_out = max_outside;
+    return true;
+}
+
 flow_t *ft_insert(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
                   uint64_t now_ns)
 {
+    return ft_insert_ex(ft, k, orig_dir, now_ns, NULL);
+}
+
+flow_t *ft_insert_ex(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
+                     uint64_t now_ns, ft_status_t *status)
+{
+    ft_status_t why = FT_OK;
+    if (!ft->free_list)
+        why = FT_FULL;
+    else if (ft->max_out && orig_dir == DIR_OUT && ft->count_out >= ft->max_out)
+        why = FT_OUTSIDE_QUOTA;
+    else if (ft->max_src && src_count(ft, k->src_ip) >= ft->max_src)
+        why = FT_SRC_LIMIT;
+    if (status) *status = why;
+    if (why != FT_OK) return NULL;
+
     flow_t *f = ft->free_list;
-    if (!f) return NULL;                  /* table full */
     ft->free_list = f->next;
     memset(f, 0, sizeof *f);              /* slots are reused: start clean */
     f->key = *k;
@@ -190,6 +272,8 @@ flow_t *ft_insert(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
     f->next = *head;
     *head = f;
     ft->count++;
+    if (orig_dir == DIR_OUT) ft->count_out++;
+    if (ft->src) src_inc(ft, k->src_ip);
     return f;
 }
 

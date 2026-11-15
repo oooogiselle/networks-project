@@ -86,9 +86,31 @@ flow_key_t   ft_reverse(const flow_key_t *k);
 flow_t *ft_lookup(flowtable_t *ft, const flow_key_t *k, uint64_t now_ns,
                   bool *is_reply);
 
+/* Why ft_insert_ex() refused a new flow. */
+typedef enum {
+    FT_OK = 0,
+    FT_FULL,             /* no free slot                                      */
+    FT_OUTSIDE_QUOTA,    /* flows started from the outside hold their share   */
+    FT_SRC_LIMIT         /* this source address already has its share of flows */
+} ft_status_t;
+
+/*
+ * Limits that stop one party starving the rest (0 = no limit). Call once,
+ * right after ft_create(), before any flow exists.
+ *   max_per_source:  most flows one originating source address may hold.
+ *   max_outside:     most flows that were started from the outside, so that
+ *                    inside users keep a reserve however hard the outside
+ *                    pushes (spoofed sources defeat a per-source cap alone).
+ * Returns false (limits unchanged) if the bookkeeping cannot be allocated.
+ */
+bool ft_set_limits(flowtable_t *ft, size_t max_per_source, size_t max_outside);
+
 /* Create a flow (zeroed counters, expires_ns = now). NULL if table is full. */
 flow_t *ft_insert(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
                   uint64_t now_ns);
+/* Same, and says why when it returns NULL (status may be NULL). */
+flow_t *ft_insert_ex(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
+                     uint64_t now_ns, ft_status_t *status);
 void    ft_remove(flowtable_t *ft, flow_t *f);
 
 /* Remove every flow with expires_ns <= now. cb (optional) sees each first. */

@@ -21,10 +21,45 @@
 static FILE *g_out = NULL;
 static log_level_t g_level = LOG_OFF;
 
+/*
+ * The limiter is a GCRA ("virtual scheduling") bucket: each line adds one
+ * interval to a theoretical arrival time, and a line is allowed while that
+ * time is less than FW_LOG_BURST intervals ahead of now. It needs one
+ * integer, handles fractional rates exactly, and costs a compare per line.
+ */
+#define LOG_INTERVAL_NS (1000000000ull / FW_LOG_LINES_PER_SEC)
+#define LOG_WINDOW_NS   ((uint64_t)FW_LOG_BURST * LOG_INTERVAL_NS)
+
+static uint64_t g_tat;               /* theoretical arrival time of the next line */
+static uint64_t g_suppressed;        /* since fw_log_set() */
+static uint64_t g_pending;           /* suppressed since the last summary line */
+
 void fw_log_set(FILE *out, log_level_t level)
 {
     g_out = out;
     g_level = level;
+    g_tat = g_suppressed = g_pending = 0;
+}
+
+uint64_t fw_log_suppressed(void) { return g_suppressed; }
+
+/* May a line be written at now_ns? If lines were dropped before, say so first. */
+static bool log_allowed(uint64_t now_ns)
+{
+    if (g_tat > now_ns + 2 * LOG_WINDOW_NS)    /* the clock went backwards */
+        g_tat = now_ns;
+    if (g_tat >= now_ns + LOG_WINDOW_NS) {
+        g_suppressed++;
+        g_pending++;
+        return false;
+    }
+    g_tat = (now_ns > g_tat ? now_ns : g_tat) + LOG_INTERVAL_NS;
+    if (g_pending) {
+        fprintf(g_out, "[%10.6f] LOG %" PRIu64 " log lines suppressed (limit %d/s)\n",
+                now_ns / 1e9, g_pending, FW_LOG_LINES_PER_SEC);
+        g_pending = 0;
+    }
+    return true;
 }
 
 bool fw_log_enabled(log_level_t level)
@@ -65,6 +100,10 @@ const char *drop_reason_str(drop_reason_t r)
     case DROP_ICMP_ERR:    return "icmp-error-unrelated";
     case DROP_ICMP_TYPE:   return "icmp-bad-type";
     case DROP_ICMP_RATE:   return "icmp-error-rate-limited";
+    case DROP_BAD_DST:     return "wrong-destination";
+    case DROP_SRC_LIMIT:   return "per-source-limit";
+    case DROP_OUTSIDE_QUOTA: return "outside-quota";
+    case DROP_WRITE_FAILED: return "write-failed";
     case DROP_REASON_COUNT: break;
     }
     return "?";
@@ -72,7 +111,7 @@ const char *drop_reason_str(drop_reason_t r)
 
 void log_flow(const char *event, const flow_t *f, uint64_t now_ns)
 {
-    if (!fw_log_enabled(LOG_INFO)) return;
+    if (!fw_log_enabled(LOG_INFO) || !log_allowed(now_ns)) return;
     char a[16], b[16];
     /* Duration = how long the flow was active. An EXPIRE is logged at sweep
      * time, which is after the idle timeout; count up to the last packet. */
@@ -90,7 +129,7 @@ void log_flow(const char *event, const flow_t *f, uint64_t now_ns)
 
 void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns)
 {
-    if (!fw_log_enabled(LOG_DEBUG)) return;
+    if (!fw_log_enabled(LOG_DEBUG) || !log_allowed(now_ns)) return;
     char a[16], b[16];
     fprintf(g_out, "[%10.6f] DROP %s %s:%u -> %s:%u flags=0x%02x on=%s why=%s\n",
             now_ns / 1e9, proto_str(p->proto),
@@ -101,7 +140,7 @@ void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns)
 
 void log_parse_fail(unsigned result, dir_t dir, size_t len, uint64_t now_ns)
 {
-    if (!fw_log_enabled(LOG_DEBUG)) return;
+    if (!fw_log_enabled(LOG_DEBUG) || !log_allowed(now_ns)) return;
     fprintf(g_out, "[%10.6f] DROP unparsable len=%zu on=%s why=%s\n",
             now_ns / 1e9, len, dir == DIR_IN ? "in" : "out",
             parse_result_str((parse_result_t)result));

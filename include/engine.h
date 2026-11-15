@@ -49,6 +49,8 @@
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 #define TCP_URG 0x20
+#define TCP_ECE 0x40
+#define TCP_CWR 0x80
 
 #define ICMP_ECHO_REPLY   0
 #define ICMP_ECHO_REQUEST 8
@@ -72,6 +74,13 @@ typedef enum {
 
 typedef enum { VERDICT_DROP = 0, VERDICT_ALLOW = 1 } verdict_t;
 
+/* Defaults applied by engine_create() / engine_create_with_rules(): one source
+ * address may hold 1/16 of the table, and flows started from the outside at
+ * most 3/4 of it, so a flood from outside can never take the inside users'
+ * reserve. engine_create_with_rules_sized() applies none (see engine_set_limits). */
+#define FW_DEFAULT_MAX_PER_SOURCE  (FW_DEFAULT_MAX_FLOWS / 16)
+#define FW_DEFAULT_MAX_OUTSIDE     (FW_DEFAULT_MAX_FLOWS / 4 * 3)
+
 /* Related ICMP errors allowed per flow per second; more are dropped. */
 #define ICMP_ERRORS_PER_FLOW_PER_SEC 8
 
@@ -89,6 +98,10 @@ typedef enum {
     DROP_ICMP_ERR,         /* ICMP error not about any tracked flow         */
     DROP_ICMP_TYPE,        /* ICMP type wrong for this direction of an echo flow */
     DROP_ICMP_RATE,        /* too many ICMP errors for one flow this second */
+    DROP_BAD_DST,          /* new flow aimed at the wrong side or a broadcast address */
+    DROP_SRC_LIMIT,        /* this source already holds its share of flows  */
+    DROP_OUTSIDE_QUOTA,    /* outside-started flows already hold their share */
+    DROP_WRITE_FAILED,     /* allowed, but the other side would not take it */
     DROP_REASON_COUNT
 } drop_reason_t;
 
@@ -141,5 +154,19 @@ void engine_parse_failed(engine_t *e, unsigned result, dir_t dir, size_t len,
 size_t engine_expire(engine_t *e, uint64_t now_ns);
 
 void engine_get_stats(const engine_t *e, engine_stats_t *out);
+
+/*
+ * Cap the flows one source address may hold and the flows started from the
+ * outside (0 = no cap). Call before traffic flows. False if it cannot allocate.
+ */
+bool engine_set_limits(engine_t *e, size_t max_per_source, size_t max_outside);
+
+/*
+ * The caller could not deliver a packet engine_decide() allowed. If that
+ * packet created its flow, forget the flow (nobody ever saw its first packet)
+ * and count the packet as dropped (DROP_WRITE_FAILED). A packet on an
+ * existing flow leaves the flow as it is. Returns true if a flow was removed.
+ */
+bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_ns);
 
 #endif

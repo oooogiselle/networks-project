@@ -16,6 +16,7 @@
 #define SYNACK  (TCP_SYN | TCP_ACK)
 #define ACK     TCP_ACK
 #define FINACK  (TCP_FIN | TCP_ACK)
+#define SEC_NS 1000000000ull
 #define ORIG true
 #define RESP false
 
@@ -145,7 +146,84 @@ static void test_pure_syn_helper(void)
     CHECK(!tcp_is_pure_syn(SYNACK));
     CHECK(!tcp_is_pure_syn(ACK));
     CHECK(!tcp_is_pure_syn(SYN | TCP_RST));
-    CHECK(tcp_is_pure_syn(SYN | TCP_PSH));
+    /* a first packet is a SYN, optionally with the ECN bits; junk flags are not */
+    CHECK(tcp_is_pure_syn(SYN | TCP_ECE | TCP_CWR));
+    CHECK(!tcp_is_pure_syn(SYN | TCP_PSH));
+    CHECK(!tcp_is_pure_syn(SYN | TCP_URG));
+    CHECK(!tcp_is_pure_syn(SYN | TCP_PSH | TCP_URG));
+    CHECK(!tcp_is_pure_syn(TCP_ECE | TCP_CWR));
+}
+
+static void test_simultaneous_open_with_synack_from_both_sides(void)
+{
+    /* Both ends connect at once: SYN crosses SYN, then each answers with
+     * SYN-ACK. The originator's SYN-ACK used to be dropped. */
+    flow_t f = new_flow();
+    CHECK(tcp_track(&f, SYN, ORIG));
+    CHECK(tcp_track(&f, SYN, RESP) && f.tcp_state == TCPS_SYN_RECV);
+    CHECK(tcp_track(&f, SYNACK, ORIG));
+    CHECK(tcp_track(&f, SYNACK, RESP));
+    CHECK(tcp_track(&f, ACK, ORIG) && f.tcp_state == TCPS_ESTABLISHED);
+    CHECK(tcp_track(&f, ACK, RESP));
+    /* in SYN_SENT the originator may still only retransmit a bare SYN */
+    flow_t g = new_flow();
+    CHECK(!tcp_track(&g, SYNACK, ORIG));
+    CHECK(g.tcp_state == TCPS_SYN_SENT);
+}
+
+static void test_closed_connection_cannot_carry_data(void)
+{
+    /* After both FINs the flow is TIME_WAIT: only payload-free ACKs (last-ACK
+     * and FIN retransmits) make sense, never data, and never new handshakes. */
+    flow_t f = established();
+    tcp_track(&f, FINACK, ORIG);
+    tcp_track(&f, FINACK, RESP);
+    CHECK(f.tcp_state == TCPS_TIME_WAIT);
+    CHECK(tcp_track_ex(&f, ACK, ORIG, 0));
+    CHECK(tcp_track_ex(&f, FINACK, RESP, 0));              /* retransmitted FIN */
+    CHECK(!tcp_track_ex(&f, ACK | TCP_PSH, ORIG, 100));    /* data from either side */
+    CHECK(!tcp_track_ex(&f, ACK, RESP, 1));
+    CHECK(!tcp_track_ex(&f, SYNACK, RESP, 0));
+    CHECK(!tcp_track_ex(&f, SYN, ORIG, 0));
+    CHECK(f.tcp_state == TCPS_TIME_WAIT);
+    /* the 3-argument form means "no payload" */
+    CHECK(tcp_track(&f, ACK, ORIG));
+    /* payload is fine while the connection is open */
+    flow_t e = established();
+    CHECK(tcp_track_ex(&e, ACK | TCP_PSH, ORIG, 1400));
+    CHECK(tcp_track_ex(&e, ACK | TCP_PSH, RESP, 1400));
+}
+
+static void test_syn_in_fin_wait_is_dropped(void)
+{
+    flow_t f = established();
+    CHECK(tcp_track(&f, FINACK, ORIG) && f.tcp_state == TCPS_FIN_WAIT);
+    CHECK(!tcp_track(&f, SYN, ORIG));
+    CHECK(!tcp_track(&f, SYN, RESP));
+    CHECK(!tcp_track(&f, SYNACK, RESP));
+    CHECK(f.tcp_state == TCPS_FIN_WAIT);
+}
+
+static void test_each_state_has_its_own_timeout(void)
+{
+    flow_t f = new_flow();
+    CHECK(flow_timeout_ns(&f) == 30 * SEC_NS);                 /* SYN_SENT */
+    tcp_track(&f, SYNACK, RESP);
+    CHECK(flow_timeout_ns(&f) == 30 * SEC_NS);                 /* SYN_RECV */
+    tcp_track(&f, ACK, ORIG);
+    CHECK(flow_timeout_ns(&f) == 3600 * SEC_NS);               /* ESTABLISHED */
+    tcp_track(&f, FINACK, ORIG);
+    /* One side has closed, the other may keep sending for as long as it likes
+     * (ssh, rsync, a remote command after shutdown(WR)): same as established. */
+    CHECK(f.tcp_state == TCPS_FIN_WAIT);
+    CHECK(flow_timeout_ns(&f) == 3600 * SEC_NS);
+    tcp_track(&f, FINACK, RESP);
+    CHECK(f.tcp_state == TCPS_TIME_WAIT);
+    CHECK(flow_timeout_ns(&f) == 30 * SEC_NS);
+    flow_t c = established();
+    tcp_track(&c, TCP_RST, RESP);
+    CHECK(c.tcp_state == TCPS_CLOSED);
+    CHECK(flow_timeout_ns(&c) == 5 * SEC_NS);
 }
 
 static void test_timeouts_depend_on_state(void)
@@ -194,9 +272,11 @@ static void test_syn_recv_retransmits_and_illegal_packets(void)
     CHECK(!tcp_track(&f, ACK | TCP_PSH, RESP));
     /* the client may retransmit its SYN, but cannot send SYN-ACK or bare PSH */
     CHECK(tcp_track(&f, SYN, ORIG));
-    CHECK(!tcp_track(&f, SYNACK, ORIG));
     CHECK(!tcp_track(&f, TCP_PSH, ORIG));
     CHECK(f.tcp_state == TCPS_SYN_RECV);          /* illegal packets: no change */
+    /* a SYN-ACK from the originator is simultaneous open: allowed, no change */
+    CHECK(tcp_track(&f, SYNACK, ORIG));
+    CHECK(f.tcp_state == TCPS_SYN_RECV);
     CHECK(tcp_track(&f, ACK, ORIG) && f.tcp_state == TCPS_ESTABLISHED);
 }
 
@@ -225,6 +305,10 @@ int main(void)
     RUN(test_new_syn_in_established_dropped);
     RUN(test_simultaneous_open);
     RUN(test_pure_syn_helper);
+    RUN(test_simultaneous_open_with_synack_from_both_sides);
+    RUN(test_closed_connection_cannot_carry_data);
+    RUN(test_syn_in_fin_wait_is_dropped);
+    RUN(test_each_state_has_its_own_timeout);
     RUN(test_timeouts_depend_on_state);
     RUN(test_timeouts_match_the_spec);
     RUN(test_syn_recv_retransmits_and_illegal_packets);
