@@ -28,6 +28,11 @@ make test     # unit tests (run on macOS or Linux, no root needed)
 make asan     # same tests under AddressSanitizer + UBSan
 ```
 
+`tests/test_fuzz.c` throws random and corrupted packets at the parser and
+engine and checks that nothing crashes and the counters stay consistent. It is
+deterministic; replay or lengthen a run with
+`FUZZ_SEED=<n> FUZZ_ITERS=<n> ./build/test_fuzz`.
+
 On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
 
 ## How a packet is decided
@@ -53,6 +58,11 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
    - **No flow** (slow path): only a pure TCP SYN, a UDP datagram, or an ICMP
      echo request may start a flow; the rule list is evaluated in order
      (first match wins). No match means drop. On allow, a flow is created.
+   The flow table holds 65,536 flows by default (`FW_DEFAULT_MAX_FLOWS`). All
+   slots are allocated once at startup, so no memory is allocated per
+   connection or per packet. When it is full, new connections are refused and
+   existing ones keep working. Idle timeouts: half-open TCP 30 s, established
+   TCP 1 hour, UDP 30 s (120 s once answered), ICMP echo 30 s.
 3. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, and calls
    `engine_expire()` about once a second.
 
@@ -63,7 +73,10 @@ the flow table.
 ## Rules
 
 See `config/rules.example.conf` and the syntax comment in `include/rules.h`.
-Ports may be a list of numbers and ranges (`80,443`, `22,8000-8100`; up to 8
+Rules can be written in the compact form from the spec
+(`allow out tcp 10.0.1.0/24 any 80,443`, `allow out icmp 10.0.1.0/24 any echo`,
+`allow in tcp any 10.0.1.3 22`) or the longer `from ... to ... port ...` form;
+both can be mixed. Ports may be a list of numbers and ranges (`80,443`, `22,8000-8100`; up to 8
 items). `inside <cidr>` declares the trusted network(s) and turns on
 address anti-spoofing; without it that check is off.
 `out` = connection initiated from the inside (the default); `in` = initiated
