@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   pktbuild.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Test helper interface for building valid wire-format IPv4
+ *              packets with correct checksums.
+ =============================================================================*/
+
 /*
  * pktbuild.h - build valid IPv4 test packets with correct checksums.
  *

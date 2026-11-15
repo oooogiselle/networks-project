@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   test_parser.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Unit tests for the packet parser: valid packets, every kind of
+ *              malformed input, checksum errors, and ICMP error inner packets.
+ =============================================================================*/
+
 /* test_parser.c - packet parser and checksum tests. */
 #include <stdlib.h>
 #include <string.h>
