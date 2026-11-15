@@ -18,6 +18,10 @@
 #   build/tunwall -r <rules>   runs in the "firewall" namespace; logs flows and
 #                              drops to stderr; SIGUSR1 prints counters
 # Override with TUNWALL=, NETNS_SCRIPT=, RULES=, TUNWALL_ARGS=, LOGDIR=.
+# INTERNET=1 also builds the NAT path ("netns.sh up nat") and tests the real
+# Internet through the firewall; it needs the host to be online and changes the
+# host's iptables while it runs (removed again afterwards). Off by default, so
+# CI and offline runs are unaffected.
 # ============================================================================
 set -u
 cd "$(dirname "$0")/../.."
@@ -105,7 +109,7 @@ cli_says "no inside network is refused with the reason"   1 'noinside\.conf: dec
 cli_says "a missing tun device is refused with a hint"    1 'tw-missing0: no such device.*netns\.sh' -r "$RULES" -i tw-missing0
 
 "$NETNS_SCRIPT" down >/dev/null 2>&1
-"$NETNS_SCRIPT" up   || { echo "namespace setup failed"; exit 1; }
+"$NETNS_SCRIPT" up ${INTERNET:+nat} || { echo "namespace setup failed"; exit 1; }
 start_fw || { echo "tunwall did not start; see $LOGDIR/tunwall.log"; exit 1; }
 
 # Servers: web + DNS-like UDP echo outside, SSH-like and blocked ports inside.
@@ -334,6 +338,34 @@ if [ -n "${HALFCLOSE_PID:-}" ]; then
                           || bad "half-close: the server's late answer did not arrive (flow expired?)"
 fi
 
+if [ -n "${INTERNET:-}" ]; then
+    echo "== the real Internet through the firewall"
+    # example.com is static, so the page fetched through the firewall must be
+    # byte for byte the one the host fetches directly. The address is resolved on
+    # the host and pinned with --resolve, so this does not depend on DNS.
+    EX_IP=$(getent ahostsv4 example.com | awk 'NR==1 {print $1}')
+    if [ -z "$EX_IP" ] || ! curl -s -m 8 -o /dev/null "http://example.com"; then
+        bad "the host itself cannot reach example.com, so INTERNET=1 cannot be tested"
+    else
+        expect "ping a real Internet address (1.1.1.1) through the firewall" reply icmp_probe inside 1.1.1.1
+        for scheme in http https; do
+            port=$([ $scheme = http ] && echo 80 || echo 443)
+            via=$(ip netns exec inside curl -s -m 15 --resolve example.com:$port:$EX_IP $scheme://example.com/ | sha256sum)
+            direct=$(curl -s -m 15 --resolve example.com:$port:$EX_IP $scheme://example.com/ | sha256sum)
+            if [ "$via" = "$direct" ] && [ "$via" != "$(printf '' | sha256sum)" ]; then
+                ok "$scheme://example.com through the firewall is byte for byte the direct page (SHA-256 ${via:0:16})"
+            else bad "$scheme://example.com differs through the firewall (via $via, direct $direct)"; fi
+        done
+        expect "a non-web port on the Internet is silently dropped (not refused)" timeout probe inside tcp "$EX_IP" 8080
+        expect "SSH to the Internet is silently dropped"                            timeout probe inside tcp "$EX_IP" 22
+        expect "outside cannot start a connection to the inside via the NAT path"   timeout probe outside tcp 10.0.1.3 3389
+        kill -USR1 "$FW_PID"; sleep 1
+        logged "the real HTTP flow is labelled http" "FLOW APP +tcp 10\\.0\\.1\\.2:[0-9]+ -> $EX_IP:80 .*app=http"
+        logged "the real HTTPS flow is labelled tls" "FLOW APP +tcp 10\\.0\\.1\\.2:[0-9]+ -> $EX_IP:443 .*app=tls"
+        logged "the dropped SSH attempt is logged with its reason" "DROP tcp 10\\.0\\.1\\.2:[0-9]+ -> $EX_IP:22 .*why=no-rule"
+    fi
+fi
+
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID"; rc=$?; FW_PID=""
 [ "$rc" = 0 ] && ok "tunwall exits 0 on SIGTERM" || bad "tunwall exited $rc on SIGTERM"
@@ -360,6 +392,16 @@ ip netns exec firewall ip tuntap del dev tun-in mode tun
 expect "control: without the blackhole rule traffic leaks (the probe works)" arrived leak_probe
 ip -n firewall rule add iif veth-in blackhole pref 102
 expect "with the blackhole rule nothing gets through a deleted tun-in"       none leak_probe
+
+if [ -n "${INTERNET:-}" ]; then
+    echo "== tearing down restores the host"
+    "$NETNS_SCRIPT" down >/dev/null 2>&1
+    [ "$(iptables -S FORWARD | grep -c tunwall-demo)$(iptables -t nat -S POSTROUTING | grep -c tunwall-demo)" = "00" ] \
+        && ok "no tunwall-demo iptables rule is left on the host" || bad "tunwall-demo iptables rules are still there"
+    ip link show veth-host >/dev/null 2>&1 && bad "veth-host is still there" || ok "the host-side veth is gone"
+    [ ! -e /run/tunwall-netns ] && [ ! -e /etc/netns/inside/resolv.conf ] \
+        && ok "the saved state and resolv.conf files are gone" || bad "state or resolv.conf files were left behind"
+fi
 
 echo; echo "$pass passed, $failn failed"
 [ "$failn" -eq 0 ]

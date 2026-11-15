@@ -21,6 +21,7 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Giselle |
 | `bench/` | iperf3/ping benchmark script and its rule files | Giselle |
+| `scripts/demo.sh`, `scripts/demo_steps.sh`, `scripts/demo_log.awk`, `scripts/dns_forwarder.py` | The recorded demo: a tmux window with the live firewall log above and narrated, self-checking steps below, using the real Internet (see `DEMO.md`) | shared |
 | `tests/` | Unit tests (`tests/pktbuild.c` builds real wire packets) | shared |
 
 ## Build and test
@@ -63,7 +64,12 @@ writes it to the other, and the kernel then routes it out the right veth.
 Because the tun devices are persistent, if `tunwall` is not running the kernel
 simply drops what it routes to them: no traffic gets through.
 `scripts/netns.sh up kernel` builds the same topology without the policy
-routing (plain kernel forwarding) as the benchmark baseline.
+routing (plain kernel forwarding) as the benchmark baseline. `scripts/netns.sh
+up nat` adds a path to the real Internet for the demo: the outside namespace
+becomes a NAT gateway to the host. That changes the host while it is up (a veth
+pair, `ip_forward`, three iptables rules tagged `tunwall-demo`) and `down`
+removes exactly those and restores `ip_forward`. The NAT is plumbing for the
+demo, not part of `tunwall`: the firewall itself does no NAT.
 
 ## Tests
 
@@ -84,7 +90,11 @@ DNS, ping, blocked inbound traffic that must be silently dropped rather than
 refused, nmap SYN/ACK/FIN/NULL/Xmas scans, exact log lines, flow expiry,
 kill-the-firewall). They need root, `nmap` and `python3`. CI sets
 `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
-`SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. The suite fails when the firewall
+`SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. `INTERNET=1`
+also builds the NAT path and tests the real Internet through the firewall (the
+same page, byte for byte, as the host fetches directly; non-web ports dropped;
+flows labelled; and that tearing down restores the host). It needs the host to
+be online, so it is off by default and CI does not run it. The suite fails when the firewall
 is wrong: with the slow tests skipped, an allow-nothing policy fails 26 checks and an
 allow-everything policy fails 16.
 
@@ -228,8 +238,8 @@ from the outside (exposed services).
 - TCP sequence-number validation (blind RST/injection protection)
 - Full SYN-flood protection: a per-source cap and an outside-flow quota keep
   inside users working, but there are no SYN cookies and no half-open limit
-- Source NAT. Application identification only labels flows: rules cannot match on
+- Source NAT in the firewall. Application identification only labels flows: rules cannot match on
   the application, and a flow is never dropped for what it carries
-- NAT from the outside namespace to the real Internet (the tests use a local web
-  server in the outside namespace, which the spec allows)
+- NAT inside `tunwall` itself (the demo's NAT to the Internet is done by the
+  host and the outside namespace, not by the firewall)
 - `perf` profile of `tunwall` and a written explanation of the throughput gap
