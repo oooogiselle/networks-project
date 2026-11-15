@@ -18,14 +18,18 @@ BUILD := build
 # Firewall core library: packet parser + decision engine (flow table, TCP
 # state, rules, engine, logging). tun I/O and main() link against this.
 LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
-           src/engine.c src/log.c src/fwalloc.c src/siphash.c
+           src/engine.c src/log.c src/fwalloc.c src/siphash.c src/forwarder.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
-TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail
+TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail test_forwarder
+# tun_open() uses the Linux tun driver, so its tests only run on Linux.
+ifeq ($(shell uname -s),Linux)
+TESTS += test_tun_io
+endif
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
-.PHONY: all test asan clean
+.PHONY: all test asan clean tunwall
 all: $(LIB)
 
 $(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
@@ -34,9 +38,17 @@ $(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
 $(LIB): $(LIB_OBJ)
 	$(AR) rcs $@ $^
 
+# The firewall program itself (Linux only: it opens tun devices).
+tunwall: $(BUILD)/tunwall
+$(BUILD)/tunwall: src/main.c src/tun_io.c include/tun_io.h $(LIB) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c src/tun_io.c $(LIB) -o $@
+
 # The parser, engine and fuzz tests also need the test packet builder.
-$(BUILD)/test_parser $(BUILD)/test_engine $(BUILD)/test_fuzz: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
+$(BUILD)/test_parser $(BUILD)/test_engine $(BUILD)/test_fuzz $(BUILD)/test_forwarder: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/$*.c tests/pktbuild.c $(LIB) -o $@
+
+$(BUILD)/test_tun_io: tests/test_tun_io.c src/tun_io.c include/tun_io.h tests/testutil.h
+	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_tun_io.c src/tun_io.c -o $@
 
 $(BUILD)/test_%: tests/test_%.c tests/testutil.h $(LIB)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) $< $(LIB) -o $@
