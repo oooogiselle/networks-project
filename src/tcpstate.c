@@ -1,3 +1,15 @@
+/*=============================================================================
+ * File Name:   tcpstate.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: TCP connection-tracking state machine (SYN_SENT through
+ *              TIME_WAIT/CLOSED) with illegal-flag detection, plus the per-
+ *              state idle timeouts from the spec.
+ =============================================================================*/
+
 #include "tcpstate.h"
 
 #define SEC 1000000000ull
@@ -88,7 +100,7 @@ uint64_t flow_timeout_ns(const flow_t *f)
         switch (f->tcp_state) {
         case TCPS_SYN_SENT:
         case TCPS_SYN_RECV:    return 30 * SEC;
-        case TCPS_ESTABLISHED: return 300 * SEC;
+        case TCPS_ESTABLISHED: return 3600 * SEC;   /* 1 hour, per the spec */
         case TCPS_FIN_WAIT:    return 60 * SEC;
         case TCPS_TIME_WAIT:   return 30 * SEC;
         case TCPS_CLOSED:      return 5 * SEC;

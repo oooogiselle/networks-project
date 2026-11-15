@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   test_tcpstate.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Unit tests for the TCP state machine: handshake, teardown, RST,
+ *              illegal flag combinations, and timeouts.
+ =============================================================================*/
+
 #include "tcpstate.h"
 #include "testutil.h"
 
@@ -148,6 +159,27 @@ static void test_timeouts_depend_on_state(void)
     CHECK(flow_timeout_ns(&f) < syn_to);
 }
 
+static void test_timeouts_match_the_spec(void)
+{
+    /* spec 4.5: half-open 30 s, established 1 hour, UDP 30-120 s, ICMP 30 s */
+    flow_t f = new_flow();
+    CHECK(flow_timeout_ns(&f) == 30 * SEC);                 /* SYN_SENT */
+    f = established();
+    CHECK(flow_timeout_ns(&f) == 3600 * SEC);
+
+    flow_t u;
+    memset(&u, 0, sizeof u);
+    u.key.proto = FW_PROTO_UDP;
+    CHECK(flow_timeout_ns(&u) == 30 * SEC);                 /* no reply yet */
+    u.seen_reply = true;
+    CHECK(flow_timeout_ns(&u) == 120 * SEC);
+
+    flow_t i;
+    memset(&i, 0, sizeof i);
+    i.key.proto = FW_PROTO_ICMP;
+    CHECK(flow_timeout_ns(&i) == 30 * SEC);
+}
+
 int main(void)
 {
     RUN(test_three_way_handshake);
@@ -163,5 +195,6 @@ int main(void)
     RUN(test_simultaneous_open);
     RUN(test_pure_syn_helper);
     RUN(test_timeouts_depend_on_state);
+    RUN(test_timeouts_match_the_spec);
     TEST_DONE();
 }

@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   tcpstate.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: TCP connection-tracking state machine interface and per-state
+ *              idle timeouts.
+ =============================================================================*/
+
 /*
  * tcpstate.h - connection-tracking TCP state machine.
  *
