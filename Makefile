@@ -23,11 +23,11 @@ FLAGS_STAMP := $(BUILD)/.flags
 # Firewall core library: packet parser + decision engine (flow table, TCP
 # state, rules, engine, logging). tun I/O and main() link against this.
 LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
-           src/engine.c src/log.c src/fwalloc.c src/siphash.c src/forwarder.c
+           src/engine.c src/log.c src/fwalloc.c src/siphash.c src/forwarder.c src/appid.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
-TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail test_forwarder
+TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail test_forwarder test_appid
 # tun_open() uses the Linux tun driver, so its tests only run on Linux.
 ifeq ($(shell uname -s),Linux)
 TESTS += test_tun_io

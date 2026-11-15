@@ -16,6 +16,7 @@
 #include <stdarg.h>
 #include <string.h>
 
+#include "appid.h"
 #include "parser.h"
 
 static FILE *g_out = NULL;
@@ -118,13 +119,18 @@ void log_flow(const char *event, const flow_t *f, uint64_t now_ns)
     const uint64_t end = strcmp(event, "EXPIRE") == 0 ? f->last_seen_ns : now_ns;
     const double dur = end > f->created_ns ? (end - f->created_ns) / 1e9 : 0.0;
     fprintf(g_out,
-            "[%10.6f] FLOW %-6s %s %s:%u -> %s:%u state=%s rule=%d dur=%.3fs "
-            "pkts=%" PRIu64 "/%" PRIu64 " bytes=%" PRIu64 "/%" PRIu64 "\n",
+            "[%10.6f] FLOW %-6s %s %s:%u -> %s:%u state=%s rule=%d app=%s dur=%.3fs "
+            "pkts=%" PRIu64 "/%" PRIu64 " bytes=%" PRIu64 "/%" PRIu64,
             now_ns / 1e9, event, proto_str(f->key.proto),
             ip_str(f->key.src_ip, a, sizeof a), f->key.src_port,
             ip_str(f->key.dst_ip, b, sizeof b), f->key.dst_port,
-            tcp_state_str(f->tcp_state), f->rule_line, dur,
+            tcp_state_str(f->tcp_state), f->rule_line, app_name((app_t)f->app), dur,
             f->pkts[0], f->pkts[1], f->bytes[0], f->bytes[1]);
+    /* The port says one thing, the payload another: say so on the APP line. */
+    const app_t expected = appid_expected_for_port(f->key.proto, f->key.dst_port);
+    if (strcmp(event, "APP") == 0 && expected != APP_UNKNOWN && expected != (app_t)f->app)
+        fprintf(g_out, " mismatch(port suggests %s)", app_name(expected));
+    fputc('\n', g_out);
 }
 
 void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns)
@@ -152,6 +158,10 @@ void engine_stats_print(const engine_stats_t *s, FILE *out)
             s->pkts_total, s->pkts_allowed, s->pkts_dropped);
     fprintf(out, "icmp:    related-errors-allowed=%" PRIu64 "\n", s->icmp_related);
     fprintf(out, "path:    fast=%" PRIu64 " slow=%" PRIu64 "\n", s->fastpath, s->slowpath);
+    fprintf(out, "apps:    http=%" PRIu64 " tls=%" PRIu64 " dns=%" PRIu64 " other=%" PRIu64
+            " mismatched=%" PRIu64 "\n",
+            s->app_flows[APP_HTTP], s->app_flows[APP_TLS], s->app_flows[APP_DNS],
+            s->app_flows[APP_OTHER], s->app_mismatch);
     fprintf(out, "flows:   created=%" PRIu64 " expired=%" PRIu64 " active=%" PRIu64 "\n",
             s->flows_created, s->flows_expired, s->flows_active);
     for (int i = 1; i < PARSE_RESULT_COUNT; i++)

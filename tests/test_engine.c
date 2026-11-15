@@ -1217,6 +1217,259 @@ static void test_undoing_a_write_that_failed_forgets_only_the_new_flow(void)
     engine_destroy(e);
 }
 
+/* ---- application identification: labels only, never a verdict ---------------- */
+
+static const char *OPEN_RULES =
+    "allow tcp from 10.0.0.0/24 to any\nallow udp from 10.0.0.0/24 to any\nallow icmp from 10.0.0.0/24 to any\n";
+
+static const char HTTP_GET[] = "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n";
+static const char HTTP_OK[]  = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+/* A TLS ClientHello record header (enough for identification). */
+static size_t tls_client_hello(uint8_t *b)
+{
+    static const uint8_t hello[] = { 0x16, 0x03, 0x01, 0x00, 0x2f, 0x01, 0x00, 0x00, 0x2b, 0x03, 0x03,
+                                     1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+                                     0, 0, 0, 0 };
+    memcpy(b, hello, sizeof hello);
+    return sizeof hello;
+}
+
+/* A DNS query for example.com (type A). */
+static size_t dns_query(uint8_t *b)
+{
+    static const uint8_t q[] = { 0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+                                 7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1 };
+    memcpy(b, q, sizeof q);
+    return sizeof q;
+}
+
+static verdict_t send_data(engine_t *e, dir_t dir, uint32_t src, uint16_t sp, uint32_t dst, uint16_t dp,
+                           int proto, const void *data, size_t n, uint64_t t, drop_reason_t *w)
+{
+    uint8_t b[512];
+    size_t len = proto == FW_PROTO_TCP
+        ? pb_tcp(b, sizeof b, NULL, src, sp, dst, dp, TCP_ACK | TCP_PSH, data, n)
+        : pb_udp(b, sizeof b, NULL, src, sp, dst, dp, data, n);
+    return send_pkt(e, parsed(b, len), dir, t, w);
+}
+
+/* handshake for CLIENT_A:cp -> SERVER:sp, returns the time after it */
+static uint64_t handshake(engine_t *e, uint16_t cp, uint16_t sp, uint64_t t)
+{
+    drop_reason_t w;
+    send_pkt(e, mk_tcp(CLIENT_A, cp, SERVER, sp, TCP_SYN), DIR_IN, t, &w);
+    send_pkt(e, mk_tcp(SERVER, sp, CLIENT_A, cp, TCP_SYN | TCP_ACK), DIR_OUT, t + 1, &w);
+    send_pkt(e, mk_tcp(CLIENT_A, cp, SERVER, sp, TCP_ACK), DIR_IN, t + 2, &w);
+    return t + 3;
+}
+
+static void test_a_flow_is_labelled_by_its_payload_not_its_port(void)
+{
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    uint8_t buf[128];
+    uint64_t t = handshake(e, 50000, 8080, SEC);                 /* HTTP on port 8080 */
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 8080, FW_PROTO_TCP, HTTP_GET, sizeof HTTP_GET - 1, t, &w) == VERDICT_ALLOW);
+    t = handshake(e, 50001, 8081, t + 10);                       /* TLS on port 8081 */
+    size_t n = tls_client_hello(buf);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50001, SERVER, 8081, FW_PROTO_TCP, buf, n, t, &w) == VERDICT_ALLOW);
+    n = dns_query(buf);                                          /* DNS on UDP port 5353 */
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 6000, SERVER, 5353, FW_PROTO_UDP, buf, n, t + 10, &w) == VERDICT_ALLOW);
+    fw_log_set(NULL, LOG_OFF);
+
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_HTTP] == 1 && st.app_flows[APP_TLS] == 1 && st.app_flows[APP_DNS] == 1);
+    CHECK(st.app_flows[APP_OTHER] == 0 && st.app_mismatch == 0);     /* none of these ports suggests anything */
+    const char *out = slurp(log);
+    CHECK(strstr(out, "FLOW APP    tcp 10.0.0.2:50000 -> 93.184.216.34:8080") != NULL);
+    CHECK(strstr(out, "app=http") != NULL && strstr(out, "app=tls") != NULL && strstr(out, "app=dns") != NULL);
+    CHECK(strstr(out, "mismatch") == NULL);
+    fclose(log);
+    engine_destroy(e);
+}
+
+static void test_a_port_that_disagrees_with_the_payload_is_flagged(void)
+{
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    uint8_t buf[128];
+    uint64_t t = handshake(e, 50000, 443, SEC);                   /* HTTP on 443: not TLS */
+    send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 443, FW_PROTO_TCP, HTTP_GET, sizeof HTTP_GET - 1, t, &w);
+    t = handshake(e, 50001, 80, t + 10);                          /* TLS on 80: not HTTP */
+    size_t n = tls_client_hello(buf);
+    send_data(e, DIR_IN, CLIENT_A, 50001, SERVER, 80, FW_PROTO_TCP, buf, n, t, &w);
+    t = handshake(e, 50002, 80, t + 10);                          /* HTTP on 80: as expected */
+    send_data(e, DIR_IN, CLIENT_A, 50002, SERVER, 80, FW_PROTO_TCP, HTTP_GET, sizeof HTTP_GET - 1, t, &w);
+    t = handshake(e, 50003, 443, t + 10);                         /* TLS on 443: as expected */
+    n = tls_client_hello(buf);
+    send_data(e, DIR_IN, CLIENT_A, 50003, SERVER, 443, FW_PROTO_TCP, buf, n, t, &w);
+    n = dns_query(buf);                                           /* DNS on 53 and on 8053 */
+    send_data(e, DIR_IN, CLIENT_A, 6000, SERVER, 53, FW_PROTO_UDP, buf, n, t + 10, &w);
+    send_data(e, DIR_IN, CLIENT_A, 6001, SERVER, 8053, FW_PROTO_UDP, buf, n, t + 10, &w);
+    send_data(e, DIR_IN, CLIENT_A, 6002, SERVER, 53, FW_PROTO_UDP, "not dns at all", 14, t + 10, &w);   /* junk on 53 */
+    fw_log_set(NULL, LOG_OFF);
+
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_HTTP] == 2 && st.app_flows[APP_TLS] == 2 && st.app_flows[APP_DNS] == 2);
+    CHECK(st.app_mismatch == 2);              /* HTTP on 443, TLS on 80; junk on 53 is still undecided */
+    const char *out = slurp(log);
+    CHECK(strstr(out, "50000 -> 93.184.216.34:443 state=ESTABLISHED rule=2 app=http") != NULL);
+    CHECK(strstr(out, "mismatch(port suggests tls)") != NULL);
+    CHECK(strstr(out, "mismatch(port suggests http)") != NULL);
+    CHECK(count_str(out, "mismatch") == 2);
+    fclose(log);
+    engine_destroy(e);
+}
+
+static void test_unrecognized_traffic_is_called_other_after_three_data_packets(void)
+{
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    uint64_t t = handshake(e, 50000, 443, SEC);                   /* something on 443 that is not TLS */
+    engine_stats_t st;
+    for (int i = 1; i <= APPID_MAX_TRIES; i++) {
+        CHECK(send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 443, FW_PROTO_TCP, "SSH-2.0-OpenSSH_9.6\r\n", 21, t + i, &w) == VERDICT_ALLOW);
+        engine_get_stats(e, &st);
+        CHECK(st.app_flows[APP_OTHER] == (i == APPID_MAX_TRIES ? 1u : 0u));   /* undecided until the last try */
+    }
+    CHECK(st.app_mismatch == 1);                                  /* "other" on a TLS port is a mismatch */
+    /* the decision is final: a recognizable packet later does not change it */
+    uint8_t buf[64];
+    size_t n = tls_client_hello(buf);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 443, FW_PROTO_TCP, buf, n, t + 10, &w) == VERDICT_ALLOW);
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_TLS] == 0 && st.app_flows[APP_OTHER] == 1 && st.app_mismatch == 1);
+    engine_destroy(e);
+}
+
+static void test_the_first_recognized_protocol_wins_and_is_counted_once(void)
+{
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    uint64_t t = handshake(e, 50000, 8080, SEC);
+    /* an unrecognized packet first, then HTTP: still HTTP */
+    send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 8080, FW_PROTO_TCP, "hello", 5, t, &w);
+    send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 8080, FW_PROTO_TCP, HTTP_GET, sizeof HTTP_GET - 1, t + 1, &w);
+    /* the server's response (HTTP) and a later TLS-looking packet change nothing */
+    send_data(e, DIR_OUT, SERVER, 8080, CLIENT_A, 50000, FW_PROTO_TCP, HTTP_OK, sizeof HTTP_OK - 1, t + 2, &w);
+    uint8_t buf[64];
+    size_t n = tls_client_hello(buf);
+    send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 8080, FW_PROTO_TCP, buf, n, t + 3, &w);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_HTTP] == 1 && st.app_flows[APP_TLS] == 0 && st.app_flows[APP_OTHER] == 0);
+    engine_destroy(e);
+}
+
+static void test_the_server_speaking_first_can_identify_the_flow(void)
+{
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    uint64_t t = handshake(e, 50000, 8080, SEC);
+    send_data(e, DIR_OUT, SERVER, 8080, CLIENT_A, 50000, FW_PROTO_TCP, HTTP_OK, sizeof HTTP_OK - 1, t, &w);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_HTTP] == 1);
+    /* and a DNS response on a UDP flow */
+    uint8_t q[64];
+    size_t n = dns_query(q);
+    send_data(e, DIR_IN, CLIENT_A, 6000, SERVER, 53, FW_PROTO_UDP, "x", 1, t + 5, &w);          /* a non-DNS first datagram */
+    send_data(e, DIR_OUT, SERVER, 53, CLIENT_A, 6000, FW_PROTO_UDP, q, n, t + 6, &w);            /* then a DNS reply */
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_DNS] == 1);
+    engine_destroy(e);
+}
+
+static void test_nothing_is_labelled_without_payload_or_on_icmp(void)
+{
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    uint64_t t = handshake(e, 50000, 80, SEC);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, t, &w);       /* bare ACKs carry no data */
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_ACK), DIR_OUT, t + 1, &w);
+    uint8_t b[128], payload[40] = "GET / HTTP/1.1";
+    size_t n = pb_icmp_echo(b, sizeof b, NULL, CLIENT_A, SERVER, ICMP_ECHO_REQUEST, 7, 1, payload, sizeof payload);
+    for (int i = 0; i < 2 * APPID_MAX_TRIES; i++)       /* more echoes than the labelling would ever try */
+        CHECK(send_pkt(e, parsed(b, n), DIR_IN, t + 2 + (uint64_t)i, &w) == VERDICT_ALLOW);   /* ICMP never carries an app */
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    uint64_t total = 0;
+    for (int a = 0; a < APP_COUNT; a++) total += st.app_flows[a];
+    CHECK(total == 0 && st.app_mismatch == 0);
+    engine_destroy(e);
+}
+
+static void test_data_in_a_syn_labels_the_flow_at_once(void)
+{
+    /* TCP Fast Open: the request rides in the SYN itself */
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    uint8_t b[256];
+    size_t n = pb_tcp(b, sizeof b, NULL, CLIENT_A, 50000, SERVER, 8080, TCP_SYN, HTTP_GET, sizeof HTTP_GET - 1);
+    CHECK(send_pkt(e, parsed(b, n), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_HTTP] == 1);
+    engine_destroy(e);
+}
+
+static void test_labelling_never_changes_a_verdict(void)
+{
+    /* Same rules, three payloads on port 443 (TLS, HTTP, garbage): every one is
+     * allowed, because the rules allowed the port. And a refused flow is never labelled. */
+    engine_t *e = make_engine("allow tcp from 10.0.0.0/24 to any port 443\n");
+    drop_reason_t w;
+    uint8_t buf[64];
+    size_t n = tls_client_hello(buf);
+    const uint16_t ports[3] = { 50000, 50001, 50002 };
+    for (int i = 0; i < 3; i++) {
+        uint64_t t = handshake(e, ports[i], 443, SEC + (uint64_t)i * 100);
+        const void *d = i == 0 ? (const void *)buf : i == 1 ? (const void *)HTTP_GET : (const void *)"junk junk junk";
+        const size_t dl = i == 0 ? n : i == 1 ? sizeof HTTP_GET - 1 : 14;
+        for (int k = 0; k < 4; k++)
+            CHECK(send_data(e, DIR_IN, CLIENT_A, ports[i], SERVER, 443, FW_PROTO_TCP, d, dl, t + (uint64_t)k, &w) == VERDICT_ALLOW);
+    }
+    /* a refused flow: the SYN is dropped, so nothing about it is ever labelled */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 51000, SERVER, 8443, TCP_SYN), DIR_IN, 10 * SEC, &w) == VERDICT_DROP);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 51000, SERVER, 8443, FW_PROTO_TCP, HTTP_GET, sizeof HTTP_GET - 1, 10 * SEC + 1, &w) == VERDICT_DROP);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_TLS] == 1 && st.app_flows[APP_HTTP] == 1 && st.app_flows[APP_OTHER] == 1);
+    CHECK(st.pkts_dropped == 2);
+    engine_destroy(e);
+}
+
+static void test_the_label_is_in_every_flow_log_line_after_it_is_known(void)
+{
+    engine_t *e = make_engine(OPEN_RULES);
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    uint8_t buf[64];
+    size_t n = tls_client_hello(buf);
+    uint64_t t = handshake(e, 50000, 443, SEC);
+    send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 443, FW_PROTO_TCP, buf, n, t, &w);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 443, TCP_FIN | TCP_ACK), DIR_IN, t + SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 443, CLIENT_A, 50000, TCP_FIN | TCP_ACK), DIR_OUT, t + 2 * SEC, &w);
+    fw_log_set(NULL, LOG_OFF);
+    const char *out = slurp(log);
+    const char *nw = strstr(out, "FLOW NEW");
+    CHECK(nw && strstr(nw, "app=-") != NULL && strstr(nw, "app=-") < strstr(nw, "\n"));   /* unknown at creation */
+    const char *app = strstr(out, "FLOW APP");
+    CHECK(app && strstr(app, "app=tls") != NULL);
+    const char *close = strstr(out, "FLOW CLOSE");
+    CHECK(close && strstr(close, "app=tls") != NULL);
+    fclose(log);
+    engine_destroy(e);
+}
+
 /* ---- creating an engine from a rules file --------------------------------- */
 
 static void test_engine_create_from_the_shipped_config(void)
@@ -1330,6 +1583,15 @@ int main(void)
     RUN(test_icmp_errors_about_a_time_wait_flow_are_dropped);
     RUN(test_the_reclaim_sweep_runs_at_exactly_one_second);
     RUN(test_flow_log_lines_name_the_rule_and_use_the_packet_time);
+    RUN(test_a_flow_is_labelled_by_its_payload_not_its_port);
+    RUN(test_a_port_that_disagrees_with_the_payload_is_flagged);
+    RUN(test_unrecognized_traffic_is_called_other_after_three_data_packets);
+    RUN(test_the_first_recognized_protocol_wins_and_is_counted_once);
+    RUN(test_the_server_speaking_first_can_identify_the_flow);
+    RUN(test_nothing_is_labelled_without_payload_or_on_icmp);
+    RUN(test_data_in_a_syn_labels_the_flow_at_once);
+    RUN(test_labelling_never_changes_a_verdict);
+    RUN(test_the_label_is_in_every_flow_log_line_after_it_is_known);
     RUN(test_engine_create_from_the_shipped_config);
     RUN(test_engine_create_reports_bad_files);
     TEST_DONE();

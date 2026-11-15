@@ -11,6 +11,7 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 |---|---|---|
 | `include/engine.h` | Shared interface: `pkt_t`, `engine_decide()` | shared |
 | `include/parser.h`, `src/parser.c` | Packet parse + checksums → `pkt_t` | Giselle |
+| `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | shared |
 | `src/flowtable.c` | 5-tuple hash table, expiry | Eva |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva |
@@ -84,7 +85,7 @@ refused, nmap SYN/ACK/FIN/NULL/Xmas scans, exact log lines, flow expiry,
 kill-the-firewall). They need root, `nmap` and `python3`. CI sets
 `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
 `SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. The suite fails when the firewall
-is wrong: with the slow tests skipped, an allow-nothing policy fails 18 checks and an
+is wrong: with the slow tests skipped, an allow-nothing policy fails 26 checks and an
 allow-everything policy fails 16.
 
 ### Benchmarks
@@ -181,7 +182,27 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
    idle flow times out, including one found expired by a lookup). Idle timeouts: half-open TCP 30 s, established
    TCP 1 hour, half-closed (one FIN seen) 1 hour, TIME_WAIT 30 s, after a RST
    5 s, UDP 30 s (120 s once answered), ICMP echo 30 s.
-3. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, and calls
+3. **Application identification** (optional feature from the spec, section 7).
+   The first few data-carrying packets of a flow are examined (either
+   direction, at most 3 before giving up) and the flow is labelled by what the
+   payload *is*, not by its port: `http` (a request line such as
+   `GET /x HTTP/1.1`, a response line, or the HTTP/2 preface), `tls` (a
+   handshake record carrying a ClientHello or ServerHello), `dns` (a
+   well-formed header plus one valid question, over UDP or over TCP with its
+   length prefix), or `other`. The checks are deliberately strict: a wrong label
+   is worse than none, so near-misses (`GETX / HTTP/1.1`, a TLS record with an
+   impossible length, a DNS name with a 64-byte label) are not recognized. The
+   label appears in the flow log lines (`app=tls`), a `FLOW APP` line is logged
+   when it is decided, and the counters show `apps: http= tls= dns= other=
+   mismatched=`. When the port suggests a different protocol than the payload
+   (53 dns, 80 http, 443 tls) the `FLOW APP` line adds
+   `mismatch(port suggests tls)` and the mismatch counter goes up, so HTTP on
+   443, TLS on 80, or junk on 53 stands out. **It only labels: it runs after the
+   verdict and never changes it** (it does not allow or drop anything), and a
+   packet with no payload, or ICMP, is never labelled. Rules cannot match on the
+   application, so, for example, TLS on 8080 is allowed or refused by the port
+   rules exactly as before.
+4. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, and calls
    `engine_expire()` about once a second.
 
 For ICMP errors, `pkt.payload` is the embedded original packet;
@@ -207,7 +228,8 @@ from the outside (exposed services).
 - TCP sequence-number validation (blind RST/injection protection)
 - Full SYN-flood protection: a per-source cap and an outside-flow quota keep
   inside users working, but there are no SYN cookies and no half-open limit
-- Application identification (HTTP/DNS by payload) or source NAT
+- Source NAT. Application identification only labels flows: rules cannot match on
+  the application, and a flow is never dropped for what it carries
 - NAT from the outside namespace to the real Internet (the tests use a local web
   server in the outside namespace, which the spec allows)
 - `perf` profile of `tunwall` and a written explanation of the throughput gap
