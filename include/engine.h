@@ -12,6 +12,11 @@
  *   - Non-TCP packets: tcp_flags = 0. Non-ICMP packets: icmp_type = 0.
  *   - Non-first IP fragments have no L4 header; drop them in the parser.
  *   - payload may be NULL when payload_len == 0.
+ *   - ICMP errors (dest unreachable, time exceeded, parameter problem): pass
+ *     them to engine_decide() as parsed; payload is the embedded original
+ *     packet. The engine matches it to an existing flow itself.
+ *   - Packets that FAIL parsing never reach engine_decide(); report each one
+ *     with engine_parse_failed() so it is counted and logged.
  *
  * THREADING: engine_t is NOT thread safe. Call from the single I/O thread.
  */
@@ -65,13 +70,21 @@ typedef enum {
     DROP_SPOOF,            /* matches a flow's tuple but arrived wrong side */
     DROP_TABLE_FULL,       /* flow table at capacity                        */
     DROP_UNSUPPORTED,      /* e.g. ICMP type we don't track                 */
+    DROP_BAD_SRC,          /* anti-spoofing: source address on wrong side   */
+    DROP_ICMP_ERR,         /* ICMP error not about any tracked flow         */
     DROP_REASON_COUNT
 } drop_reason_t;
 
 const char *drop_reason_str(drop_reason_t r);
 
+/* Room for one counter per parse_result_t (see parser.h); engine.c checks. */
+#define ENGINE_PARSE_KINDS 8
+
 typedef struct engine_stats {
+    /* pkts_total/pkts_dropped also include packets that failed parsing. */
     uint64_t pkts_total, pkts_allowed, pkts_dropped;
+    uint64_t icmp_related;         /* ICMP errors allowed via a tracked flow */
+    uint64_t parse_fail[ENGINE_PARSE_KINDS];  /* indexed by parse_result_t  */
     uint64_t fastpath;             /* hit an existing flow: hash lookup only */
     uint64_t slowpath;             /* no flow: rules evaluated               */
     uint64_t flows_created, flows_expired, flows_active;
@@ -93,6 +106,14 @@ void      engine_destroy(engine_t *e);
  */
 verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
                         uint64_t now_ns, drop_reason_t *reason);
+
+/*
+ * Record a packet that parse_packet() rejected (result is the non-OK
+ * parse_result_t, len the raw length). It counts as a dropped packet and is
+ * logged at DEBUG, next to the engine's own drop reasons.
+ */
+void engine_parse_failed(engine_t *e, unsigned result, dir_t dir, size_t len,
+                         uint64_t now_ns);
 
 /* Sweep expired flows. Call about once per second from the I/O loop. */
 size_t engine_expire(engine_t *e, uint64_t now_ns);
