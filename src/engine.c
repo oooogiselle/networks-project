@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "flowtable.h"
+#include "fwalloc.h"
 #include "log.h"
 #include "parser.h"
 #include "rules.h"
@@ -41,12 +42,12 @@ struct engine {
 engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows)
 {
     if (!rules) return NULL;
-    engine_t *e = calloc(1, sizeof *e);
-    if (!e) return NULL;
+    engine_t *e = fw_calloc(1, sizeof *e);
+    if (!e) { rules_free(rules); return NULL; }     /* we own rules, always */
     e->rules = rules;
     /* about one bucket per flow slot keeps chains short at capacity */
     e->ft = ft_create(max_flows, max_flows);
-    if (!e->ft) { free(e); return NULL; }
+    if (!e->ft) { rules_free(rules); free(e); return NULL; }
     return e;
 }
 
@@ -59,9 +60,7 @@ engine_t *engine_create(const char *rules_path, char *err, size_t errlen)
 {
     rules_t *r = rules_load_file(rules_path, err, errlen);
     if (!r) return NULL;
-    engine_t *e = engine_create_with_rules(r);
-    if (!e) rules_free(r);
-    return e;
+    return engine_create_with_rules(r);       /* frees r if it fails */
 }
 
 void engine_destroy(engine_t *e)
