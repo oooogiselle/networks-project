@@ -1,10 +1,30 @@
+/*=============================================================================
+ * File Name:   flowtable.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Flow table implementation: a hash table over a preallocated pool
+ *              of flow slots (no allocation per connection or per packet), lazy
+ *              expiry on lookup, and a periodic sweep.
+ =============================================================================*/
+
 #include "flowtable.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * All flow slots are allocated once, in ft_create(), as one array. Free slots
+ * form a singly linked list (through flow_t.next), so inserting and removing
+ * a flow never calls malloc/free: nothing is allocated per connection, let
+ * alone per packet.
+ */
 struct flowtable {
     flow_t  **buckets;
+    flow_t   *pool;          /* max slots, allocated once */
+    flow_t   *free_list;     /* unused slots */
     size_t    mask;          /* nbuckets - 1 */
     size_t    count, max;
     uint64_t  expired_total;
@@ -63,21 +83,36 @@ flowtable_t *ft_create(size_t nbuckets, size_t max_flows)
     flowtable_t *ft = calloc(1, sizeof *ft);
     if (!ft) return NULL;
     ft->buckets = calloc(n, sizeof *ft->buckets);
-    if (!ft->buckets) { free(ft); return NULL; }
+    ft->pool = max_flows ? calloc(max_flows, sizeof *ft->pool) : NULL;
+    if (!ft->buckets || (max_flows && !ft->pool)) {
+        free(ft->buckets);
+        free(ft->pool);
+        free(ft);
+        return NULL;
+    }
     ft->mask = n - 1;
     ft->max = max_flows;
+    for (size_t i = max_flows; i-- > 0; ) {     /* slot 0 is handed out first */
+        ft->pool[i].next = ft->free_list;
+        ft->free_list = &ft->pool[i];
+    }
     return ft;
 }
 
 void ft_destroy(flowtable_t *ft)
 {
     if (!ft) return;
-    for (size_t i = 0; i <= ft->mask; i++) {
-        flow_t *f = ft->buckets[i];
-        while (f) { flow_t *n = f->next; free(f); f = n; }
-    }
+    free(ft->pool);
     free(ft->buckets);
     free(ft);
+}
+
+/* Return an already-unlinked slot to the free list. */
+static void release(flowtable_t *ft, flow_t *f)
+{
+    f->next = ft->free_list;
+    ft->free_list = f;
+    ft->count--;
 }
 
 void ft_remove(flowtable_t *ft, flow_t *f)
@@ -86,8 +121,7 @@ void ft_remove(flowtable_t *ft, flow_t *f)
     while (*pp && *pp != f) pp = &(*pp)->next;
     if (!*pp) return;
     *pp = f->next;
-    free(f);
-    ft->count--;
+    release(ft, f);
 }
 
 static flow_t *find_exact(flowtable_t *ft, const flow_key_t *k)
@@ -117,9 +151,10 @@ flow_t *ft_lookup(flowtable_t *ft, const flow_key_t *k, uint64_t now_ns,
 flow_t *ft_insert(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
                   uint64_t now_ns)
 {
-    if (ft->count >= ft->max) return NULL;
-    flow_t *f = calloc(1, sizeof *f);
-    if (!f) return NULL;
+    flow_t *f = ft->free_list;
+    if (!f) return NULL;                  /* table full */
+    ft->free_list = f->next;
+    memset(f, 0, sizeof *f);              /* slots are reused: start clean */
     f->key = *k;
     f->orig_dir = orig_dir;
     f->created_ns = f->last_seen_ns = f->expires_ns = now_ns;
@@ -140,8 +175,7 @@ size_t ft_expire(flowtable_t *ft, uint64_t now_ns, ft_expire_cb cb, void *ud)
             if (f->expires_ns <= now_ns) {
                 if (cb) cb(f, ud);
                 *pp = f->next;
-                free(f);
-                ft->count--;
+                release(ft, f);
                 removed++;
             } else {
                 pp = &f->next;

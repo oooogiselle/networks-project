@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   flowtable.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Flow table interface: connections keyed by 5-tuple, matched in
+ *              both directions, with expiry.
+ =============================================================================*/
+
 /*
  * flowtable.h - hash table of tracked flows, keyed by 5-tuple.
  *
