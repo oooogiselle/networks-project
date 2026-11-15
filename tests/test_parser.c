@@ -87,6 +87,19 @@ static void csum_large_input_does_not_overflow(void)
              csum_fold(0xffff + 0xff00));
 }
 
+static void csum_early_carry_fold(void)
+{
+    /* The accumulator folds its carries once it reaches 2^31. A packet can't
+     * be long enough to get there from zero, so start it near the limit. */
+    const uint8_t word[2] = { 0xff, 0xff };
+    uint64_t ref = 0x7fffffffu + 0xffffu;
+    while (ref >> 16) ref = (ref & 0xffff) + (ref >> 16);
+    CHECK_EQ(csum_fold(csum_partial(word, 2, 0x7fffffffu)), (uint16_t)~ref);
+    /* same total reached in two steps */
+    CHECK_EQ(csum_fold(csum_partial(word, 2, csum_partial(word, 0, 0x7fffffffu))),
+             (uint16_t)~ref);
+}
+
 /* ---- valid packets ------------------------------------------------------------ */
 
 static void tcp_syn_fields(void)
@@ -708,6 +721,7 @@ int main(void)
     RUN(csum_rfc1071_example);
     RUN(csum_odd_length_pads_with_zero);
     RUN(csum_large_input_does_not_overflow);
+    RUN(csum_early_carry_fold);
     RUN(tcp_syn_fields);
     RUN(tcp_with_options_and_payload);
     RUN(tcp_odd_length_payload);
