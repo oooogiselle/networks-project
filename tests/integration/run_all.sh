@@ -249,6 +249,32 @@ if need_tool nmap; then
     done
 fi
 
+echo "== application identification (by payload, not by port)"
+# Real traffic of each kind: HTTP on its port, a real TLS handshake on 443, HTTP
+# on port 443 (the port says TLS, the payload says HTTP), and a real DNS query.
+if need_tool openssl; then
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+        -keyout "$LOGDIR/tls.key" -out "$LOGDIR/tls.crt" -subj /CN=tunwall-test >/dev/null 2>&1
+    bg ip netns exec outside python3 -c '
+import functools, http.server, ssl, sys
+h = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[3])
+srv = http.server.HTTPServer(("10.0.2.2", 443), h)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()' "$LOGDIR/tls.crt" "$LOGDIR/tls.key" "$EMPTY"
+    sleep 1
+    check "real TLS handshake and request through the firewall" pass inside curl -sk --max-time 5 -o /dev/null https://10.0.2.2:443/
+fi
+bg ip netns exec outside python3 -m http.server 443 --bind 10.0.2.3 --directory "$EMPTY"
+sleep 1
+check "plain HTTP on port 443 passes (the port is allowed)" pass inside curl -s --max-time 5 -o /dev/null http://10.0.2.3:443/
+dns_query() { ip netns exec inside python3 -c '
+import socket, struct
+q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + b"\x07example\x03com\x00" + struct.pack(">HH", 1, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+s.sendto(q, ("10.0.2.2", 53)); assert s.recv(512) == q'; }
+check "a real DNS query is answered" pass dns_query
+
 echo "== TTL and path MTU"
 ttl_probe() { # ttl_probe <ttl>: reply | ttl-exceeded | timeout
     local out; out=$(ip netns exec inside ping -t "$1" -c 2 -W 2 10.0.2.2 2>&1)
@@ -277,6 +303,14 @@ logged "flow opened for the exposed ssh connection" 'FLOW NEW +tcp 10\.0\.2\.[0-
 logged "inbound 3389 dropped for no matching rule" 'DROP tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:3389 .*why=no-rule\(default-deny\)'
 logged "outbound port 8080 dropped for no matching rule" 'DROP tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:8080 .*why=no-rule\(default-deny\)'
 logged "DNS to other resolver dropped by the deny rule" 'DROP udp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.3:53 .*why=rule-deny'
+logged "the web download is labelled http" 'FLOW APP +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 .*app=http'
+if command -v openssl >/dev/null; then
+    logged "the TLS handshake is labelled tls" 'FLOW APP +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:443 .*app=tls dur'
+fi
+logged "the DNS query is labelled dns" 'FLOW APP +udp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:53 .*app=dns'
+logged "HTTP on port 443 is flagged: payload disagrees with port" 'FLOW APP +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.3:443 .*app=http dur.* mismatch\(port suggests tls\)'
+not_logged "HTTP on its own port is not flagged" 'FLOW APP +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 .*mismatch'
+logged "stats: the labelled flows are counted" '^apps: +http=[1-9][0-9]* tls=[0-9]+ dns=[1-9][0-9]* other=[0-9]+ mismatched=[1-9][0-9]*'
 logged "TCP close logged for the web download" 'FLOW CLOSE +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 state=(TIME_WAIT|CLOSED)'
 logged "probes of the firewall's own addresses were dropped by tunwall" 'DROP tcp 10\.0\.[12]\.[0-9]+:[0-9]+ -> 10\.0\.[12]\.1:8080 .*why=(no-rule|wrong-destination)'
 logged "inbound ping dropped for no matching rule" 'DROP icmp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.2:[0-9]+ .*why=no-rule\(default-deny\)'

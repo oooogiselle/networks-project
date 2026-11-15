@@ -35,6 +35,7 @@ _Static_assert(PARSE_RESULT_COUNT <= ENGINE_PARSE_KINDS,
                "grow ENGINE_PARSE_KINDS in engine.h");
 
 static void expire_cb(const flow_t *f, void *ud);
+static void identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns);
 
 #define RECLAIM_MIN_INTERVAL_NS 1000000000ull   /* 1 s: table-reclaim and ICMP-error windows */
 
@@ -285,6 +286,7 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
             f->last_seen_ns = now_ns;
             f->expires_ns = now_ns + flow_timeout_ns(f);
         }
+        identify_app(e, f, p, now_ns);
         return do_allow(e, reason);
     }
 
@@ -335,7 +337,32 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
     f->expires_ns = now_ns + flow_timeout_ns(f);
     e->st.flows_created++;
     log_flow("NEW", f, now_ns);
+    identify_app(e, f, p, now_ns);          /* e.g. a DNS query, or data in a SYN */
     return do_allow(e, reason);
+}
+
+/*
+ * Label a flow by what its payload is (see appid.h). The first few
+ * data-carrying packets of either direction are examined; the first
+ * recognized protocol wins, and after APPID_MAX_TRIES unrecognized data
+ * packets the flow is called "other". It is logged once when decided. This
+ * only labels: it is called after the verdict, and never changes it.
+ */
+static void identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns)
+{
+    if (f->app != APP_UNKNOWN || p->payload_len == 0 ||
+        (p->proto != FW_PROTO_TCP && p->proto != FW_PROTO_UDP))
+        return;
+    app_t a = appid_detect(p->proto, p->payload, p->payload_len);
+    if (a == APP_UNKNOWN) {
+        if (++f->app_tries < APPID_MAX_TRIES) return;
+        a = APP_OTHER;
+    }
+    f->app = (uint8_t)a;
+    e->st.app_flows[a]++;
+    const app_t expected = appid_expected_for_port(f->key.proto, f->key.dst_port);
+    if (expected != APP_UNKNOWN && expected != a) e->st.app_mismatch++;
+    log_flow("APP", f, now_ns);
 }
 
 /* A flow whose CLOSE was logged is already reported; do not log it again. */

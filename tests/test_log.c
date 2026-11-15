@@ -129,6 +129,46 @@ static void test_setting_the_log_resets_the_limiter(void)
     fclose(f);
 }
 
+static void test_stats_show_the_application_counts(void)
+{
+    engine_stats_t st;
+    memset(&st, 0, sizeof st);
+    FILE *f = tmpfile();
+    engine_stats_print(&st, f);
+    CHECK(strstr(slurp(f), "apps:    http=0 tls=0 dns=0 other=0 mismatched=0") != NULL);
+    st.app_flows[APP_HTTP] = 3; st.app_flows[APP_TLS] = 2; st.app_flows[APP_DNS] = 1;
+    st.app_flows[APP_OTHER] = 4; st.app_mismatch = 5;
+    fclose(f);
+    f = tmpfile();
+    engine_stats_print(&st, f);
+    CHECK(strstr(slurp(f), "apps:    http=3 tls=2 dns=1 other=4 mismatched=5\n") != NULL);
+    fclose(f);
+}
+
+static void test_the_app_label_and_mismatch_note_in_a_flow_line(void)
+{
+    FILE *f = tmpfile();
+    fw_log_set(f, LOG_INFO);
+    flow_t fl;
+    memset(&fl, 0, sizeof fl);
+    fl.key = (flow_key_t){ IP(10,0,1,2), IP(93,184,216,34), 50000, 443, FW_PROTO_TCP };
+    fl.app = APP_HTTP;                                   /* HTTP on the TLS port */
+    log_flow("APP", &fl, SEC_NS);
+    log_flow("NEW", &fl, SEC_NS);                        /* only the APP line carries the note */
+    fl.app = APP_TLS;                                    /* TLS on the TLS port: nothing to note */
+    log_flow("APP", &fl, SEC_NS);
+    fl.key.dst_port = 8443; fl.app = APP_HTTP;           /* a port with no expectation */
+    log_flow("APP", &fl, SEC_NS);
+    fw_log_set(NULL, LOG_OFF);
+    const char *out = slurp(f);
+    CHECK(strstr(out, "app=http dur=1.000s pkts=0/0 bytes=0/0 mismatch(port suggests tls)\n") != NULL);
+    const char *note = strstr(out, "mismatch(");
+    CHECK(note != NULL && strstr(note + 1, "mismatch(") == NULL);      /* exactly one note */
+    CHECK(strstr(out, "FLOW NEW    tcp 10.0.1.2:50000 -> 93.184.216.34:443 state=- rule=0 app=http") != NULL);
+    CHECK(strstr(out, "app=tls dur") != NULL);
+    fclose(f);
+}
+
 static void test_protocol_and_ip_names(void)
 {
     CHECK(strcmp(proto_str(FW_PROTO_TCP), "tcp") == 0);
@@ -229,6 +269,8 @@ int main(void)
     RUN(test_a_steady_rate_within_the_limit_loses_nothing);
     RUN(test_the_limiter_survives_the_clock_going_backwards);
     RUN(test_setting_the_log_resets_the_limiter);
+    RUN(test_stats_show_the_application_counts);
+    RUN(test_the_app_label_and_mismatch_note_in_a_flow_line);
     RUN(test_protocol_and_ip_names);
     RUN(test_every_drop_reason_has_its_own_name);
     RUN(test_tcp_state_names);

@@ -39,6 +39,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "appid.h"
+
 #define FW_PROTO_ICMP 1
 #define FW_PROTO_TCP  6
 #define FW_PROTO_UDP  17
@@ -119,6 +121,12 @@ typedef struct engine_stats {
     uint64_t slowpath;             /* no flow: rules evaluated               */
     uint64_t flows_created, flows_expired, flows_active;
     uint64_t drops[DROP_REASON_COUNT];
+    /* Application identification (appid.h): flows labelled by what their
+     * payload is, and how many of them used a port that suggests a different
+     * protocol (e.g. HTTP on 443, TLS on 80, anything but DNS on 53). Labels
+     * never change a verdict. */
+    uint64_t app_flows[APP_COUNT];
+    uint64_t app_mismatch;
 } engine_stats_t;
 
 typedef struct engine engine_t;
