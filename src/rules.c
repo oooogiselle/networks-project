@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   rules.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Rule file parser (reports the line number of any syntax error)
+ *              and first-match rule evaluation with a default-deny policy.
+ =============================================================================*/
+
 #include "rules.h"
 
 #include <arpa/inet.h>
@@ -82,6 +93,51 @@ static bool parse_ports(const char *s, port_set_t *out)
     return true;
 }
 
+/*
+ * Compact rule tail, starting at tok[i] (after action, direction, protocol):
+ *   <src> <dst> [<ports>]    ports apply to the destination port
+ *   <src> <dst> echo         icmp only; echo requests are the only ICMP
+ *                            that can start a flow anyway, so it is a marker
+ * Omitted ports (or `any`) mean every port.
+ */
+static bool parse_compact(char **tok, int n, int i, rule_t *r, int lineno,
+                          char *err, size_t errlen)
+{
+    if (i >= n || !parse_addr(tok[i], &r->src)) {
+        set_err(err, errlen, lineno, "bad source address");
+        return false;
+    }
+    i++;
+    if (i >= n || !parse_addr(tok[i], &r->dst)) {
+        set_err(err, errlen, lineno, "expected destination address");
+        return false;
+    }
+    i++;
+    if (i < n) {
+        if (strcmp(tok[i], "echo") == 0) {
+            if (r->proto != FW_PROTO_ICMP) {
+                set_err(err, errlen, lineno, "'echo' is only valid for icmp");
+                return false;
+            }
+        } else if (strcmp(tok[i], "any") != 0) {
+            if (r->proto == FW_PROTO_ICMP) {
+                set_err(err, errlen, lineno, "icmp rules take 'echo', not ports");
+                return false;
+            }
+            if (!parse_ports(tok[i], &r->dport)) {
+                set_err(err, errlen, lineno, "bad port list");
+                return false;
+            }
+        }
+        i++;
+    }
+    if (i != n) {
+        set_err(err, errlen, lineno, "unexpected trailing tokens");
+        return false;
+    }
+    return true;
+}
+
 /* Returns 0 = rule parsed, 1 = blank/comment, 2 = `inside` directive (the
  * network is returned in r->src), -1 = error (err filled). */
 static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errlen)
@@ -133,6 +189,11 @@ static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errle
     else if (strcmp(tok[i], "any") == 0) r->proto = 0;
     else { set_err(err, errlen, lineno, "unknown protocol"); return -1; }
     i++;
+
+    /* Anything other than `from` after the protocol is the compact form:
+     *   <src> <dst> [<ports> | echo]      (as in the requirements spec) */
+    if (i < n && strcmp(tok[i], "from") != 0)
+        return parse_compact(tok, n, i, r, lineno, err, errlen) ? 0 : -1;
 
     for (int side = 0; side < 2; side++) {
         const char *kw = side ? "to" : "from";

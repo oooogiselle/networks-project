@@ -1,3 +1,15 @@
+/*=============================================================================
+ * File Name:   test_rules.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Unit tests for the rule parser and matcher: first match wins,
+ *              CIDR and port edge cases, compact syntax, inside networks, and
+ *              syntax errors.
+ =============================================================================*/
+
 #include "rules.h"
 #include "testutil.h"
 
@@ -224,6 +236,99 @@ static void test_inside_errors(void)
                  "inside 10.0.6.0/24\ninside 10.0.7.0/24\ninside 10.0.8.0/24\n", 9);
 }
 
+static void test_compact_syntax_matches_spec_example(void)
+{
+    /* the example rule file from the requirements spec, verbatim */
+    rules_t *r = parse(
+        "# action dir proto src dst ports\n"
+        "allow out tcp 10.0.1.0/24 any 80,443\n"
+        "allow out udp 10.0.1.0/24 any 53\n"
+        "allow out icmp 10.0.1.0/24 any echo\n"
+        "allow in tcp any 10.0.1.3 22\n"
+        "# anything not matched is denied\n");
+    CHECK(r && r->n == 4);
+    CHECK(r->v[0].dir == DIR_IN && r->v[3].dir == DIR_OUT);
+
+    pkt_t web = mk_tcp(IP(10,0,1,2), 40000, IP(93,184,216,34), 443, TCP_SYN);
+    pkt_t odd = mk_tcp(IP(10,0,1,2), 40000, IP(93,184,216,34), 8080, TCP_SYN);
+    pkt_t dns = mk_udp(IP(10,0,1,2), 40000, IP(10,0,2,2), 53);
+    pkt_t png = mk_icmp(IP(10,0,1,2), IP(8,8,8,8), ICMP_ECHO_REQUEST, 7);
+    pkt_t ssh = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 22, TCP_SYN);
+    pkt_t rdp = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
+    CHECK(rules_match(r, &web, DIR_IN) == &r->v[0]);
+    CHECK(!rules_match(r, &odd, DIR_IN));
+    CHECK(rules_match(r, &dns, DIR_IN) == &r->v[1]);
+    CHECK(rules_match(r, &png, DIR_IN) == &r->v[2]);
+    CHECK(rules_match(r, &ssh, DIR_OUT) == &r->v[3]);
+    CHECK(!rules_match(r, &rdp, DIR_OUT));         /* default deny */
+    CHECK(!rules_match(r, &ssh, DIR_IN));          /* wrong direction */
+    rules_free(r);
+}
+
+static void test_compact_defaults_and_equivalence(void)
+{
+    /* direction is optional (default out); ports optional / `any` = all */
+    rules_t *c = parse("allow tcp 10.0.0.0/24 any\n"
+                       "deny  udp any 8.8.8.8 any\n"
+                       "allow in any any 10.0.1.3\n");
+    CHECK(c && c->n == 3);
+    CHECK(c->v[0].dir == DIR_IN && c->v[0].dport.n == 1 &&
+          c->v[0].dport.r[0].lo == 0 && c->v[0].dport.r[0].hi == 65535);
+    CHECK(c->v[1].action == ACT_DENY);
+    CHECK(c->v[2].dir == DIR_OUT && c->v[2].proto == 0);
+
+    /* the same policy written both ways behaves identically */
+    rules_t *v = parse("allow tcp from 10.0.0.0/24 to any port 80,8000-8100\n");
+    rules_t *k = parse("allow tcp 10.0.0.0/24 any 80,8000-8100\n");
+    const uint16_t ports[] = {79, 80, 81, 8000, 8100, 8101};
+    for (size_t i = 0; i < sizeof ports / sizeof *ports; i++) {
+        pkt_t p = mk_tcp(IP(10,0,0,2), 5000, IP(8,8,8,8), ports[i], TCP_SYN);
+        CHECK((rules_match(v, &p, DIR_IN) != NULL) ==
+              (rules_match(k, &p, DIR_IN) != NULL));
+    }
+    /* and the two forms can be mixed in one file */
+    rules_t *m = parse("allow tcp from any to any port 22\n"
+                       "allow tcp 10.0.0.0/24 any 80\n");
+    CHECK(m && m->n == 2);
+    rules_free(c); rules_free(v); rules_free(k); rules_free(m);
+}
+
+static void test_compact_syntax_errors(void)
+{
+    expect_error("allow tcp 10.0.0.0/24\n", 1);                  /* no dst */
+    expect_error("allow tcp bogus any 80\n", 1);
+    expect_error("allow tcp 10.0.0.0/24 bogus 80\n", 1);
+    expect_error("allow tcp 10.0.0.0/24 any 70000\n", 1);
+    expect_error("allow tcp 10.0.0.0/24 any 80, 443\n", 1);      /* space */
+    expect_error("allow tcp 10.0.0.0/24 any 80 extra\n", 1);
+    expect_error("allow tcp 10.0.0.0/24 any echo\n", 1);         /* echo: icmp only */
+    expect_error("allow udp 10.0.0.0/24 any echo\n", 1);
+    expect_error("allow icmp 10.0.0.0/24 any 80\n", 1);          /* icmp: no ports */
+    expect_error("allow icmp 10.0.0.0/24 any echo extra\n", 1);
+    expect_error("allow out\n", 1);
+    expect_error("allow tcp 10.0.0.0/24 any 80\nallow in tcp any\n", 2);
+}
+
+static void test_shipped_example_config_loads(void)
+{
+    /* run from the repo root by `make test` */
+    char err[128] = "";
+    rules_t *r = rules_load_file("config/rules.example.conf", err, sizeof err);
+    if (!r) fprintf(stderr, "  %s\n", err);
+    CHECK(r != NULL);
+    if (!r) return;
+    CHECK(r->n == 5 && r->ninside == 1);
+    pkt_t web = mk_tcp(IP(10,0,1,2), 40000, IP(93,184,216,34), 443, TCP_SYN);
+    pkt_t ssh = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 22, TCP_SYN);
+    pkt_t rdp = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
+    pkt_t rogue = mk_udp(IP(10,0,1,2), 40000, IP(8,8,8,8), 53);
+    CHECK(rules_match(r, &web, DIR_IN) && rules_match(r, &web, DIR_IN)->action == ACT_ALLOW);
+    CHECK(rules_match(r, &ssh, DIR_OUT) && rules_match(r, &ssh, DIR_OUT)->action == ACT_ALLOW);
+    CHECK(!rules_match(r, &rdp, DIR_OUT));
+    CHECK(rules_match(r, &rogue, DIR_IN) && rules_match(r, &rogue, DIR_IN)->action == ACT_DENY);
+    rules_free(r);
+}
+
 static void test_load_missing_file(void)
 {
     char err[128];
@@ -246,6 +351,10 @@ int main(void)
     RUN(test_port_list_errors);
     RUN(test_inside_directive);
     RUN(test_inside_errors);
+    RUN(test_compact_syntax_matches_spec_example);
+    RUN(test_compact_defaults_and_equivalence);
+    RUN(test_compact_syntax_errors);
+    RUN(test_shipped_example_config_loads);
     RUN(test_load_missing_file);
     TEST_DONE();
 }
