@@ -1,0 +1,7 @@
+build/
+tunwall
+*.o
+*.dSYM/
+perf.data*
+*.log
+.DS_Store

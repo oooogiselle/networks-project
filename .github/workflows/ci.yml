@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: unit tests (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make CC=${{ matrix.cc }} all
+      - name: Unit tests
+        run: make CC=${{ matrix.cc }} test
+      - name: Unit tests (ASan + UBSan)
+        run: make CC=${{ matrix.cc }} asan
+
+  # Integration tests (network namespaces, needs sudo) are added in week 9
+  # once tests/integration/run_all.sh exists.
