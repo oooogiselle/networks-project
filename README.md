@@ -16,20 +16,53 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva |
 | `src/engine.c` | Fast path / slow path decision logic | Eva |
 | `src/log.c` | Per-flow logs, counters | Eva |
-| `src/tun_io.c`, `src/main.c` | tun devices, I/O loop | Giselle (TODO) |
-| `scripts/` | Namespace harness, benchmarks | Giselle (TODO) |
+| `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Giselle |
+| `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Giselle |
+| `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Giselle |
+| `bench/` | iperf3/ping benchmark script and its rule files | Giselle |
 | `tests/` | Unit tests (`tests/pktbuild.c` builds real wire packets) | shared |
 
 ## Build and test
 
 ```
-make          # builds build/libfwengine.a (parser + engine)
+make          # builds build/libfwengine.a (parser, engine, forwarder)
 make test     # unit tests (run on macOS or Linux, no root needed)
 make asan     # same tests under AddressSanitizer + UBSan
+make tunwall  # builds build/tunwall, the firewall program (Linux only)
 ```
 
-Line coverage of every file in `src/` is 100% (measured with
-`clang --coverage`). `tests/test_alloc_fail.c` covers the out-of-memory paths
+## Running the firewall
+
+```
+sudo scripts/netns.sh up                       # inside / firewall / outside namespaces
+sudo ip netns exec firewall build/tunwall -r config/rules.example.conf -d
+sudo ip netns exec inside curl http://10.0.2.2/   # in another terminal
+sudo scripts/netns.sh down
+```
+
+`tunwall -r <rules> [-i tun-in] [-o tun-out] [-d | -q]`: `-d` also logs every
+dropped packet with its reason, `-q` logs only errors. SIGUSR1 prints the
+counters; SIGINT/SIGTERM stop it and print them. It refuses to start on a rules
+syntax error (printing the line number), on a missing `inside` network, or if a
+tun device does not exist.
+
+How the topology works: `scripts/netns.sh` creates two **persistent** tun
+devices in the firewall namespace and uses `ip rule` so that every packet
+arriving from the inside veth goes into `tun-in` and every packet from the
+outside veth goes into `tun-out`. The kernel never forwards between the two
+sides itself; `tunwall` reads a packet from one tun device and, if allowed,
+writes it to the other, and the kernel then routes it out the right veth.
+Because the tun devices are persistent, if `tunwall` is not running the kernel
+simply drops what it routes to them: no traffic gets through.
+`scripts/netns.sh up kernel` builds the same topology without the policy
+routing (plain kernel forwarding) as the benchmark baseline.
+
+## Tests
+
+Line coverage of the library (everything in `src/` except `main.c` and
+`tun_io.c`'s successful-attach line, which need root and real tun devices and
+are covered by the integration tests instead) is 100%, measured with
+`gcc --coverage`. `tests/test_alloc_fail.c` covers the out-of-memory paths
 by making each startup allocation fail in turn (`src/fwalloc.c` is the thin
 wrapper that allows this); run it under `make asan` on Linux to also catch
 leaks. `tests/test_fuzz.c` throws random and corrupted packets at the parser and
@@ -37,10 +70,37 @@ engine and checks that nothing crashes and the counters stay consistent. It is
 deterministic; replay or lengthen a run with
 `FUZZ_SEED=<n> FUZZ_ITERS=<n> ./build/test_fuzz`.
 
-`sudo tests/integration/run_all.sh` runs the namespace tests (curl, DNS, ping,
-blocked inbound traffic, nmap, logging, kill-the-firewall). They skip locally until
-`build/tunwall` and `scripts/netns.sh` exist (not in CI yet; once enabled, CI fails instead of skipping via `REQUIRE_INTEGRATION=1`). `sudo bench/run_bench.sh <label>`
-records iperf3 and ping numbers for the comparison in the spec.
+`make tunwall && sudo tests/integration/run_all.sh` runs the end-to-end tests in
+the namespace topology against the real `tunwall` (curl with a SHA-256 match,
+DNS, ping, blocked inbound traffic that must be silently dropped rather than
+refused, nmap SYN/ACK/FIN/NULL/Xmas scans, exact log lines, flow expiry,
+kill-the-firewall). They need root, `nmap` and `python3`. CI sets
+`REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
+`SKIP_SLOW=1` to skip the 40 s expiry test. The suite fails when the firewall
+is wrong: against an allow-nothing policy 14 checks fail and against an
+allow-everything policy 13 do.
+
+### Benchmarks
+
+```
+sudo scripts/netns.sh up kernel && sudo bench/run_bench.sh kernel       # (a) kernel forwarding
+sudo scripts/netns.sh up                                                # (b) tunwall, one allow-all rule
+sudo ip netns exec firewall build/tunwall -r bench/allow-all.conf -q &
+sudo bench/run_bench.sh allow-all
+bench/gen_many_rules.sh 2000 > /tmp/many.conf                           # (c) tunwall, 2000 rules
+sudo ip netns exec firewall build/tunwall -r /tmp/many.conf -q &
+sudo bench/run_bench.sh many-rules
+```
+
+The script refuses to run if the topology or the running firewall does not match
+its label. First measurements (one 10 s iperf3 TCP run each, 2-CPU / 4 GB VM, so
+treat as rough): kernel forwarding 8.75 Gbit/s, `tunwall` with one rule
+1.11 Gbit/s, `tunwall` with 2000 rules 1.61 Gbit/s (not slower: rules are only
+consulted for a new flow). Average ping RTT (200 pings): kernel 0.04 ms,
+`tunwall` with 2000 rules 0.14 ms, `tunwall` with one rule 1.03 ms (a few
+outliers up to 16.7 ms dominate that average; the spec's goal is under 0.5 ms
+added). More and longer runs are needed before trusting these, and profiling
+with `perf` to explain the gap is still to do (`PERF=1` records it).
 
 On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
 
@@ -111,3 +171,6 @@ from the outside (exposed services).
 - TCP sequence-number validation (blind RST/injection protection)
 - SYN-flood protection (SYN cookies / half-open limits)
 - Application identification (HTTP/DNS by payload) or source NAT
+- NAT from the outside namespace to the real Internet (the tests use a local web
+  server in the outside namespace, which the spec allows)
+- `perf` profile of `tunwall` and a written explanation of the throughput gap
