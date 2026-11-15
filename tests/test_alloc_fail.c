@@ -164,6 +164,28 @@ static void test_engine_create_survives_each_failure(void)
     CHECK(engine_create_with_rules(NULL) == NULL);
 }
 
+static void test_default_engine_with_limits_survives_each_failure(void)
+{
+    /* engine_create_with_rules() also allocates the per-source counter table */
+    char err[128];
+    int failures = 0;
+    for (long k = 1; k < MAX_SWEEP; k++) {
+        rules_t *rules = rules_parse_string("inside 10.0.0.0/8\nallow udp any any\n", err, sizeof err);
+        CHECK(rules != NULL);
+        fw_alloc_fail_nth(k);
+        engine_t *e = engine_create_with_rules(rules);
+        if (!fw_alloc_failure_fired()) {
+            CHECK(e != NULL);
+            engine_destroy(e);
+            break;
+        }
+        failures++;
+        CHECK(e == NULL);               /* and nothing leaks: run under make asan */
+    }
+    fw_alloc_fail_nth(0);
+    CHECK(failures == 6);               /* engine, the flow table's four, the per-source counters */
+}
+
 static void test_engine_create_from_file_survives_each_failure(void)
 {
     char err[128];
@@ -217,6 +239,7 @@ int main(void)
     RUN(test_rules_parse_survives_each_failure);
     RUN(test_rules_load_file_survives_each_failure);
     RUN(test_engine_create_survives_each_failure);
+    RUN(test_default_engine_with_limits_survives_each_failure);
     RUN(test_engine_create_from_file_survives_each_failure);
     RUN(test_wrappers_behave_like_the_originals);
     TEST_DONE();

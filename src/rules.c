@@ -295,7 +295,7 @@ rules_t *rules_load_file(const char *path, char *err, size_t errlen)
 {
     FILE *fp = fopen(path, "r");
     if (!fp) {
-        if (err && errlen) snprintf(err, errlen, "cannot open %s", path);
+        if (err && errlen) snprintf(err, errlen, "%s: cannot open file", path);
         return NULL;
     }
     char *text = NULL;
@@ -323,14 +323,14 @@ rules_t *rules_load_file(const char *path, char *err, size_t errlen)
     fclose(fp);
     if (read_failed) {
         free(text);
-        if (err && errlen) snprintf(err, errlen, "error reading %s", path);
+        if (err && errlen) snprintf(err, errlen, "%s: error reading file", path);
         return NULL;
     }
     /* The parser works on a C string, so a NUL would silently end the file
      * there and drop every later rule. */
     if (text && memchr(text, '\0', len)) {
         free(text);
-        if (err && errlen) snprintf(err, errlen, "%s contains a NUL byte", path);
+        if (err && errlen) snprintf(err, errlen, "%s: contains a NUL byte", path);
         return NULL;
     }
     if (!text) {                       /* empty file */
@@ -341,6 +341,11 @@ rules_t *rules_load_file(const char *path, char *err, size_t errlen)
     }
     rules_t *rs = rules_parse_string(text, err, errlen);
     free(text);
+    if (!rs && err && errlen) {                 /* "line N: ..." -> "path: line N: ..." */
+        char msg[256];
+        snprintf(msg, sizeof msg, "%s: %s", path, err);
+        snprintf(err, errlen, "%s", msg);
+    }
     return rs;
 }
 
@@ -360,6 +365,15 @@ static bool ports_ok(const port_set_t *s, uint16_t p)
 {
     for (uint8_t i = 0; i < s->n; i++)
         if (p >= s->r[i].lo && p <= s->r[i].hi) return true;
+    return false;
+}
+
+bool rules_is_inside_broadcast(const rules_t *rs, uint32_t ip)
+{
+    for (size_t i = 0; i < rs->ninside; i++) {
+        const addr_match_t *m = &rs->inside[i];
+        if (m->mask != 0xffffffffu && ip == (m->net | ~m->mask)) return true;
+    }
     return false;
 }
 

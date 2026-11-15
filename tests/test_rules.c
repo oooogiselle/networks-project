@@ -402,6 +402,20 @@ static void test_ports_only_allowed_on_tcp_and_udp_rules(void)
     rules_free(r);
 }
 
+static void test_port_and_token_limits_are_enforced(void)
+{
+    CHECK(parse_fails_with("allow out tcp any any 65536\n", "line 1:", "port"));     /* 16-bit */
+    CHECK(parse_fails_with("allow out tcp any any 99999\n", "line 1:", "port"));
+    rules_t *r = parse("allow out tcp any any 65535\nallow out tcp any any 1-65535\n");
+    CHECK(r != NULL && r->n == 2);
+    rules_free(r);
+    /* a line of 16 tokens is the most allowed; a 17th is refused */
+    CHECK(parse_fails_with("allow tcp from any to any port 80 a b c d e f g h i\n", "line 1:", "too many tokens"));
+    r = parse("allow tcp from any to any port 80\n");                       /* 8 tokens: fine */
+    CHECK(r != NULL);
+    rules_free(r);
+}
+
 static void test_load_missing_file(void)
 {
     char err[128];
@@ -429,6 +443,7 @@ int main(void)
     RUN(test_compact_syntax_errors);
     RUN(test_shipped_example_config_loads);
     RUN(test_load_missing_file);
+    RUN(test_port_and_token_limits_are_enforced);
     RUN(test_ports_only_allowed_on_tcp_and_udp_rules);
     RUN(test_load_directory_is_an_error_not_an_empty_ruleset);
     RUN(test_load_file_with_nul_byte_is_an_error);

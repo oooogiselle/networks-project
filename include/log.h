@@ -24,7 +24,19 @@
 
 typedef enum { LOG_OFF = 0, LOG_INFO, LOG_DEBUG } log_level_t;
 
-void fw_log_set(FILE *out, log_level_t level);
+/*
+ * Rate limit: logging must not become a denial of service, so lines are
+ * limited to FW_LOG_LINES_PER_SEC sustained with bursts of up to
+ * FW_LOG_BURST, shared by every kind of line. When lines had to be dropped, one
+ * "N log lines suppressed" line is written as soon as logging resumes. The
+ * counters and statistics are never limited, only the text.
+ */
+#define FW_LOG_LINES_PER_SEC 1000
+#define FW_LOG_BURST         1000
+
+void fw_log_set(FILE *out, log_level_t level);   /* also resets the limiter */
+/* Lines suppressed by the rate limit since fw_log_set(). */
+uint64_t fw_log_suppressed(void);
 bool fw_log_enabled(log_level_t level);
 
 /* Format a host-order IPv4 address into buf (>= 16 bytes). */

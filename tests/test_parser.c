@@ -575,6 +575,8 @@ static void ip_options_are_validated_and_source_routing_dropped(void)
     const uint8_t len1[8] = {7, 1, 0, 0, 0, 0, 0, 0};
     const uint8_t toolong[8] = {7, 40, 4, 0, 0, 0, 0, 0};
     const uint8_t nolen[4] = {1, 1, 1, 7};
+    const uint8_t overrun[8] = {7, 9, 0, 0, 0, 0, 0, 0};    /* length 9, room for 8 */
+    const uint8_t exact[8] = {7, 8, 0, 0, 0, 0, 0, 0};      /* length 8, exactly fits */
     n = with_ip_options(b, sizeof b, len0, 8);
     CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
     n = with_ip_options(b, sizeof b, len1, 8);
@@ -583,6 +585,10 @@ static void ip_options_are_validated_and_source_routing_dropped(void)
     CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
     n = with_ip_options(b, sizeof b, nolen, 4);
     CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+    n = with_ip_options(b, sizeof b, overrun, 8);          /* off by one byte */
+    CHECK_EQ(parse_exact(b, n), PARSE_MALFORMED);
+    n = with_ip_options(b, sizeof b, exact, 8);
+    CHECK_EQ(parse_exact(b, n), PARSE_OK);
 }
 
 static void martian_addresses(void)

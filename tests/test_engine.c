@@ -169,20 +169,6 @@ static void test_spoofed_direction_dropped(void)
     engine_destroy(e);
 }
 
-static void test_flow_checks_the_interface_even_when_addresses_pass(void)
-{
-    /* Defence in depth behind the address check: both hosts are inside, so
-     * every source address is acceptable on the inside interface, but a
-     * flow's reply must still arrive on the opposite interface. */
-    engine_t *e = make_engine("allow tcp from 10.0.0.0/24 to 10.0.0.0/24\n");
-    drop_reason_t w;
-    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, CLIENT_B, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
-    /* the "reply" arrives on the same interface the request came from */
-    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 80, CLIENT_A, 50000, TCP_SYN|TCP_ACK), DIR_IN, SEC+1, &w) == VERDICT_DROP);
-    CHECK(w == DROP_SPOOF);
-    engine_destroy(e);
-}
-
 static void test_half_open_flow_expires(void)
 {
     engine_t *e = make_engine(RULES);
@@ -714,6 +700,7 @@ static void test_default_capacity_is_65536_and_full_table_keeps_flows(void)
 {
     CHECK(FW_DEFAULT_MAX_FLOWS == 65536u);
     engine_t *e = engine_create_with_rules(rules_of("allow udp any any\n"));
+    CHECK(engine_set_limits(e, 0, 0));      /* this test is about raw capacity, not the caps */
     drop_reason_t w;
     /* fill the table with distinct UDP flows (client port x server port) */
     for (uint32_t i = 0; i < FW_DEFAULT_MAX_FLOWS; i++) {
@@ -920,6 +907,316 @@ static void test_table_full_reclaim_is_rate_limited(void)
     engine_destroy(e);
 }
 
+static engine_t *established_flow(uint64_t *t);
+static char *slurp(FILE *f);
+static rules_t *rules_of(const char *text);
+
+static void test_the_icmp_error_budget_resets_at_exactly_one_second(void)
+{
+    engine_t *e = make_engine(RULES_IN);
+    drop_reason_t w;
+    uint8_t syn[128], err[256];
+    size_t n = pb_tcp(syn, sizeof syn, NULL, CLIENT_A, 50000, SERVER, 80, TCP_SYN, NULL, 0);
+    CHECK(send_pkt(e, parsed(syn, n), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    pkt_t er = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_TIME_EXCEEDED, syn);
+    const uint64_t t0 = 10 * SEC;
+    for (int i = 0; i < ICMP_ERRORS_PER_FLOW_PER_SEC; i++)
+        CHECK(send_pkt(e, er, DIR_OUT, t0, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, er, DIR_OUT, t0 + SEC - 1, &w) == VERDICT_DROP);   /* 1 ns short */
+    CHECK(w == DROP_ICMP_RATE);
+    CHECK(send_pkt(e, er, DIR_OUT, t0 + SEC, &w) == VERDICT_ALLOW);      /* exactly a second */
+    /* a clock that jumps backwards must not freeze the flow's budget */
+    for (int i = 1; i < ICMP_ERRORS_PER_FLOW_PER_SEC; i++)
+        CHECK(send_pkt(e, er, DIR_OUT, t0 + SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, er, DIR_OUT, t0 + SEC, &w) == VERDICT_DROP);       /* budget used up */
+    CHECK(send_pkt(e, er, DIR_OUT, 2 * SEC, &w) == VERDICT_ALLOW);       /* time went backwards: reset */
+    engine_destroy(e);
+}
+
+static void test_icmp_errors_about_a_time_wait_flow_are_dropped(void)
+{
+    uint64_t t = SEC;
+    engine_t *e = established_flow(&t);
+    drop_reason_t w;
+    uint8_t syn[128], err[256];
+    size_t n = pb_tcp(syn, sizeof syn, NULL, CLIENT_A, 50000, SERVER, 80, TCP_SYN, NULL, 0);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_FIN | TCP_ACK), DIR_IN, t += SEC, &w);
+    pkt_t early = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_DEST_UNREACH, syn);
+    CHECK(send_pkt(e, early, DIR_OUT, t += SEC, &w) == VERDICT_ALLOW);   /* FIN_WAIT: still open */
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_FIN | TCP_ACK), DIR_OUT, t += SEC, &w);
+    pkt_t late = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_DEST_UNREACH, syn);
+    CHECK(send_pkt(e, late, DIR_OUT, t += SEC, &w) == VERDICT_DROP);     /* TIME_WAIT */
+    CHECK(w == DROP_ICMP_ERR);
+    (void)n;
+    engine_destroy(e);
+}
+
+static void test_the_reclaim_sweep_runs_at_exactly_one_second(void)
+{
+    engine_t *e = engine_create_with_rules_sized(rules_of("allow udp any any\n"), 2);
+    drop_reason_t w;
+    const uint64_t MS = SEC / 1000;
+    send_pkt(e, mk_udp(CLIENT_A, 1, SERVER, 53), DIR_IN, 0, &w);          /* both expire at 30 s */
+    send_pkt(e, mk_udp(CLIENT_A, 2, SERVER, 53), DIR_IN, 0, &w);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, 29 * SEC + 500 * MS, &w) == VERDICT_DROP);
+    /* exactly one second after that sweep the flows are expired and the sweep may run again */
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, 30 * SEC + 500 * MS, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_flow_log_lines_name_the_rule_and_use_the_packet_time(void)
+{
+    engine_t *e = make_engine("allow tcp from 10.0.0.0/24 to any port 80\nallow udp from 10.0.0.0/24 to any port 53\n");
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, 10 * SEC, &w);
+    send_pkt(e, mk_udp(CLIENT_A, 6000, SERVER, 53), DIR_IN, 12 * SEC, &w);
+    CHECK(engine_expire(e, 500 * SEC) == 2);
+    fw_log_set(NULL, LOG_OFF);
+    const char *out = slurp(log);
+    /* make_engine prepends the inside line, so the rules are on lines 2 and 3 */
+    CHECK(strstr(out, "[ 10.000000] FLOW NEW    tcp 10.0.0.2:50000 -> 93.184.216.34:80 state=SYN_SENT rule=2") != NULL);
+    CHECK(strstr(out, "[ 12.000000] FLOW NEW    udp 10.0.0.2:6000 -> 93.184.216.34:53") != NULL);
+    CHECK(strstr(out, "rule=3") != NULL);
+    CHECK(strstr(out, "[500.000000] FLOW EXPIRE tcp") != NULL);     /* stamped with the sweep time */
+    CHECK(strstr(out, "[500.000000] FLOW EXPIRE udp") != NULL);
+    fclose(log);
+    engine_destroy(e);
+}
+
+/* ---- who may start a flow, and how many ------------------------------------ */
+
+static void test_a_flow_must_run_between_inside_and_outside(void)
+{
+    /* Whatever the rules say: inside-to-inside and outside-to-outside traffic
+     * has no business crossing the firewall, nor has anything addressed to an
+     * inside network's broadcast address. */
+    engine_t *e = make_engine("allow any any any\nallow in any any any\n");
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4444, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50001, CLIENT_B, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_BAD_DST);                                  /* inside -> inside   */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50002, CLIENT_A, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_BAD_DST);                                  /* to its own address */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4445, SERVER, 80, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_BAD_DST);                                  /* outside -> outside */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4446, IP(10,0,0,255), 80, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_BAD_DST);                                  /* inside broadcast   */
+    CHECK(send_pkt(e, mk_udp(ATTACKER, 4447, IP(10,0,0,255), 53), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_BAD_DST);
+    /* .0 and .254 are ordinary hosts */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4448, IP(10,0,0,254), 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+
+    /* a /32 inside network has no broadcast address */
+    e = make_engine("inside 10.0.0.2/32\nallow in any any any\n");
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4449, CLIENT_A, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_only_a_plain_syn_starts_a_tcp_flow(void)
+{
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    /* ECN setup bits ride on a SYN legitimately */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN | TCP_ECE | TCP_CWR), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    /* PSH / URG on a SYN is a scanner's trick, not a connection */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50001, SERVER, 80, TCP_SYN | TCP_PSH), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_NOT_SYN);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50002, SERVER, 80, TCP_SYN | TCP_URG), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_NOT_SYN);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50003, SERVER, 80, TCP_SYN | TCP_PSH | TCP_URG), DIR_IN, SEC, &w) == VERDICT_DROP);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_created == 1);
+    /* A SYN that carries data is allowed on purpose: TCP Fast Open sends data
+     * in the SYN, and the destination was already approved by a rule. */
+    uint8_t b[256], data[16] = "fast-open-data";
+    size_t n = pb_tcp(b, sizeof b, NULL, CLIENT_A, 50004, SERVER, 80, TCP_SYN, data, sizeof data);
+    CHECK(send_pkt(e, parsed(b, n), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static engine_t *established_flow(uint64_t *t)
+{
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, *t, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN | TCP_ACK), DIR_OUT, *t += SEC, &w);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, *t += SEC, &w);
+    return e;
+}
+
+static void test_a_closed_connection_cannot_be_kept_alive_or_carry_data(void)
+{
+    uint64_t t = SEC;
+    engine_t *e = established_flow(&t);
+    drop_reason_t w;
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_FIN | TCP_ACK), DIR_IN, t += SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_FIN | TCP_ACK), DIR_OUT, t += SEC, &w);
+    const uint64_t closed_at = t;               /* TIME_WAIT: 30 s from here */
+
+    /* data on a connection both sides have closed: dropped */
+    t += 10 * SEC;
+    uint8_t b[256], data[8] = "payload";
+    size_t n = pb_tcp(b, sizeof b, NULL, CLIENT_A, 50000, SERVER, 80, TCP_ACK | TCP_PSH, data, sizeof data);
+    CHECK(send_pkt(e, parsed(b, n), DIR_IN, t, &w) == VERDICT_DROP);
+    CHECK(w == DROP_TCP_STATE);
+    /* bare ACKs are fine, but they do not extend the flow's life */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, t = closed_at + 20 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, closed_at + 29 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, closed_at + 31 * SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_NOT_SYN);                   /* the flow is gone: no flow, not a SYN */
+    engine_destroy(e);
+
+    /* a reset connection (CLOSED, 5 s) is not kept alive by repeated RSTs */
+    t = SEC;
+    e = established_flow(&t);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_RST), DIR_OUT, t += SEC, &w);
+    const uint64_t reset_at = t;
+    for (int i = 1; i <= 4; i++)
+        CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_RST), DIR_OUT, reset_at + i * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_RST), DIR_OUT, reset_at + 6 * SEC, &w) == VERDICT_DROP);
+    engine_destroy(e);
+}
+
+static void test_a_half_closed_connection_survives_a_long_pause(void)
+{
+    /* The client sends its request and half-closes (shutdown(WR)); the server
+     * takes 75 s to answer, which a real server may. */
+    uint64_t t = SEC;
+    engine_t *e = established_flow(&t);
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_FIN | TCP_ACK), DIR_IN, t += SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_ACK | TCP_PSH), DIR_OUT, t + 75 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_FIN | TCP_ACK), DIR_OUT, t + 76 * SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_a_tuple_in_time_wait_can_be_reused_by_a_new_syn(void)
+{
+    uint64_t t = SEC;
+    engine_t *e = established_flow(&t);
+    drop_reason_t w;
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_FIN | TCP_ACK), DIR_IN, t += SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_FIN | TCP_ACK), DIR_OUT, t += SEC, &w);
+    /* anything but a plain SYN from the originator does not revive it */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN | TCP_ACK), DIR_IN, t += SEC, &w) == VERDICT_DROP);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN), DIR_OUT, t += SEC, &w) == VERDICT_DROP);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_active == 1);
+    /* a fresh SYN from the originator starts over */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, t += SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN | TCP_ACK), DIR_OUT, t += SEC, &w) == VERDICT_ALLOW);
+    engine_get_stats(e, &st);
+    CHECK(st.flows_created == 2 && st.flows_active == 1);
+    engine_destroy(e);
+}
+
+static void test_one_source_cannot_hold_more_than_its_share_of_flows(void)
+{
+    engine_t *e = make_engine("allow in tcp from any to 10.0.0.3 port 22\nallow udp from 10.0.0.0/24 to any\n");
+    CHECK(engine_set_limits(e, 3, 0));
+    drop_reason_t w;
+    for (int i = 0; i < 3; i++)
+        CHECK(send_pkt(e, mk_tcp(ATTACKER, (uint16_t)(4000 + i), CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4010, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SRC_LIMIT);
+    /* a SYN retransmit on an existing flow is not a new flow */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    /* other sources are untouched, inside or outside */
+    CHECK(send_pkt(e, mk_tcp(IP(198,51,100,67), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    for (int i = 0; i < 3; i++) {
+        CHECK(send_pkt(e, mk_udp(CLIENT_A, (uint16_t)(5000 + i), SERVER, 53), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+        CHECK(send_pkt(e, mk_udp(CLIENT_B, (uint16_t)(5000 + i), SERVER, 53), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    }
+    /* the cap applies to every originating address, an inside host included */
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 5003, SERVER, 53), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SRC_LIMIT);
+    /* flows that time out give the source its room back */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 4010, CLIENT_B, 22, TCP_SYN), DIR_OUT, 100 * SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.drops[DROP_SRC_LIMIT] == 2);
+    engine_destroy(e);
+}
+
+static void test_outside_flows_cannot_take_the_inside_users_reserve(void)
+{
+    engine_t *e = make_engine("allow in tcp from any to 10.0.0.3 port 22\nallow tcp from 10.0.0.0/24 to any port 80\n");
+    CHECK(engine_set_limits(e, 0, 4));
+    drop_reason_t w;
+    for (int i = 0; i < 4; i++)
+        CHECK(send_pkt(e, mk_tcp(IP(198,51,100,i + 1), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(IP(198,51,100,99), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_OUTSIDE_QUOTA);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_a_spoofed_flood_from_outside_leaves_the_inside_working(void)
+{
+    /* The default engine, the example policy, and an attacker using a fresh
+     * (spoofed) source address for every SYN so no per-source cap helps. */
+    engine_t *e = make_engine("allow in tcp from any to 10.0.0.3 port 22\nallow tcp from 10.0.0.0/24 to any port 80\n");
+    drop_reason_t w;
+    uint32_t allowed = 0, quota = 0;
+    for (uint32_t i = 0; i < 60000; i++) {
+        uint32_t src = IP(198,18,0,0) + 1 + i;
+        verdict_t v = send_pkt(e, mk_tcp(src, 4444, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w);
+        if (v == VERDICT_ALLOW) allowed++; else if (w == DROP_OUTSIDE_QUOTA) quota++;
+    }
+    CHECK(allowed == FW_DEFAULT_MAX_OUTSIDE);
+    CHECK(quota == 60000 - FW_DEFAULT_MAX_OUTSIDE);
+    /* the inside users still get through, over and over */
+    for (int i = 0; i < 100; i++)
+        CHECK(send_pkt(e, mk_tcp(CLIENT_A, (uint16_t)(40000 + i), SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_the_default_engine_caps_one_source_at_a_sixteenth(void)
+{
+    engine_t *e = make_engine("allow in tcp from any to 10.0.0.3 port 22\n");
+    drop_reason_t w;
+    uint32_t ok = 0;
+    for (uint32_t i = 0; i < FW_DEFAULT_MAX_PER_SOURCE + 50; i++)
+        if (send_pkt(e, mk_tcp(ATTACKER, (uint16_t)(1024 + i), CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW) ok++;
+    CHECK(ok == FW_DEFAULT_MAX_PER_SOURCE);
+    CHECK(w == DROP_SRC_LIMIT);
+    CHECK(FW_DEFAULT_MAX_PER_SOURCE == 4096 && FW_DEFAULT_MAX_OUTSIDE == 49152);
+    CHECK(send_pkt(e, mk_tcp(IP(198,51,100,200), 1024, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_undoing_a_write_that_failed_forgets_only_the_new_flow(void)
+{
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    pkt_t syn = mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN);
+    CHECK(send_pkt(e, syn, DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(engine_undo_new_flow(e, &syn, DIR_IN, SEC));
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_active == 0 && st.flows_created == 0);
+    CHECK(st.pkts_allowed == 0 && st.pkts_dropped == 1 && st.drops[DROP_WRITE_FAILED] == 1);
+    CHECK(send_pkt(e, syn, DIR_IN, SEC + 1, &w) == VERDICT_ALLOW);      /* the retry works */
+
+    /* a packet on an existing flow: the flow stays */
+    pkt_t sa = mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN | TCP_ACK);
+    CHECK(send_pkt(e, sa, DIR_OUT, SEC + 2, &w) == VERDICT_ALLOW);
+    CHECK(!engine_undo_new_flow(e, &sa, DIR_OUT, SEC + 2));
+    pkt_t syn_again = mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN);     /* a retransmit of the SYN */
+    CHECK(send_pkt(e, syn_again, DIR_IN, SEC + 3, &w) == VERDICT_ALLOW);
+    CHECK(!engine_undo_new_flow(e, &syn_again, DIR_IN, SEC + 3));       /* not the creating packet */
+    engine_get_stats(e, &st);
+    CHECK(st.flows_active == 1);
+    engine_destroy(e);
+}
+
 /* ---- creating an engine from a rules file --------------------------------- */
 
 static void test_engine_create_from_the_shipped_config(void)
@@ -957,7 +1254,8 @@ static void test_engine_create_reports_bad_files(void)
     close(fd);
     err[0] = '\0';
     CHECK(engine_create(path, err, sizeof err) == NULL);   /* refuses to start */
-    CHECK(strncmp(err, "line 2:", 7) == 0);                /* says which line */
+    CHECK(strncmp(err, path, strlen(path)) == 0);          /* names the file ... */
+    CHECK(strstr(err, ": line 2:") != NULL);               /* ... and says which line */
     unlink(path);
 
     /* a valid file with no `inside` line is refused, and says why */
@@ -985,7 +1283,6 @@ int main(void)
     RUN(test_tcp_reply_without_flow_dropped);
     RUN(test_inbound_data_before_handshake_dropped);
     RUN(test_spoofed_direction_dropped);
-    RUN(test_flow_checks_the_interface_even_when_addresses_pass);
     RUN(test_half_open_flow_expires);
     RUN(test_established_flow_idle_timeout_and_refresh);
     RUN(test_sweep_expires_flows);
@@ -1019,6 +1316,20 @@ int main(void)
     RUN(test_close_is_logged_once_per_flow);
     RUN(test_table_full_reclaims_expired_flows_on_insert);
     RUN(test_table_full_reclaim_is_rate_limited);
+    RUN(test_a_flow_must_run_between_inside_and_outside);
+    RUN(test_only_a_plain_syn_starts_a_tcp_flow);
+    RUN(test_a_closed_connection_cannot_be_kept_alive_or_carry_data);
+    RUN(test_a_half_closed_connection_survives_a_long_pause);
+    RUN(test_a_tuple_in_time_wait_can_be_reused_by_a_new_syn);
+    RUN(test_one_source_cannot_hold_more_than_its_share_of_flows);
+    RUN(test_outside_flows_cannot_take_the_inside_users_reserve);
+    RUN(test_a_spoofed_flood_from_outside_leaves_the_inside_working);
+    RUN(test_the_default_engine_caps_one_source_at_a_sixteenth);
+    RUN(test_undoing_a_write_that_failed_forgets_only_the_new_flow);
+    RUN(test_the_icmp_error_budget_resets_at_exactly_one_second);
+    RUN(test_icmp_errors_about_a_time_wait_flow_are_dropped);
+    RUN(test_the_reclaim_sweep_runs_at_exactly_one_second);
+    RUN(test_flow_log_lines_name_the_rule_and_use_the_packet_time);
     RUN(test_engine_create_from_the_shipped_config);
     RUN(test_engine_create_reports_bad_files);
     TEST_DONE();

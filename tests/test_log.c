@@ -13,6 +13,18 @@
 #include "parser.h"
 #include "testutil.h"
 
+#define SEC_NS 1000000000ull
+
+/* The whole file (the rate-limit tests write a lot). */
+static char *slurp_all(FILE *f)
+{
+    static char big[400000];
+    rewind(f);
+    size_t n = fread(big, 1, sizeof big - 1, f);
+    big[n] = '\0';
+    return big;
+}
+
 static char *slurp(FILE *f)
 {
     static char buf[4096];
@@ -20,6 +32,101 @@ static char *slurp(FILE *f)
     size_t n = fread(buf, 1, sizeof buf - 1, f);
     buf[n] = '\0';
     return buf;
+}
+
+static int count_lines(FILE *f)
+{
+    rewind(f);
+    int n = 0, c;
+    while ((c = fgetc(f)) != EOF) if (c == '\n') n++;
+    return n;
+}
+
+static void test_a_flood_of_log_lines_is_rate_limited(void)
+{
+    /* A scan or flood must not turn into a flood of log writes: at most
+     * FW_LOG_BURST lines at once, FW_LOG_LINES_PER_SEC sustained, then one
+     * summary line saying how many were dropped when logging resumes. */
+    FILE *f = tmpfile();
+    fw_log_set(f, LOG_DEBUG);
+    pkt_t p = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
+    const uint64_t t0 = 5 * SEC_NS;
+    for (int i = 0; i < FW_LOG_BURST + 500; i++)
+        log_drop(&p, DIR_OUT, DROP_NO_RULE, t0);
+    CHECK(count_lines(f) == FW_LOG_BURST);
+    CHECK(fw_log_suppressed() == 500);
+
+    /* two seconds later there is room again: a summary, then the line itself */
+    log_drop(&p, DIR_OUT, DROP_NO_RULE, t0 + 2 * SEC_NS);
+    CHECK(count_lines(f) == FW_LOG_BURST + 2);
+    const char *out = slurp_all(f);
+    const char *sum = strstr(out + strlen(out) - 400, "500 log lines suppressed");
+    CHECK(sum != NULL);
+    CHECK(fw_log_suppressed() == 500);                  /* running total keeps counting */
+    log_drop(&p, DIR_OUT, DROP_NO_RULE, t0 + 2 * SEC_NS + 1);
+    CHECK(count_lines(f) == FW_LOG_BURST + 3);          /* no second summary */
+    fw_log_set(NULL, LOG_OFF);
+    fclose(f);
+}
+
+static void test_every_kind_of_log_line_shares_one_budget(void)
+{
+    FILE *f = tmpfile();
+    fw_log_set(f, LOG_DEBUG);
+    pkt_t p = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
+    flow_t fl;
+    memset(&fl, 0, sizeof fl);
+    fl.key.proto = FW_PROTO_TCP;
+    for (int i = 0; i < 400; i++) log_drop(&p, DIR_OUT, DROP_NO_RULE, SEC_NS);
+    for (int i = 0; i < 400; i++) log_flow("NEW", &fl, SEC_NS);
+    for (int i = 0; i < 400; i++) log_parse_fail(1, DIR_IN, 20, SEC_NS);
+    CHECK(count_lines(f) == FW_LOG_BURST);
+    CHECK(fw_log_suppressed() == 200);
+    fw_log_set(NULL, LOG_OFF);
+    fclose(f);
+}
+
+static void test_a_steady_rate_within_the_limit_loses_nothing(void)
+{
+    FILE *f = tmpfile();
+    fw_log_set(f, LOG_DEBUG);
+    pkt_t p = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
+    /* one line every 2 ms = 500 per second, for 4 seconds */
+    for (int i = 0; i < 2000; i++)
+        log_drop(&p, DIR_OUT, DROP_NO_RULE, SEC_NS + (uint64_t)i * 2000000ull);
+    CHECK(count_lines(f) == 2000);
+    CHECK(fw_log_suppressed() == 0);
+    fw_log_set(NULL, LOG_OFF);
+    fclose(f);
+}
+
+static void test_the_limiter_survives_the_clock_going_backwards(void)
+{
+    FILE *f = tmpfile();
+    fw_log_set(f, LOG_DEBUG);
+    pkt_t p = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
+    for (int i = 0; i < FW_LOG_BURST + 10; i++)
+        log_drop(&p, DIR_OUT, DROP_NO_RULE, 100000 * SEC_NS);
+    const int before = count_lines(f);
+    log_drop(&p, DIR_OUT, DROP_NO_RULE, 1 * SEC_NS);    /* hours earlier */
+    CHECK(count_lines(f) > before);                     /* logged, not silenced for hours */
+    fw_log_set(NULL, LOG_OFF);
+    fclose(f);
+}
+
+static void test_setting_the_log_resets_the_limiter(void)
+{
+    FILE *f = tmpfile();
+    fw_log_set(f, LOG_DEBUG);
+    pkt_t p = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
+    for (int i = 0; i < FW_LOG_BURST + 10; i++) log_drop(&p, DIR_OUT, DROP_NO_RULE, SEC_NS);
+    CHECK(fw_log_suppressed() == 10);
+    fw_log_set(f, LOG_DEBUG);
+    CHECK(fw_log_suppressed() == 0);
+    for (int i = 0; i < FW_LOG_BURST; i++) log_drop(&p, DIR_OUT, DROP_NO_RULE, SEC_NS);
+    CHECK(fw_log_suppressed() == 0);
+    fw_log_set(NULL, LOG_OFF);
+    fclose(f);
 }
 
 static void test_protocol_and_ip_names(void)
@@ -117,6 +224,11 @@ static void test_stats_summary_lists_each_nonzero_reason(void)
 
 int main(void)
 {
+    RUN(test_a_flood_of_log_lines_is_rate_limited);
+    RUN(test_every_kind_of_log_line_shares_one_budget);
+    RUN(test_a_steady_rate_within_the_limit_loses_nothing);
+    RUN(test_the_limiter_survives_the_clock_going_backwards);
+    RUN(test_setting_the_log_resets_the_limiter);
     RUN(test_protocol_and_ip_names);
     RUN(test_every_drop_reason_has_its_own_name);
     RUN(test_tcp_state_names);
