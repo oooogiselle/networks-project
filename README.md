@@ -38,8 +38,8 @@ deterministic; replay or lengthen a run with
 `FUZZ_SEED=<n> FUZZ_ITERS=<n> ./build/test_fuzz`.
 
 `sudo tests/integration/run_all.sh` runs the namespace tests (curl, DNS, ping,
-blocked inbound traffic, nmap, logging, kill-the-firewall). They skip until
-`build/tunwall` and `scripts/netns.sh` exist. `sudo bench/run_bench.sh <label>`
+blocked inbound traffic, nmap, logging, kill-the-firewall). They skip locally until
+`build/tunwall` and `scripts/netns.sh` exist (not in CI yet; once enabled, CI fails instead of skipping via `REQUIRE_INTEGRATION=1`). `sudo bench/run_bench.sh <label>`
 records iperf3 and ping numbers for the comparison in the spec.
 
 On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
