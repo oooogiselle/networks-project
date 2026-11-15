@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   log.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Logging interface: per-flow lifecycle events, per-packet drop
+ *              reasons, parse failures, and the statistics summary.
+ =============================================================================*/
+
 /*
  * log.h - per-flow event logging and metrics output.
  *

@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   test_flowtable.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Unit tests for the flow table: lookup in both directions,
+ *              expiry, capacity limits, and slot reuse.
+ =============================================================================*/
+
 #include "flowtable.h"
 #include "testutil.h"
 
@@ -99,6 +110,63 @@ static void test_remove(void)
     ft_destroy(ft);
 }
 
+static void test_slots_are_reused_not_reallocated(void)
+{
+    flowtable_t *ft = ft_create(8, 4);
+    flow_t *slots[4];
+    for (int i = 0; i < 4; i++) {
+        flow_key_t k = K(IP(10,0,0,2), 1000 + i, IP(1,2,3,4), 80);
+        slots[i] = ft_insert(ft, &k, DIR_IN, 0);
+        CHECK(slots[i] != NULL);
+    }
+    flow_key_t extra = K(IP(10,0,0,2), 2000, IP(1,2,3,4), 80);
+    CHECK(ft_insert(ft, &extra, DIR_IN, 0) == NULL);        /* full */
+
+    /* dirty a flow, free it, and the slot comes back clean */
+    slots[1]->pkts[0] = 99;
+    slots[1]->tcp_state = TCPS_ESTABLISHED;
+    slots[1]->seen_reply = true;
+    slots[1]->rule_line = 7;
+    ft_remove(ft, slots[1]);
+    CHECK(ft_count(ft) == 3);
+    flow_t *again = ft_insert(ft, &extra, DIR_OUT, 5 * SEC);
+    CHECK(again == slots[1]);                               /* same memory */
+    CHECK(again->pkts[0] == 0 && again->tcp_state == TCPS_NONE &&
+          !again->seen_reply && again->rule_line == 0);
+    CHECK(again->orig_dir == DIR_OUT && again->created_ns == 5 * SEC);
+    CHECK(again->key.src_port == 2000);
+    ft_destroy(ft);
+}
+
+static void test_churn_never_exceeds_capacity(void)
+{
+    /* insert/expire far more flows than there are slots, in waves */
+    flowtable_t *ft = ft_create(16, 32);
+    uint64_t t = 0;
+    for (int wave = 0; wave < 200; wave++) {
+        for (int i = 0; i < 32; i++) {
+            flow_key_t k = K(IP(10,0,0,2), 1000 + i, IP(1,2,3,4), 80 + wave);
+            flow_t *f = ft_insert(ft, &k, DIR_IN, t);
+            CHECK(f != NULL);
+            if (f) f->expires_ns = t + 10;
+        }
+        flow_key_t k = K(IP(9,9,9,9), 1, IP(1,2,3,4), 1);
+        CHECK(ft_insert(ft, &k, DIR_IN, t) == NULL);        /* still full */
+        t += 100;
+        CHECK(ft_expire(ft, t, NULL, NULL) == 32);
+        CHECK(ft_count(ft) == 0);
+    }
+    ft_destroy(ft);
+}
+
+static void test_zero_capacity_table_refuses_everything(void)
+{
+    flowtable_t *ft = ft_create(8, 0);
+    flow_key_t k = K(IP(10,0,0,2), 1, IP(1,2,3,4), 80);
+    CHECK(ft != NULL && ft_insert(ft, &k, DIR_IN, 0) == NULL);
+    ft_destroy(ft);
+}
+
 int main(void)
 {
     RUN(test_insert_and_lookup_both_directions);
@@ -107,5 +175,8 @@ int main(void)
     RUN(test_sweep_removes_only_expired);
     RUN(test_capacity_limit);
     RUN(test_remove);
+    RUN(test_slots_are_reused_not_reallocated);
+    RUN(test_churn_never_exceeds_capacity);
+    RUN(test_zero_capacity_table_refuses_everything);
     TEST_DONE();
 }

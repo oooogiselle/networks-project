@@ -1,3 +1,14 @@
+/*=============================================================================
+ * File Name:   testutil.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Minimal unit-test helpers (CHECK and RUN macros) and small
+ *              constructors for test packets.
+ =============================================================================*/
+
 /* Minimal unit-test helpers: CHECK() counts failures, main returns non-zero. */
 #ifndef FW_TESTUTIL_H
 #define FW_TESTUTIL_H

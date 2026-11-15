@@ -1,3 +1,15 @@
+/*=============================================================================
+ * File Name:   parser.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Packet parser interface: zero-copy IPv4/TCP/UDP/ICMP parsing,
+ *              ICMP error inner-packet extraction, and RFC 1071 checksum
+ *              helpers.
+ =============================================================================*/
+
 /*
  * parser.h - zero-copy IPv4 / TCP / UDP / ICMP parser.
  *

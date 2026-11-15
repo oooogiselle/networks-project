@@ -1,3 +1,15 @@
+/*=============================================================================
+ * File Name:   engine.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Shared interface between the packet parser / I/O loop and the
+ *              decision engine: pkt_t, verdicts, drop reasons, statistics, and
+ *              engine_decide().
+ =============================================================================*/
+
 /*
  * engine.h - the shared interface between the packet parser / I/O loop
  * (Giselle) and the decision engine (flow table, TCP state, rules).
@@ -94,10 +106,15 @@ typedef struct engine_stats {
 typedef struct engine engine_t;
 typedef struct rules rules_t;
 
+/* Flow table capacity when not specified (the requirements spec's default). */
+#define FW_DEFAULT_MAX_FLOWS 65536u
+
 /* Load rules from a file. Returns NULL and fills err on failure. */
 engine_t *engine_create(const char *rules_path, char *err, size_t errlen);
 /* Takes ownership of rules (used by tests). */
 engine_t *engine_create_with_rules(rules_t *rules);
+/* Same, with an explicit flow table capacity (all slots allocated up front). */
+engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows);
 void      engine_destroy(engine_t *e);
 
 /*

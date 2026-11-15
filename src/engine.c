@@ -1,3 +1,16 @@
+/*=============================================================================
+ * File Name:   engine.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Decision engine. Ties the flow table, TCP state machine and
+ *              rules together (fast path for known flows, slow path for new
+ *              ones), and handles ICMP error matching and address anti-
+ *              spoofing.
+ =============================================================================*/
+
 /*
  * engine.c - ties the flow table, TCP state machine and rules together.
  *
@@ -15,8 +28,6 @@
 #include "rules.h"
 #include "tcpstate.h"
 
-#define DEFAULT_BUCKETS  (1u << 16)
-#define DEFAULT_MAX_FLOWS (1u << 18)
 
 _Static_assert(PARSE_RESULT_COUNT <= ENGINE_PARSE_KINDS,
                "grow ENGINE_PARSE_KINDS in engine.h");
@@ -27,15 +38,21 @@ struct engine {
     engine_stats_t st;
 };
 
-engine_t *engine_create_with_rules(rules_t *rules)
+engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows)
 {
     if (!rules) return NULL;
     engine_t *e = calloc(1, sizeof *e);
     if (!e) return NULL;
     e->rules = rules;
-    e->ft = ft_create(DEFAULT_BUCKETS, DEFAULT_MAX_FLOWS);
+    /* about one bucket per flow slot keeps chains short at capacity */
+    e->ft = ft_create(max_flows, max_flows);
     if (!e->ft) { free(e); return NULL; }
     return e;
+}
+
+engine_t *engine_create_with_rules(rules_t *rules)
+{
+    return engine_create_with_rules_sized(rules, FW_DEFAULT_MAX_FLOWS);
 }
 
 engine_t *engine_create(const char *rules_path, char *err, size_t errlen)

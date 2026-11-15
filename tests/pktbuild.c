@@ -1,3 +1,15 @@
+/*=============================================================================
+ * File Name:   pktbuild.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Test helper: builds wire-format TCP, UDP, ICMP echo and ICMP
+ *              error packets, and recomputes checksums so a single defect can
+ *              be tested in isolation.
+ =============================================================================*/
+
 /* pktbuild.c - test packet construction. See pktbuild.h. */
 #include "pktbuild.h"
 

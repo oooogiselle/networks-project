@@ -1,3 +1,15 @@
+/*=============================================================================
+ * File Name:   rules.h
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: Rule file format and matching interface: verbose and compact
+ *              rule syntax, port lists, and the inside-network declaration used
+ *              for anti-spoofing.
+ =============================================================================*/
+
 /*
  * rules.h - rule file parsing and first-match evaluation.
  *
@@ -5,6 +17,16 @@
  *
  *   (allow|deny) [in|out] (tcp|udp|icmp|any)
  *       from <addr> [port <ports>] to <addr> [port <ports>]
+ *
+ * or the compact form used in the requirements spec:
+ *
+ *   (allow|deny) [in|out] (tcp|udp|icmp|any) <addr> <addr> [<ports>|echo]
+ *       e.g.  allow out tcp 10.0.1.0/24 any 80,443
+ *             allow out icmp 10.0.1.0/24 any echo
+ *             allow in  tcp any 10.0.1.3 22
+ *   Ports in the compact form match the DESTINATION port (omitted = any).
+ *   `echo` is only for icmp (echo requests are the only ICMP that starts a
+ *   flow, so it documents intent). Both forms may be mixed in one file.
  *
  *   <addr>  := any | a.b.c.d | a.b.c.d/len
  *   <ports> := <item>[,<item>...]   with <item> := N | N-M

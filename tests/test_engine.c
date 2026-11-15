@@ -1,3 +1,15 @@
+/*=============================================================================
+ * File Name:   test_engine.c
+ * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Course:      CS60: Computer Networks
+ * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+ * Date:        November 15, 2026
+ *
+ * Description: End-to-end tests for the decision engine: the allowed and denied
+ *              walkthroughs, ICMP errors, anti-spoofing, parse-failure stats,
+ *              table capacity, and log output.
+ =============================================================================*/
+
 /* End-to-end decision tests: the walkthroughs from the project proposal. */
 #include "engine.h"
 #include "log.h"
@@ -165,8 +177,11 @@ static void test_established_flow_idle_timeout_and_refresh(void)
     /* traffic every 200s keeps it alive well beyond a single timeout */
     for (int i = 1; i <= 5; i++)
         CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_ACK), DIR_OUT, t + i*200*SEC, &w) == VERDICT_ALLOW);
-    /* but silence for 10 minutes does not */
-    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_ACK), DIR_OUT, t + 1700*SEC, &w) == VERDICT_DROP);
+    /* established connections idle for just under an hour survive (and the
+     * timer restarts)... */
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_ACK), DIR_OUT, t + 1000*SEC + 3599*SEC, &w) == VERDICT_ALLOW);
+    /* ...but an hour of silence ends them */
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_ACK), DIR_OUT, t + 4599*SEC + 3600*SEC, &w) == VERDICT_DROP);
     engine_destroy(e);
 }
 
@@ -541,6 +556,117 @@ static void test_parse_failures_counted_and_logged(void)
     engine_destroy(e);
 }
 
+/* ---- table capacity and flow log lines ---------------------------------- */
+
+static rules_t *rules_of(const char *text)
+{
+    char err[128];
+    return rules_parse_string(text, err, sizeof err);
+}
+
+static void test_default_capacity_is_65536_and_full_table_keeps_flows(void)
+{
+    CHECK(FW_DEFAULT_MAX_FLOWS == 65536u);
+    engine_t *e = engine_create_with_rules(rules_of("allow udp any any\n"));
+    drop_reason_t w;
+    /* fill the table with distinct UDP flows (client port x server port) */
+    for (uint32_t i = 0; i < FW_DEFAULT_MAX_FLOWS; i++) {
+        pkt_t p = mk_udp(CLIENT_A, (uint16_t)(1024 + i % 60000), SERVER,
+                         (uint16_t)(1 + i / 60000));
+        if (send_pkt(e, p, DIR_IN, SEC, &w) != VERDICT_ALLOW) {
+            CHECK(!"flow table filled before 65536 flows");
+            break;
+        }
+    }
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.flows_active == FW_DEFAULT_MAX_FLOWS);
+
+    /* one more is refused... */
+    CHECK(send_pkt(e, mk_udp(CLIENT_B, 5000, SERVER, 9999), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_TABLE_FULL);
+    /* ...but existing flows keep working in both directions */
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 1024, SERVER, 1), DIR_IN, SEC+1, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_udp(SERVER, 1, CLIENT_A, 1024), DIR_OUT, SEC+2, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_table_full_recovers_after_expiry(void)
+{
+    engine_t *e = engine_create_with_rules_sized(rules_of("allow udp any any\n"), 2);
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 1, SERVER, 53), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 2, SERVER, 53), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_TABLE_FULL);
+    CHECK(send_pkt(e, mk_udp(SERVER, 53, CLIENT_A, 1), DIR_OUT, SEC+1, &w) == VERDICT_ALLOW);
+
+    /* flow 1 saw a reply, so it has the longer 120 s UDP timeout */
+    CHECK(engine_expire(e, 100*SEC) == 1);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 3, SERVER, 53), DIR_IN, 101*SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 4, SERVER, 53), DIR_IN, 101*SEC, &w) == VERDICT_DROP);
+    CHECK(engine_expire(e, 300*SEC) == 2);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.drops[DROP_TABLE_FULL] == 2);
+    engine_destroy(e);
+}
+
+/* Read everything the logger wrote to f. */
+static char *slurp(FILE *f)
+{
+    static char buf[4096];
+    rewind(f);
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = '\0';
+    return buf;
+}
+
+static void test_flow_close_log_has_duration_packets_bytes(void)
+{
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    uint64_t t = 10 * SEC;
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, t, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN|TCP_ACK), DIR_OUT, t + 1*SEC, &w);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, t + 2*SEC, &w);
+    send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_FIN|TCP_ACK), DIR_IN, t + 4*SEC, &w);
+    send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_FIN|TCP_ACK), DIR_OUT, t + 5*SEC, &w);
+    fw_log_set(NULL, LOG_OFF);
+
+    const char *out = slurp(log);
+    CHECK(strstr(out, "FLOW NEW") && strstr(out, "dur=0.000s"));
+    const char *close = strstr(out, "FLOW CLOSE");
+    CHECK(close != NULL);
+    if (close) {
+        CHECK(strstr(close, "state=TIME_WAIT") != NULL);
+        CHECK(strstr(close, "dur=5.000s") != NULL);          /* t .. t+5 s */
+        CHECK(strstr(close, "pkts=3/2") != NULL);
+        CHECK(strstr(close, "bytes=180/120") != NULL);
+        CHECK(strstr(close, "10.0.0.2:50000 -> 93.184.216.34:80") != NULL);
+    }
+    fclose(log);
+    engine_destroy(e);
+}
+
+static void test_expire_log_counts_to_last_packet_not_sweep_time(void)
+{
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    FILE *log = tmpfile();
+    fw_log_set(log, LOG_INFO);
+    send_pkt(e, mk_udp(CLIENT_A, 6000, SERVER, 53), DIR_IN, 10*SEC, &w);
+    send_pkt(e, mk_udp(SERVER, 53, CLIENT_A, 6000), DIR_OUT, 12*SEC, &w);
+    CHECK(engine_expire(e, 1000*SEC) == 1);                  /* long after */
+    fw_log_set(NULL, LOG_OFF);
+    const char *x = strstr(slurp(log), "FLOW EXPIRE");
+    CHECK(x != NULL && strstr(x, "dur=2.000s") != NULL);
+    fclose(log);
+    engine_destroy(e);
+}
+
 int main(void)
 {
     RUN(test_web_fetch_allowed);
@@ -572,5 +698,9 @@ int main(void)
     RUN(test_antispoof_covers_icmp_errors);
     RUN(test_antispoof_off_without_inside_directive);
     RUN(test_parse_failures_counted_and_logged);
+    RUN(test_default_capacity_is_65536_and_full_table_keeps_flows);
+    RUN(test_table_full_recovers_after_expiry);
+    RUN(test_flow_close_log_has_duration_packets_bytes);
+    RUN(test_expire_log_counts_to_last_packet_not_sweep_time);
     TEST_DONE();
 }
