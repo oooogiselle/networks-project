@@ -3,8 +3,7 @@
 
 #include <string.h>
 
-#include "../src/common.h"
-#include "../src/packet.h"
+#include "parser.h"
 
 void pb_wr16(uint8_t *p, uint16_t v)
 {
@@ -78,20 +77,20 @@ void pb_fix_csums(uint8_t *pkt, size_t len)
     uint8_t *l4 = pkt + ihl;
     size_t l4len = len - ihl;
     switch (pkt[9]) {
-    case PROTO_TCP:
+    case FW_PROTO_TCP:
         if (l4len >= 20) {
             pb_wr16(l4 + 16, 0);
-            pb_wr16(l4 + 16, l4_csum(pkt, l4, l4len, PROTO_TCP));
+            pb_wr16(l4 + 16, l4_csum(pkt, l4, l4len, FW_PROTO_TCP));
         }
         break;
-    case PROTO_UDP:
+    case FW_PROTO_UDP:
         if (l4len >= 8 && rd16(l4 + 6) != 0) {
             pb_wr16(l4 + 6, 0);
-            uint16_t c = l4_csum(pkt, l4, l4len, PROTO_UDP);
+            uint16_t c = l4_csum(pkt, l4, l4len, FW_PROTO_UDP);
             pb_wr16(l4 + 6, c ? c : 0xffff); /* 0 on the wire means "none" */
         }
         break;
-    case PROTO_ICMP:
+    case FW_PROTO_ICMP:
         if (l4len >= 8) {
             pb_wr16(l4 + 2, 0);
             pb_wr16(l4 + 2, csum_fold(csum_partial(l4, l4len, 0)));
@@ -108,7 +107,7 @@ size_t pb_tcp(uint8_t *buf, size_t cap, const struct pb_opts *o,
     size_t thl = 20 + optlen;
     if (optlen % 4 || optlen > 40)
         return 0;
-    size_t ihl = ip_header(buf, cap, o, PROTO_TCP, src, dst, thl + plen);
+    size_t ihl = ip_header(buf, cap, o, FW_PROTO_TCP, src, dst, thl + plen);
     if (!ihl)
         return 0;
 
@@ -134,7 +133,7 @@ size_t pb_udp(uint8_t *buf, size_t cap, const struct pb_opts *o,
               uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport,
               const void *payload, size_t plen)
 {
-    size_t ihl = ip_header(buf, cap, o, PROTO_UDP, src, dst, 8 + plen);
+    size_t ihl = ip_header(buf, cap, o, FW_PROTO_UDP, src, dst, 8 + plen);
     if (!ihl)
         return 0;
 
@@ -155,7 +154,7 @@ size_t pb_icmp_echo(uint8_t *buf, size_t cap, const struct pb_opts *o,
                     uint32_t src, uint32_t dst, uint8_t type, uint16_t id,
                     uint16_t seq, const void *payload, size_t plen)
 {
-    size_t ihl = ip_header(buf, cap, o, PROTO_ICMP, src, dst, 8 + plen);
+    size_t ihl = ip_header(buf, cap, o, FW_PROTO_ICMP, src, dst, 8 + plen);
     if (!ihl)
         return 0;
 
@@ -176,7 +175,7 @@ size_t pb_icmp_error(uint8_t *buf, size_t cap, const struct pb_opts *o,
                      uint32_t src, uint32_t dst, uint8_t type, uint8_t code,
                      const uint8_t *orig, size_t embed_len)
 {
-    size_t ihl = ip_header(buf, cap, o, PROTO_ICMP, src, dst, 8 + embed_len);
+    size_t ihl = ip_header(buf, cap, o, FW_PROTO_ICMP, src, dst, 8 + embed_len);
     if (!ihl)
         return 0;
 

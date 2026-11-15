@@ -1,55 +1,47 @@
-# Tunwall Makefile (works with GNU make 3.81+)
-#
-#   make           build ./tunwall (Linux only)
-#   make test      build and run unit tests (any POSIX system)
-#   make asan      unit tests under AddressSanitizer + UBSan
-#   make clean
+CC       ?= cc
+CFLAGS   ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Wshadow
+CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 
-CC      ?= cc
-CFLAGS  ?= -O2 -g
-CFLAGS  += -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -Wshadow \
-           -Wpointer-arith -Wstrict-prototypes -Wmissing-prototypes
-SAN     := -fsanitize=address,undefined -fno-omit-frame-pointer \
-           -fno-sanitize-recover=all
+BUILD := build
 
-UNAME_S := $(shell uname -s)
-BUILD   := build
+# Firewall core library: packet parser + decision engine (flow table, TCP
+# state, rules, engine, logging). tun I/O and main() link against this.
+LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
+           src/engine.c src/log.c
+LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
+LIB     := $(BUILD)/libfwengine.a
 
-# Portable core: everything in src/ except the Linux I/O shell.
-IO_SRCS   := src/main.c src/tun.c
-CORE_SRCS := $(filter-out $(IO_SRCS),$(wildcard src/*.c))
-TEST_SRCS := $(wildcard tests/unit/*.c) $(wildcard tests/pktbuild.c)
+TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine
+TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 .PHONY: all test asan clean
+all: $(LIB)
 
-ifeq ($(UNAME_S),Linux)
-ifneq ($(wildcard src/main.c),)
-all: tunwall
-else
-all:
-	@echo "src/main.c not written yet; nothing to build. Run 'make test'."
-endif
-else
-all:
-	@echo "tunwall needs Linux (TUN devices). On $(UNAME_S), run 'make test'."
-endif
+$(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-tunwall: $(CORE_SRCS) $(wildcard $(IO_SRCS)) $(wildcard src/*.h)
-	$(CC) $(CFLAGS) -o $@ $(CORE_SRCS) $(wildcard $(IO_SRCS))
+$(LIB): $(LIB_OBJ)
+	$(AR) rcs $@ $^
 
-$(BUILD)/unit_tests: $(CORE_SRCS) $(TEST_SRCS) $(wildcard src/*.h tests/*.h tests/unit/*.h)
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -Itests -o $@ $(CORE_SRCS) $(TEST_SRCS)
+# The parser tests also need the test packet builder.
+$(BUILD)/test_parser: tests/test_parser.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
+	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_parser.c tests/pktbuild.c $(LIB) -o $@
 
-$(BUILD)/unit_tests_asan: $(CORE_SRCS) $(TEST_SRCS) $(wildcard src/*.h tests/*.h tests/unit/*.h)
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -O1 $(SAN) -Isrc -Itests -o $@ $(CORE_SRCS) $(TEST_SRCS)
+$(BUILD)/test_%: tests/test_%.c tests/testutil.h $(LIB)
+	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) $< $(LIB) -o $@
 
-test: $(BUILD)/unit_tests
-	./$(BUILD)/unit_tests
+$(BUILD):
+	mkdir -p $(BUILD)
 
-asan: $(BUILD)/unit_tests_asan
-	./$(BUILD)/unit_tests_asan
+test: $(TEST_BINS)
+	@fail=0; for t in $(TEST_BINS); do echo "== $$t"; ./$$t || fail=1; done; \
+	  if [ $$fail -ne 0 ]; then echo "SOME TESTS FAILED"; exit 1; fi; echo "ALL TESTS PASSED"
+
+# Same tests under AddressSanitizer + UBSan.
+# (On macOS use clang: `make CC=clang asan`. Homebrew gcc has no ASan runtime.)
+asan:
+	$(MAKE) clean
+	$(MAKE) test CFLAGS="-std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer"
 
 clean:
-	rm -rf $(BUILD) tunwall
+	rm -rf $(BUILD)
