@@ -47,23 +47,43 @@ static bool parse_port(const char *s, uint16_t *out)
     return true;
 }
 
-static bool parse_ports(const char *s, port_range_t *out)
+/* One list item: "N" or "N-M". */
+static bool parse_port_range(char *s, port_range_t *out)
 {
-    char buf[24];
-    if (strlen(s) >= sizeof buf) return false;
-    strcpy(buf, s);
-    char *dash = strchr(buf, '-');
+    char *dash = strchr(s, '-');
     if (dash) {
         *dash = '\0';
-        return parse_port(buf, &out->lo) && parse_port(dash + 1, &out->hi) &&
+        return parse_port(s, &out->lo) && parse_port(dash + 1, &out->hi) &&
                out->lo <= out->hi;
     }
-    if (!parse_port(buf, &out->lo)) return false;
+    if (!parse_port(s, &out->lo)) return false;
     out->hi = out->lo;
     return true;
 }
 
-/* Returns 0 = rule parsed, 1 = blank/comment, -1 = error (err filled). */
+/* "80", "1024-65535", "80,443", "80,8000-8100". Empty items are errors. */
+static bool parse_ports(const char *s, port_set_t *out)
+{
+    char buf[96];
+    if (strlen(s) >= sizeof buf) return false;
+    strcpy(buf, s);
+    out->n = 0;
+    /* strtok_r would skip empty items ("80,,443"), so split by hand. */
+    char *item = buf;
+    for (;;) {
+        char *comma = strchr(item, ',');
+        if (comma) *comma = '\0';
+        if (out->n == MAX_PORT_RANGES) return false;
+        if (!parse_port_range(item, &out->r[out->n])) return false;
+        out->n++;
+        if (!comma) break;
+        item = comma + 1;
+    }
+    return true;
+}
+
+/* Returns 0 = rule parsed, 1 = blank/comment, 2 = `inside` directive (the
+ * network is returned in r->src), -1 = error (err filled). */
 static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errlen)
 {
     char *hash = strchr(line, '#');
@@ -81,8 +101,17 @@ static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errle
 
     memset(r, 0, sizeof *r);
     r->line = lineno;
-    r->sport = (port_range_t){0, 65535};
-    r->dport = (port_range_t){0, 65535};
+
+    if (strcmp(tok[0], "inside") == 0) {
+        if (n != 2 || strcmp(tok[1], "any") == 0 || !parse_addr(tok[1], &r->src)) {
+            set_err(err, errlen, lineno, "expected 'inside <a.b.c.d/len>'");
+            return -1;
+        }
+        return 2;
+    }
+
+    r->sport.n = r->dport.n = 1;
+    r->sport.r[0] = r->dport.r[0] = (port_range_t){0, 65535};
     int i = 0;
 
     if (strcmp(tok[i], "allow") == 0) r->action = ACT_ALLOW;
@@ -108,7 +137,7 @@ static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errle
     for (int side = 0; side < 2; side++) {
         const char *kw = side ? "to" : "from";
         addr_match_t *a = side ? &r->dst : &r->src;
-        port_range_t *p = side ? &r->dport : &r->sport;
+        port_set_t *p = side ? &r->dport : &r->sport;
         if (i >= n || strcmp(tok[i], kw) != 0) {
             set_err(err, errlen, lineno, side ? "expected 'to'" : "expected 'from'");
             return -1;
@@ -164,6 +193,12 @@ rules_t *rules_parse_string(const char *text, char *err, size_t errlen)
         lineno++;
         rule_t r;
         int rc = parse_line(line, lineno, &r, err, errlen);
+        if (rc == 2 && rs->ninside == MAX_INSIDE_NETS) {
+            set_err(err, errlen, lineno, "too many 'inside' networks");
+            rc = -1;
+        } else if (rc == 2) {
+            rs->inside[rs->ninside++] = r.src;
+        }
         if (rc < 0 || (rc == 0 && !rules_push(rs, &r))) {
             if (rc == 0) set_err(err, errlen, lineno, "out of memory");
             free(copy);
@@ -216,9 +251,18 @@ static bool addr_ok(const addr_match_t *m, uint32_t ip)
     return m->any || (ip & m->mask) == m->net;
 }
 
-static bool ports_ok(const port_range_t *r, uint16_t p)
+static bool ports_ok(const port_set_t *s, uint16_t p)
 {
-    return p >= r->lo && p <= r->hi;
+    for (uint8_t i = 0; i < s->n; i++)
+        if (p >= s->r[i].lo && p <= s->r[i].hi) return true;
+    return false;
+}
+
+bool rules_is_inside(const rules_t *rs, uint32_t ip)
+{
+    for (size_t i = 0; i < rs->ninside; i++)
+        if (addr_ok(&rs->inside[i], ip)) return true;
+    return false;
 }
 
 const rule_t *rules_match(const rules_t *rs, const pkt_t *p, dir_t dir)
