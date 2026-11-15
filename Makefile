@@ -1,3 +1,14 @@
+# ============================================================================
+# File Name:   Makefile
+# Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+# Course:      CS60: Computer Networks
+# Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
+# Date:        November 15, 2026
+#
+# Description: Build, test, and AddressSanitizer targets for the firewall
+#              library and its unit tests.
+# ============================================================================
+
 CC       ?= cc
 CFLAGS   ?= -std=c11 -O2 -g -Wall -Wextra -Wpedantic -Wshadow
 CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
@@ -11,7 +22,7 @@ LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
-TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine
+TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 .PHONY: all test asan clean
@@ -23,8 +34,8 @@ $(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
 $(LIB): $(LIB_OBJ)
 	$(AR) rcs $@ $^
 
-# The parser and engine tests also need the test packet builder.
-$(BUILD)/test_parser $(BUILD)/test_engine: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
+# The parser, engine and fuzz tests also need the test packet builder.
+$(BUILD)/test_parser $(BUILD)/test_engine $(BUILD)/test_fuzz: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/$*.c tests/pktbuild.c $(LIB) -o $@
 
 $(BUILD)/test_%: tests/test_%.c tests/testutil.h $(LIB)
