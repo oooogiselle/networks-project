@@ -23,19 +23,90 @@
 # "up kernel" builds the same topology WITHOUT the policy routing, so the kernel
 # forwards between the two sides itself: the baseline for the benchmarks.
 #
-# Usage: sudo scripts/netns.sh up [kernel] | down | status
+# "up nat" is the firewall topology plus a path to the real Internet for the
+# demo: the outside namespace becomes a NAT gateway (10.0.3.2) to the host
+# (10.0.3.1), which masquerades out of its normal uplink. It changes the HOST:
+# a veth pair, ip_forward, and three iptables rules, every one tagged with the
+# comment "tunwall-demo", and `down` removes exactly those and restores the
+# previous ip_forward. The inside namespace gets a resolv.conf pointing at
+# 10.0.2.2, where scripts/dns_forwarder.py answers (the example rules only let
+# the inside use that one resolver).
+#
+# Usage: sudo scripts/netns.sh up [kernel|nat] | down | status
 # Start the firewall with: sudo ip netns exec firewall build/tunwall -r <rules>
 # ============================================================================
 set -euE      # -E: the ERR trap in up() also fires inside functions
 
 IN=inside; FW=firewall; OUT=outside
+STATE=/run/tunwall-netns        # what "up nat" changed on the host, so down can undo it
+TAG=tunwall-demo
 
 need_root() { [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo $0 $*)" >&2; exit 1; }; }
 
 fw()  { ip netns exec "$FW" "$@"; }
 
+# The three host rules for the Internet path (add with -I, remove with -D).
+host_rules() { # host_rules -I|-D <uplink>
+    local op=$1 up=$2
+    iptables -t nat "$op" POSTROUTING -s 10.0.3.0/24 -o "$up" -m comment --comment $TAG -j MASQUERADE
+    iptables "$op" FORWARD -i veth-host -o "$up" -m comment --comment $TAG -j ACCEPT
+    iptables "$op" FORWARD -i "$up" -o veth-host -m conntrack --ctstate RELATED,ESTABLISHED \
+        -m comment --comment $TAG -j ACCEPT
+}
+
+# Undo whatever "up nat" did to the host. Safe to run when it did nothing.
+internet_down() {
+    if [ -f "$STATE/uplink" ]; then
+        local up; up=$(cat "$STATE/uplink")
+        while host_rules -D "$up" 2>/dev/null; do :; done
+    fi
+    [ -f "$STATE/ip_forward" ] && sysctl -qw net.ipv4.ip_forward="$(cat "$STATE/ip_forward")" || true
+    if [ -f "$STATE/created" ]; then
+        while read -r f; do rm -f "$f"; rmdir "$(dirname "$f")" 2>/dev/null || true; done < "$STATE/created"
+    fi
+    rm -rf "$STATE"
+    ip link del veth-host 2>/dev/null || true
+}
+
 down() {
+    internet_down
     for ns in "$IN" "$FW" "$OUT"; do ip netns del "$ns" 2>/dev/null || true; done
+}
+
+# The outside namespace becomes a NAT gateway to the host's Internet.
+internet_up() {
+    local uplink
+    uplink=$(ip route show default | awk '/default/ {print $5; exit}')
+    [ -n "$uplink" ] || { echo "netns.sh: the host has no default route, so there is no Internet to share" >&2; return 1; }
+    mkdir -p "$STATE"
+    echo "$uplink" > "$STATE/uplink"
+    sysctl -n net.ipv4.ip_forward > "$STATE/ip_forward"
+
+    ip link add veth-host type veth peer name veth-wan netns "$OUT"
+    ip addr add 10.0.3.1/24 dev veth-host
+    ip link set veth-host up
+    ip -n "$OUT" addr add 10.0.3.2/24 dev veth-wan
+    ip -n "$OUT" link set veth-wan up
+    ip -n "$OUT" route replace default via 10.0.3.1          # the Internet is via the host
+    ip -n "$OUT" route add 10.0.1.0/24 via 10.0.2.1          # the inside is via the firewall
+    ip netns exec "$OUT" sysctl -qw net.ipv4.ip_forward=1
+    ip netns exec "$OUT" iptables -t nat -A POSTROUTING -o veth-wan -j MASQUERADE
+    ip -n "$FW" route add default via 10.0.2.2               # the firewall hands the rest to "outside"
+
+    sysctl -qw net.ipv4.ip_forward=1
+    host_rules -I "$uplink"
+
+    # ip netns exec uses /etc/netns/<ns>/resolv.conf when it exists. Never
+    # overwrite one that is already there.
+    local ns
+    for ns in "$IN" "$OUT"; do
+        local f=/etc/netns/$ns/resolv.conf
+        if [ -e "$f" ]; then echo "netns.sh: keeping your existing $f" >&2; continue; fi
+        mkdir -p "/etc/netns/$ns"
+        if [ "$ns" = "$IN" ]; then echo "nameserver 10.0.2.2" > "$f"; else echo "nameserver 1.1.1.1" > "$f"; fi
+        echo "$f" >> "$STATE/created"
+    done
+    echo "Internet path up: outside=10.0.3.2 -> host 10.0.3.1 -> $uplink (DNS: run scripts/dns_forwarder.py in the outside namespace)"
 }
 
 up() {
@@ -121,12 +192,16 @@ up() {
 
     # Forwarding goes on LAST, once everything that must govern it is in place.
     fw sysctl -qw net.ipv4.ip_forward=1
+    [ "$mode" = nat ] && internet_up
     trap - ERR
 
     # Offloads would hand tunwall oversized or half-checksummed packets.
-    for pair in "$IN:veth-cin" "$FW:veth-in" "$FW:veth-out" "$OUT:veth-sout"; do
-        ip netns exec "${pair%%:*}" ethtool -K "${pair##*:}" tso off gso off gro off \
-            tx off rx off >/dev/null 2>&1 || true
+    for pair in "$IN:veth-cin" "$FW:veth-in" "$FW:veth-out" "$OUT:veth-sout" "$OUT:veth-wan"; do
+        [ "$mode" = nat ] || [ "${pair##*:}" != veth-wan ] || continue
+        if ! ip netns exec "${pair%%:*}" ethtool -K "${pair##*:}" tso off gso off gro off \
+                tx off rx off >/dev/null 2>&1; then
+            echo "netns.sh: warning: could not turn offloads off on ${pair##*:} (is ethtool installed?); TCP may misbehave" >&2
+        fi
     done
     echo "namespaces up ($mode): inside=10.0.1.2,.3  firewall=10.0.1.1/10.0.2.1  outside=10.0.2.2,.3"
 }
@@ -139,7 +214,9 @@ status() {
 }
 
 case "${1:-}" in
-    up)     need_root "$@"; up "${2:-firewall}" ;;
+    up)     need_root "$@"
+            case "${2:-firewall}" in firewall|kernel|nat) ;; *) echo "usage: sudo $0 up [kernel|nat]" >&2; exit 2 ;; esac
+            up "${2:-firewall}" ;;
     down)   need_root "$@"; down ;;
     status) need_root "$@"; status ;;
     *) echo "usage: sudo $0 up | down | status" >&2; exit 2 ;;

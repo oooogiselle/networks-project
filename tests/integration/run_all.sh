@@ -18,6 +18,10 @@
 #   build/tunwall -r <rules>   runs in the "firewall" namespace; logs flows and
 #                              drops to stderr; SIGUSR1 prints counters
 # Override with TUNWALL=, NETNS_SCRIPT=, RULES=, TUNWALL_ARGS=, LOGDIR=.
+# INTERNET=1 also builds the NAT path ("netns.sh up nat") and tests the real
+# Internet through the firewall; it needs the host to be online and changes the
+# host's iptables while it runs (removed again afterwards). Off by default, so
+# CI and offline runs are unaffected.
 # ============================================================================
 set -u
 cd "$(dirname "$0")/../.."
@@ -70,14 +74,77 @@ icmp_probe(){ # reply | refused (ICMP unreachable) | timeout (silent drop)
     elif echo "$out" | grep -qE "100% packet loss"; then echo timeout
     else echo "mixed"; fi
 }
+# Wait (up to 10 s) until a server is really listening, instead of hoping a fixed
+# sleep was long enough. A server that never comes up is reported as such.
+# Ask tunwall for its counters and wait until they are really in the log.
+dump_stats() {
+    local before i
+    before=$(grep -c "^packets: total=" "$LOGDIR/tunwall.log")
+    kill -USR1 "$FW_PID"
+    for i in $(seq 1 50); do
+        [ "$(grep -c "^packets: total=" "$LOGDIR/tunwall.log")" -gt "$before" ] && return 0
+        sleep 0.1
+    done
+    bad "tunwall did not print its counters after SIGUSR1"
+}
+
+wait_listen() { # wait_listen <ns> tcp|udp <ip> <port> <what>
+    local ns=$1 proto=$2 ip=$3 port=$4 what=$5 flag=-ltnH i
+    [ "$proto" = udp ] && flag=-lunH
+    for i in $(seq 1 100); do
+        ip netns exec "$ns" ss $flag 2>/dev/null | awk '{print $4}' | grep -qx "$ip:$port" && return 0
+        sleep 0.1
+    done
+    bad "$what never started listening on $ip:$port (namespace $ns)"
+    return 1
+}
+
+# When a check has failed, print what is needed to see why, into the job log
+# (a bare list of failed checks says what broke, not why).
+diagnostics() {
+    echo; echo "================ diagnostics: a check failed ================"
+    echo "--- kernel and tools"
+    uname -r; python3 --version 2>&1; ip -V 2>&1
+    echo "present: $(command -v ethtool ss nstat openssl nmap curl 2>/dev/null | tr '\n' ' ')"
+    echo "--- firewall log, last 60 lines ($LOGDIR/tunwall.log)"
+    tail -n 60 "$LOGDIR/tunwall.log" 2>&1
+    echo "--- tunwall still running? $(kill -0 "$FW_PID" 2>/dev/null && echo yes || echo no)"
+    local ns
+    for ns in inside firewall outside; do
+        echo "--- $ns: addresses and listening sockets"
+        ip -n "$ns" -br addr 2>&1
+        ip netns exec "$ns" ss -ltunp 2>&1 | head -20
+    done
+    echo "--- firewall: policy rules, tun routes, neighbours"
+    ip -n firewall rule 2>&1
+    ip -n firewall route show table 100 2>&1; ip -n firewall route show table 200 2>&1
+    ip -n firewall neigh 2>&1; ip -n inside neigh 2>&1; ip -n outside neigh 2>&1
+    echo "--- firewall: link counters (look for dropped / errors on the tun devices)"
+    ip netns exec firewall ip -s link show 2>&1 | grep -vE "^\s+(link/|altname)" | head -40
+    echo "--- offloads on the firewall's veth-in"
+    ip netns exec firewall ethtool -k veth-in 2>&1 | grep -E "^(tx|rx)-checksumming|segmentation-offload|receive-offload" | head -6
+    echo "--- TCP counters seen by the inside and outside hosts"
+    for ns in inside outside; do
+        echo "($ns)"; ip netns exec "$ns" nstat -az TcpAttemptFails TcpOutRsts TcpRetransSegs TcpInCsumErrors IpInHdrErrors 2>&1 | head -8
+    done
+    echo "============================================================="
+}
+
 inside()  { ip netns exec inside  "$@"; }
 outside() { ip netns exec outside "$@"; }
 bg()      { "$@" >/dev/null 2>&1 & BG_PIDS="$BG_PIDS $!"; }
 
 start_fw() {
     ip netns exec firewall "$TUNWALL" -r "$RULES" $TUNWALL_ARGS 2>"$LOGDIR/tunwall.log" &
-    FW_PID=$!; sleep 1
-    kill -0 "$FW_PID" 2>/dev/null
+    FW_PID=$!
+    # wait until it says it is running (it has attached both tun devices), not a fixed second
+    local i
+    for i in $(seq 1 100); do
+        kill -0 "$FW_PID" 2>/dev/null || return 1
+        grep -q "^tunwall: running" "$LOGDIR/tunwall.log" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    kill -0 "$FW_PID" 2>/dev/null           # quiet (-q) runs never print the line
 }
 cleanup() {
     [ -n "$FW_PID" ] && kill "$FW_PID" 2>/dev/null
@@ -105,8 +172,8 @@ cli_says "no inside network is refused with the reason"   1 'noinside\.conf: dec
 cli_says "a missing tun device is refused with a hint"    1 'tw-missing0: no such device.*netns\.sh' -r "$RULES" -i tw-missing0
 
 "$NETNS_SCRIPT" down >/dev/null 2>&1
-"$NETNS_SCRIPT" up   || { echo "namespace setup failed"; exit 1; }
-start_fw || { echo "tunwall did not start; see $LOGDIR/tunwall.log"; exit 1; }
+"$NETNS_SCRIPT" up ${INTERNET:+nat} || { echo "namespace setup failed"; exit 1; }
+start_fw || { echo "tunwall did not start; see $LOGDIR/tunwall.log"; cat "$LOGDIR/tunwall.log"; exit 1; }
 
 # Servers: web + DNS-like UDP echo outside, SSH-like and blocked ports inside.
 SRV=$LOGDIR/www; mkdir -p "$SRV"; head -c 200000 /dev/urandom > "$SRV/index.bin"
@@ -125,7 +192,10 @@ while True:
 EMPTY=$LOGDIR/empty; mkdir -p "$EMPTY"   # served directory: nothing sensitive
 bg ip netns exec inside python3 -m http.server 22   --bind 10.0.1.3 --directory "$EMPTY"
 bg ip netns exec inside python3 -m http.server 3389 --bind 10.0.1.3 --directory "$EMPTY"
-sleep 1
+wait_listen outside tcp 10.0.2.2 80   "the outside web server"
+wait_listen outside udp 10.0.2.2 53   "the outside DNS echo server"
+wait_listen inside  tcp 10.0.1.3 22   "the inside ssh-like server"
+wait_listen inside  tcp 10.0.1.3 3389 "the inside rdp-like server"
 
 # Flow expiry: an unanswered UDP flow times out after 30 s. Two flows send a
 # datagram; the server answers one after 5 s (flow alive, must arrive) and one
@@ -164,7 +234,7 @@ while True:
     if not d: break
     buf+=d
 time.sleep(75); c.sendall(b"answer:"+buf); c.close()'
-    sleep 1
+    wait_listen outside tcp 10.0.2.3 80 "the half-close server"
     ip netns exec inside python3 -c '
 import socket,sys
 s=socket.create_connection(("10.0.2.3",80),timeout=110)
@@ -187,6 +257,15 @@ need_tool() { # in CI (REQUIRE_INTEGRATION) a missing tool is a failure, not a s
     if [ -n "${REQUIRE_INTEGRATION:-}" ]; then bad "$1 is not installed"; else echo "skip: $1 not installed"; fi
     return 1
 }
+
+echo "== sanity: a TCP connection from inside reaches an outside server"
+for _ in 1 2 3 4 5; do
+    pre=$(probe inside tcp 10.0.2.2 80)
+    [ "$pre" = open ] && break
+    sleep 1
+done
+if [ "$pre" = open ]; then ok "inside can open a TCP connection to the outside web server"
+else bad "inside could not open a TCP connection to the outside web server (got '$pre')"; diagnostics; fi
 
 echo "== allowed traffic from inside"
 check  "inside curl downloads page"      pass inside curl -sf --max-time 5 -o "$LOGDIR/got.bin" http://10.0.2.2/index.bin
@@ -233,7 +312,7 @@ fi
 
 echo "== the firewall's own addresses are not a way around it"
 bg ip netns exec firewall python3 -m http.server 8080 --bind 0.0.0.0 --directory "$EMPTY"
-sleep 1
+wait_listen firewall tcp 0.0.0.0 8080 "the test service on the firewall itself"
 expect "outside cannot reach a service on the firewall (10.0.2.1)" timeout probe outside tcp 10.0.2.1 8080
 expect "outside cannot reach a service on the firewall (10.0.1.1)" timeout probe outside tcp 10.0.1.1 8080
 expect "inside cannot reach it either (10.0.1.1)"                  timeout probe inside  tcp 10.0.1.1 8080
@@ -262,11 +341,11 @@ srv = http.server.HTTPServer(("10.0.2.2", 443), h)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[1], sys.argv[2])
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
 srv.serve_forever()' "$LOGDIR/tls.crt" "$LOGDIR/tls.key" "$EMPTY"
-    sleep 1
+    wait_listen outside tcp 10.0.2.2 443 "the TLS server"
     check "real TLS handshake and request through the firewall" pass inside curl -sk --max-time 5 -o /dev/null https://10.0.2.2:443/
 fi
 bg ip netns exec outside python3 -m http.server 443 --bind 10.0.2.3 --directory "$EMPTY"
-sleep 1
+wait_listen outside tcp 10.0.2.3 443 "the plain HTTP server on port 443"
 check "plain HTTP on port 443 passes (the port is allowed)" pass inside curl -s --max-time 5 -o /dev/null http://10.0.2.3:443/
 dns_query() { ip netns exec inside python3 -c '
 import socket, struct
@@ -296,7 +375,7 @@ expect "a larger DF packet is told 'fragmentation needed'"           frag-needed
 ip -n firewall link set veth-out mtu 1500
 
 echo "== logging and stats"
-kill -USR1 "$FW_PID"; sleep 1
+dump_stats
 
 logged "flow opened for the allowed web request" 'FLOW NEW +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:80 '
 logged "flow opened for the exposed ssh connection" 'FLOW NEW +tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:22 '
@@ -334,6 +413,34 @@ if [ -n "${HALFCLOSE_PID:-}" ]; then
                           || bad "half-close: the server's late answer did not arrive (flow expired?)"
 fi
 
+if [ -n "${INTERNET:-}" ]; then
+    echo "== the real Internet through the firewall"
+    # example.com is static, so the page fetched through the firewall must be
+    # byte for byte the one the host fetches directly. The address is resolved on
+    # the host and pinned with --resolve, so this does not depend on DNS.
+    EX_IP=$(getent ahostsv4 example.com | awk 'NR==1 {print $1}')
+    if [ -z "$EX_IP" ] || ! curl -s -m 8 -o /dev/null "http://example.com"; then
+        bad "the host itself cannot reach example.com, so INTERNET=1 cannot be tested"
+    else
+        expect "ping a real Internet address (1.1.1.1) through the firewall" reply icmp_probe inside 1.1.1.1
+        for scheme in http https; do
+            port=$([ $scheme = http ] && echo 80 || echo 443)
+            via=$(ip netns exec inside curl -s -m 15 --resolve example.com:$port:$EX_IP $scheme://example.com/ | sha256sum)
+            direct=$(curl -s -m 15 --resolve example.com:$port:$EX_IP $scheme://example.com/ | sha256sum)
+            if [ "$via" = "$direct" ] && [ "$via" != "$(printf '' | sha256sum)" ]; then
+                ok "$scheme://example.com through the firewall is byte for byte the direct page (SHA-256 ${via:0:16})"
+            else bad "$scheme://example.com differs through the firewall (via $via, direct $direct)"; fi
+        done
+        expect "a non-web port on the Internet is silently dropped (not refused)" timeout probe inside tcp "$EX_IP" 8080
+        expect "SSH to the Internet is silently dropped"                            timeout probe inside tcp "$EX_IP" 22
+        expect "outside cannot start a connection to the inside via the NAT path"   timeout probe outside tcp 10.0.1.3 3389
+        dump_stats
+        logged "the real HTTP flow is labelled http" "FLOW APP +tcp 10\\.0\\.1\\.2:[0-9]+ -> $EX_IP:80 .*app=http"
+        logged "the real HTTPS flow is labelled tls" "FLOW APP +tcp 10\\.0\\.1\\.2:[0-9]+ -> $EX_IP:443 .*app=tls"
+        logged "the dropped SSH attempt is logged with its reason" "DROP tcp 10\\.0\\.1\\.2:[0-9]+ -> $EX_IP:22 .*why=no-rule"
+    fi
+fi
+
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID"; rc=$?; FW_PID=""
 [ "$rc" = 0 ] && ok "tunwall exits 0 on SIGTERM" || bad "tunwall exited $rc on SIGTERM"
@@ -349,7 +456,8 @@ import socket
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("10.0.2.2",9999)); s.settimeout(3)
 try: s.recvfrom(64); print("arrived")
 except socket.timeout: print("none")' > "$LOGDIR/leak.out" &
-    local lp=$!; sleep 1
+    local lp=$!
+    wait_listen outside udp 10.0.2.2 9999 "the leak-probe listener" || true
     ip netns exec inside timeout 3 python3 -c 'import socket; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(b"leak",("10.0.2.2",9999))'
     wait "$lp"; tail -1 "$LOGDIR/leak.out"
 }
@@ -360,6 +468,18 @@ ip netns exec firewall ip tuntap del dev tun-in mode tun
 expect "control: without the blackhole rule traffic leaks (the probe works)" arrived leak_probe
 ip -n firewall rule add iif veth-in blackhole pref 102
 expect "with the blackhole rule nothing gets through a deleted tun-in"       none leak_probe
+
+if [ -n "${INTERNET:-}" ]; then
+    echo "== tearing down restores the host"
+    "$NETNS_SCRIPT" down >/dev/null 2>&1
+    [ "$(iptables -S FORWARD | grep -c tunwall-demo)$(iptables -t nat -S POSTROUTING | grep -c tunwall-demo)" = "00" ] \
+        && ok "no tunwall-demo iptables rule is left on the host" || bad "tunwall-demo iptables rules are still there"
+    ip link show veth-host >/dev/null 2>&1 && bad "veth-host is still there" || ok "the host-side veth is gone"
+    [ ! -e /run/tunwall-netns ] && [ ! -e /etc/netns/inside/resolv.conf ] \
+        && ok "the saved state and resolv.conf files are gone" || bad "state or resolv.conf files were left behind"
+fi
+
+[ "$failn" -eq 0 ] || diagnostics
 
 echo; echo "$pass passed, $failn failed"
 [ "$failn" -eq 0 ]
