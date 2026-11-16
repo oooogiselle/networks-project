@@ -197,8 +197,11 @@ up() {
 
     # Offloads would hand tunwall oversized or half-checksummed packets.
     for pair in "$IN:veth-cin" "$FW:veth-in" "$FW:veth-out" "$OUT:veth-sout" "$OUT:veth-wan"; do
-        ip netns exec "${pair%%:*}" ethtool -K "${pair##*:}" tso off gso off gro off \
-            tx off rx off >/dev/null 2>&1 || true
+        [ "$mode" = nat ] || [ "${pair##*:}" != veth-wan ] || continue
+        if ! ip netns exec "${pair%%:*}" ethtool -K "${pair##*:}" tso off gso off gro off \
+                tx off rx off >/dev/null 2>&1; then
+            echo "netns.sh: warning: could not turn offloads off on ${pair##*:} (is ethtool installed?); TCP may misbehave" >&2
+        fi
     done
     echo "namespaces up ($mode): inside=10.0.1.2,.3  firewall=10.0.1.1/10.0.2.1  outside=10.0.2.2,.3"
 }
