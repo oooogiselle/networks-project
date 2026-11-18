@@ -55,24 +55,59 @@ const char *parse_result_str(parse_result_t r)
 /* ---- checksums ---------------------------------------------------------- */
 
 /*
- * One's-complement sum of big-endian 16-bit words. The result is unfolded;
- * pass it to csum_fold(). Carries fold back in early, so the 32-bit
- * accumulator can't overflow on any input length.
+ * One's-complement sum of big-endian 16-bit words. The result is unfolded and
+ * only meaningful modulo 0xffff: pass it to csum_fold().
+ *
+ * This runs on every byte of every packet, so it is written to be fast: it
+ * adds 8 bytes per step in the machine's own byte order, with no branch and no
+ * carry handling inside the loop (a 64-bit accumulator cannot overflow on any
+ * packet). That is valid because the one's-complement sum does not depend on
+ * byte order (RFC 1071, section 2B): the sum of words read in the other order is
+ * just the byte-swapped sum, so one swap at the end puts it right. Loads go
+ * through memcpy, so alignment and strict aliasing are not an issue. The
+ * original word-at-a-time version is kept in tests/test_parser.c as the
+ * reference this must equal.
  */
 uint32_t csum_partial(const void *data, size_t len, uint32_t sum)
 {
     const uint8_t *p = data;
+    uint64_t acc = 0;                       /* native-order sum of 32-bit halves */
 
-    while (len > 1) {
-        sum += (uint32_t)p[0] << 8 | p[1];
-        if (sum & 0x80000000u)
-            sum = (sum & 0xffff) + (sum >> 16);
+    while (len >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        acc += (w & 0xffffffffu) + (w >> 32);
+        p += 8;
+        len -= 8;
+    }
+    if (len >= 4) {
+        uint32_t w;
+        memcpy(&w, p, 4);
+        acc += w;
+        p += 4;
+        len -= 4;
+    }
+    /* fold the native-order sum to 16 bits ... */
+    acc = (acc & 0xffffffffu) + (acc >> 32);
+    acc = (acc & 0xffffu) + (acc >> 16);
+    acc = (acc & 0xffffu) + (acc >> 16);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    acc = ((acc & 0xffu) << 8) | (acc >> 8);                 /* ... and into network order */
+#elif !(defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#error "csum_partial needs to know the byte order of this machine"
+#endif
+    /* the last 0..3 bytes start on an even offset, so they are whole words
+     * (plus one odd byte, which counts as the high half of a word) */
+    if (len >= 2) {
+        acc += (uint64_t)p[0] << 8 | p[1];
         p += 2;
         len -= 2;
     }
     if (len)
-        sum += (uint32_t)p[0] << 8;
-    return sum;
+        acc += (uint64_t)p[0] << 8;
+    acc += sum;
+    acc = (acc & 0xffffffffu) + (acc >> 32);                 /* back into 32 bits */
+    return (uint32_t)acc;
 }
 
 /* Fold to 16 bits and complement. Verifying a checksummed region gives 0. */
