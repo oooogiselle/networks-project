@@ -52,7 +52,7 @@ state, for example after closing the terminal in the middle.
 | 7 | nmap | one open port, the rest `filtered` | "Only the port with a rule shows as open. An ACK scan finds nothing either." |
 | 8 | Exposed service | green inbound `FLOW NEW` | "Port 22 has a rule allowing it in, so that one works and is tracked." |
 | 9 | Counters | the stats block in the top pane | "SIGUSR1 prints packets, drops by reason, the applications seen, and any log lines suppressed." |
-| 10 | Performance | the benchmark table | "About 1 to 2 Gbit/s versus 9 for the kernel: we do a read and a write per packet and can't batch. Well above our 200 Mbit/s goal." |
+| 10 | Performance | the benchmark table | "About 1.3 Gbit/s versus 5 for the kernel on this VM, adding about 0.12 ms at the median. We are single-threaded, and the profile shows most of the time is the kernel forwarding each packet twice. Well above our 200 Mbit/s goal." |
 | 11 | Kill the firewall | ping fails, curl times out | "The tun devices are persistent, so with no program reading them the kernel drops everything. No firewall, no traffic." |
 
 ## Suggested split of the ~10 minutes
@@ -78,7 +78,7 @@ Swap the roles if you like: each of you is graded on your own portion.
 - The tun devices are **persistent** and the routing **fails closed**.
 - Two review rounds, fuzzing, mutation testing and sanitizers found and fixed about 40 issues.
 
-Not done: source NAT inside the firewall, TCP sequence validation, full SYN-flood protection (no SYN cookies), and a `perf` profile.
+Not done: source NAT inside the firewall, TCP sequence validation, full SYN-flood protection (no SYN cookies), and a larger-scale architecture such as multi-threading.
 
 ## If something goes wrong
 

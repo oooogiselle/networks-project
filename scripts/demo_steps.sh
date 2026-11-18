@@ -159,9 +159,9 @@ check "drops are broken down by reason" log_has "^drop\\[no-rule\\(default-deny\
 
 # ---------------------------------------------------------------------------
 step "Performance against the Linux kernel" \
-     "Measured earlier on this 2-CPU VM with iperf3 (median of 5 runs of 10 s)." \
-     "The firewall does a read and a write per packet and cannot batch (no GSO/GRO), so" \
-     "it is several times slower than the kernel, but far above the 200 Mbit/s goal."
+     "Measured on this 2-CPU VM: iperf3 (5 runs of 10 s) and 5000 pings. The firewall adds" \
+     "about 0.12 ms at the median. It is single-threaded, so one core is its ceiling; the" \
+     "profile shows ~90% of the time is the kernel forwarding each packet twice."
 cmd "sed -n '/^| Setup/,/^\$/p' README.md"
 sed -n '/^| Setup/,/^$/p' README.md | sed 's/^/     /'
 
