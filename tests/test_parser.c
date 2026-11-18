@@ -591,6 +591,60 @@ static void ip_options_are_validated_and_source_routing_dropped(void)
     CHECK_EQ(parse_exact(b, n), PARSE_OK);
 }
 
+/* The original, obviously-correct checksum: one big-endian 16-bit word per step.
+ * csum_partial() is now a wide, branch-free version; this is what it must equal. */
+static uint32_t csum_reference(const uint8_t *p, size_t len, uint32_t sum)
+{
+    while (len > 1) {
+        sum += (uint32_t)p[0] << 8 | p[1];
+        if (sum & 0x80000000u)
+            sum = (sum & 0xffff) + (sum >> 16);
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        sum += (uint32_t)p[0] << 8;
+    return sum;
+}
+
+static uint32_t csum_rng = 0x9e3779b9u;
+static uint32_t csum_rand(void)
+{
+    csum_rng ^= csum_rng << 13; csum_rng ^= csum_rng >> 17; csum_rng ^= csum_rng << 5;
+    return csum_rng;
+}
+
+static void csum_partial_equals_the_reference(void)
+{
+    static uint8_t buf[70000 + 8];
+    /* every length 0..300 at every alignment, random data, several starting sums */
+    const uint32_t inits[] = { 0, 1, 0xffff, 0x2ffff, 0x7fffffffu };
+    for (size_t len = 0; len <= 300; len++)
+        for (size_t off = 0; off < 8; off++) {
+            for (size_t i = 0; i < len + 8; i++) buf[i] = (uint8_t)csum_rand();
+            for (size_t k = 0; k < sizeof inits / sizeof *inits; k++)
+                CHECK_EQ(csum_fold(csum_partial(buf + off, len, inits[k])),
+                         csum_fold(csum_reference(buf + off, len, inits[k])));
+        }
+    /* random large lengths, up to and beyond the largest IPv4 packet */
+    for (int round = 0; round < 400; round++) {
+        size_t len = csum_rand() % 70001, off = csum_rand() % 8;
+        for (size_t i = 0; i < len + 8; i++) buf[i] = (uint8_t)csum_rand();
+        uint32_t init = csum_rand() & 0x7fffffffu;
+        CHECK_EQ(csum_fold(csum_partial(buf + off, len, init)),
+                 csum_fold(csum_reference(buf + off, len, init)));
+    }
+    /* carry stress: all-ones and all-zero data of every awkward size */
+    const size_t sizes[] = { 1, 2, 3, 7, 8, 9, 15, 16, 17, 1499, 1500, 1501, 4095, 4096, 65534, 65535, 70000 };
+    for (size_t k = 0; k < sizeof sizes / sizeof *sizes; k++)
+        for (int fill = 0; fill <= 1; fill++)
+            for (size_t j = 0; j < 3; j++) {
+                memset(buf, fill ? 0xff : 0x00, sizeof buf);
+                CHECK_EQ(csum_fold(csum_partial(buf + j, sizes[k], 0x7fffffffu)),
+                         csum_fold(csum_reference(buf + j, sizes[k], 0x7fffffffu)));
+            }
+}
+
 static void martian_addresses(void)
 {
     const uint32_t bad_src[] = {IP4(0, 0, 0, 0), IP4(127, 0, 0, 1),
@@ -835,6 +889,7 @@ int main(void)
     RUN(bad_checksums);
     RUN(pseudo_header_covers_addresses);
     RUN(fragments_rejected);
+    RUN(csum_partial_equals_the_reference);
     RUN(martian_addresses);
     RUN(martian_this_network_and_link_local);
     RUN(ttl_zero_is_rejected);

@@ -20,7 +20,7 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Giselle |
 | `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Giselle |
-| `bench/` | iperf3/ping benchmark script and its rule files | Giselle |
+| `bench/` | iperf3 and latency-percentile benchmark (`run_bench.sh`, `summary.py`), the CPU profile (`profile.sh`), and the rule files | Giselle |
 | `scripts/demo.sh`, `scripts/demo_steps.sh`, `scripts/demo_log.awk`, `scripts/dns_forwarder.py` | The recorded demo: a tmux window with the live firewall log above and narrated, self-checking steps below, using the real Internet (see `DEMO.md`) | shared |
 | `tests/` | Unit tests (`tests/pktbuild.c` builds real wire packets) | shared |
 
@@ -114,23 +114,79 @@ The script refuses to run if the topology, the running firewall or its rules
 file (by rule count) does not match its label. `RUNS=5 SECS=10` repeats the
 iperf3 run and reports the median.
 
-Measured on the 2-CPU / 4 GB course VM (5 runs of 10 s each, median of the
-receiver rate; the VM is shared by iperf3's client and server and `tunwall`,
-so the spread is large):
+Measured on the 2-CPU / 4 GB course VM with the machine otherwise idle: 5
+iperf3 runs of 10 s (median of the receiver rate, with the range) and 5,000 pings
+10 ms apart (percentiles of the pooled round-trip times). `bench/summary.py`
+prints this table from the saved results; "added" is the firewall's value minus
+the kernel baseline's, which is what the spec's "under 0.5 ms" goal is about.
 
-| Setup | Median | Range over 5 runs | Avg ping (200) |
-|---|---|---|---|
-| (a) kernel forwarding | 8.94 Gbit/s | 8.32 - 9.06 | 0.04 ms |
-| (b) `tunwall`, one allow-all rule | 1.74 Gbit/s | 0.52 - 1.77 | 0.11 ms |
-| (c) `tunwall`, 2000 rules | 1.08 Gbit/s | 0.77 - 1.45 | 0.77 ms (outliers to 20 ms) |
+| Setup | Throughput (median, range) | p50 | p95 | p99 | max | Added p50 | Added p99 |
+|---|---|---|---|---|---|---|---|
+| (a) kernel forwarding | 5.15 Gbit/s (2.31 - 5.34) | 0.036 | 0.076 | 0.145 | 6.860 | - | - |
+| (b) `tunwall`, one rule | 1.28 Gbit/s (1.24 - 1.35) | 0.153 | 0.276 | 0.588 | 8.780 | +0.117 ms | +0.443 ms |
+| (c) `tunwall`, 2000 rules | 1.34 Gbit/s (1.20 - 1.35) | 0.154 | 0.273 | 0.660 | 9.040 | +0.118 ms | +0.515 ms |
 
-`tunwall` is far above the 200 Mbit/s goal but about 5 to 8 times slower than
-kernel forwarding (it does a read and a write per packet, no GSO/GRO batching).
-The ranges of (b) and (c) overlap, so these runs do not show whether the rule
-count matters (rules are only consulted for a new flow, so it should not). The
-latency goal (under 0.5 ms added) is not demonstrated on this VM because of the
-outliers. A `perf` profile to explain the gap is still to do (`PERF=1` records
-one).
+Latencies are ping round-trip times in ms. What this shows:
+- **Throughput** is about 6 times the 200 Mbit/s goal, and about a quarter of the
+  kernel's.
+- **Latency:** the firewall adds about **0.12 ms at the median** and **0.44 to
+  0.52 ms at the 99th percentile**, so the goal (under 0.5 ms) is met at the
+  median and right at the limit in the tail. The 6 to 9 ms maxima appear for the
+  kernel too, so they are the VM, not the firewall.
+- **Rule count does not matter**: 2,000 rules give the same throughput range and
+  the same latency as one rule, as expected (rules are only consulted for the
+  first packet of a flow).
+- The VM's absolute speed drifts a lot between sessions (the kernel baseline has
+  measured 2.4, 5.2 and 8.9 Gbit/s on different days), so only comparisons made
+  in the same session are meaningful.
+
+### Where the time goes (`bench/profile.sh`)
+
+`sudo bench/profile.sh` builds the topology, pushes iperf3 through the firewall
+and records, over a steady-state window: a `perf` CPU profile (software clock, as
+this VM has no hardware counters), how much of one core `tunwall` uses, packets
+per second, and syscalls per packet. The measured explanation of the gap:
+
+- **`tunwall` is limited by a single core.** It is single-threaded and runs at
+  98 to 100% of one core, so its throughput is exactly (packets per second it can
+  handle) x (packet size): about 142,000 packets/s of about 1,140 bytes, or 6.9
+  microseconds of CPU per packet.
+- **Two syscalls per packet, no more.** Measured with `strace -c`: 1.00 `read`,
+  1.00 `write` and 0.01 `ppoll` per packet. The `poll` is already amortized over
+  bursts of up to 64 packets.
+- **About 90% of that time is the kernel, not our code.** Each packet is
+  forwarded by the kernel twice (into the tun device, and out again after we write
+  it back), plus a `read` and a `write` that copy it across the user/kernel
+  boundary. The kernel baseline does one pass and no copies, and it can also use
+  checksum and segmentation offload, which a userspace loop reading single
+  packets cannot. That is the design's cost; the profile groups it as buffer
+  allocation, IP forwarding and routing, device queues and softirq, syscall entry,
+  and the two copies.
+- **What was ours to fix: the checksum.** The first profile put `csum_partial`
+  at 18% of all CPU time, the largest item in our own code: the parser validates
+  the IP, TCP and UDP checksums (a spec requirement) and did it one 16-bit word at
+  a time with a branch per word. It now adds 8 bytes per step with no branch
+  (valid because the one's-complement sum does not depend on byte order, RFC
+  1071). An equivalence test against the original covers every length 0 to 300 at
+  every alignment, large and all-ones inputs and odd starting sums, and deliberately
+  broken variants of the new code are all caught.
+
+| | Before | After |
+|---|---|---|
+| `tunwall`'s own code, share of CPU time | 19.8% | 5.5% |
+| of which parsing and checksums | 18.2% | 3.5% |
+| CPU per packet | 8.96 us | 6.89 us |
+| Packets per second (one core) | 111,000 | 142,000 |
+| Throughput in the profile run | 1.02 Gbit/s | 1.29 Gbit/s |
+
+An interleaved A/B (old and new `tunwall` alternating on the same topology, 8 runs
+each) gives a median of 0.914 Gbit/s before and 1.235 Gbit/s after, **+35%**; the
+worst new run (1.15) beats the best old run (0.98), so it is not noise.
+
+What would be needed to go much faster is a different architecture, not tuning:
+several threads on a multi-queue tun device, or larger packets through tun's
+offload support. Those are future work. With our own code now about 5% of the
+time, no more micro-optimizing of it would matter.
 
 On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
 
@@ -242,4 +298,5 @@ from the outside (exposed services).
   the application, and a flow is never dropped for what it carries
 - NAT inside `tunwall` itself (the demo's NAT to the Internet is done by the
   host and the outside namespace, not by the firewall)
-- `perf` profile of `tunwall` and a written explanation of the throughput gap
+- Multi-threaded or offload-aware packet handling (the profile shows the remaining
+  cost is in the kernel, so it would take a different architecture)

@@ -19,7 +19,10 @@
 #              to run if the topology, the firewall, or its rules file (by its
 #              rule count) do not fit it.
 #              RUNS=5 SECS=10 repeats the iperf3 run and reports the MEDIAN of
-#              the runs (one run is too noisy to trust). The receiver rate is
+#              the runs (one run is too noisy to trust). PINGS (default 200) and
+#              LAT_RUNS (default RUNS) set the latency sample: percentiles
+#              (p50/p95/p99) of the pooled round-trip times are reported, not
+#              just an average. The receiver rate is
 #              the headline figure. Results go to bench/results/<label>.txt
 #              (git-ignored). Set PERF=1 to also record a perf profile.
 # ============================================================================
@@ -28,6 +31,8 @@ cd "$(dirname "$0")/.."
 label=${1:?usage: run_bench.sh <label>}
 secs=${SECS:-10}
 runs=${RUNS:-1}
+pings=${PINGS:-200}              # pings per latency round
+lat_runs=${LAT_RUNS:-$runs}      # latency rounds (pooled into one set of percentiles)
 out=bench/results
 for c in iperf3 ping python3; do command -v $c >/dev/null || { echo "need $c"; exit 1; }; done
 
@@ -66,8 +71,30 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 {
   echo "# $label  $(date -Is)  --  $info"
-  echo "## ping (200 packets)"
-  ip netns exec inside ping -c 200 -i 0.01 -q 10.0.2.2 | tail -2
+  echo "## latency: $pings pings x $lat_runs round(s), 10 ms apart, pooled"
+  for ((i = 1; i <= lat_runs; i++)); do
+      ip netns exec inside ping -c "$pings" -i 0.01 10.0.2.2 > "$tmp/ping$i.txt" 2>&1 || true
+  done
+  python3 - "$tmp" "$lat_runs" "$out/$label.latency.json" <<'PY'
+import json, re, statistics, sys
+d, n, dest = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+rtt, sent = [], 0
+for i in range(1, n + 1):
+    text = open("%s/ping%d.txt" % (d, i)).read()
+    rtt += [float(x) for x in re.findall(r"time=([0-9.]+) ms", text)]
+    m = re.search(r"(\d+) packets transmitted", text)
+    sent += int(m.group(1)) if m else 0
+if not rtt:
+    print("  no ping replies"); sys.exit(0)
+rtt.sort()
+def pct(p):                      # nearest-rank percentile
+    return rtt[min(len(rtt) - 1, max(0, int(round(p / 100.0 * len(rtt) + 0.5)) - 1))]
+r = {"samples": len(rtt), "sent": sent, "min_ms": rtt[0], "p50_ms": pct(50), "p95_ms": pct(95),
+     "p99_ms": pct(99), "max_ms": rtt[-1], "mean_ms": statistics.mean(rtt)}
+json.dump(r, open(dest, "w"))
+print("  %d replies of %d: min %.3f  p50 %.3f  p95 %.3f  p99 %.3f  max %.3f  mean %.3f ms" %
+      (r["samples"], sent, r["min_ms"], r["p50_ms"], r["p95_ms"], r["p99_ms"], r["max_ms"], r["mean_ms"]))
+PY
   echo "## iperf3 TCP, ${secs}s x ${runs} run(s)"
   for ((i = 1; i <= runs; i++)); do
       ip netns exec outside iperf3 -s -1 -B 10.0.2.2 >/dev/null 2>&1 &
@@ -75,7 +102,7 @@ trap 'rm -rf "$tmp"' EXIT
       ip netns exec inside iperf3 -c 10.0.2.2 -t "$secs" -J > "$tmp/run$i.json" || true
       wait $srv 2>/dev/null || true
   done
-  python3 - "$tmp" "$runs" <<'PY'
+  python3 - "$tmp" "$runs" "$out/$label.iperf.json" <<'PY'
 import json, statistics, sys
 d, n = sys.argv[1], int(sys.argv[2])
 rx, tx = [], []
@@ -90,6 +117,9 @@ for i in range(1, n + 1):
 if rx:
     print("  median received %.2f Gbit/s (min %.2f, max %.2f), median sent %.2f Gbit/s" %
           (statistics.median(rx), min(rx), max(rx), statistics.median(tx)))
+    json.dump({"runs": len(rx), "median_rx_gbps": statistics.median(rx), "min_rx_gbps": min(rx),
+               "max_rx_gbps": max(rx), "median_tx_gbps": statistics.median(tx)},
+              open(sys.argv[3], "w"))
 PY
 } | tee "$out/$label.txt"
 # leave the results owned by whoever ran sudo, not by root
