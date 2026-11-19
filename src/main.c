@@ -8,7 +8,8 @@
  * Description: tunwall, the userspace stateful firewall. Loads the rules file
  *              (refusing to start on any error), opens the two tun devices,
  *              and runs the packet loop until SIGINT or SIGTERM. SIGUSR1
- *              prints the counters; they are also printed on exit. Flow
+ *              prints the counters (they are also printed on exit), and
+ *              SIGHUP reloads the rules file without a restart. Flow
  *              opens/closes and dropped packets (with the reason) are logged
  *              to stderr, rate-limited so a flood cannot flood the log.
  =============================================================================*/
@@ -31,9 +32,11 @@
 
 static volatile sig_atomic_t g_stop;
 static volatile sig_atomic_t g_dump_stats;
+static volatile sig_atomic_t g_reload;
 
 static void on_stop(int sig)  { (void)sig; g_stop = 1; }
 static void on_usr1(int sig)  { (void)sig; g_dump_stats = 1; }
+static void on_hup(int sig)   { (void)sig; g_reload = 1; }
 
 static void usage(FILE *out)
 {
@@ -49,8 +52,8 @@ static void usage(FILE *out)
         "  -d        accepted for old scripts: logging drops is now the default\n"
         "By default every flow open/close and every dropped packet (with its reason)\n"
         "is logged to stderr, limited to %d lines/s (a summary line says how many\n"
-        "were suppressed). SIGUSR1 prints the counters; SIGINT/SIGTERM stop it and\n"
-        "print them.\n", NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT, FW_LOG_LINES_PER_SEC);
+        "were suppressed). SIGUSR1 prints the counters; SIGHUP reloads the rules file\n"
+        "(a bad file keeps the old rules); SIGINT/SIGTERM stop it and print them.\n", NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT, FW_LOG_LINES_PER_SEC);
 }
 
 /* Installed first thing, so no signal can arrive while it is still unhandled
@@ -66,11 +69,13 @@ static void install_handlers(void)
     sigaction(SIGTERM, &sa, NULL);
     sa.sa_handler = on_usr1;
     sigaction(SIGUSR1, &sa, NULL);
+    sa.sa_handler = on_hup;
+    sigaction(SIGHUP, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 }
 
 /*
- * Keep the three signals blocked except inside the forwarder's wait, which
+ * Keep the four signals blocked except inside the forwarder's wait, which
  * unblocks them atomically (ppoll). Otherwise a stop signal landing between
  * "should I stop?" and "wait" would be missed until the wait timed out.
  */
@@ -81,6 +86,7 @@ static void block_signals_outside_the_wait(forwarder_t *fwd)
     sigaddset(&block, SIGINT);
     sigaddset(&block, SIGTERM);
     sigaddset(&block, SIGUSR1);
+    sigaddset(&block, SIGHUP);
     sigprocmask(SIG_BLOCK, &block, &orig);
     fwd_set_sigmask(fwd, &orig);
 }
@@ -169,6 +175,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "tunwall: a tun device failed: %s\n", strerror(errno));
             rc = 1;
             break;
+        }
+        if (g_reload) {
+            /* New rules apply to new connections; existing flows keep going.
+             * Any error leaves the running rules exactly as they were. */
+            g_reload = 0;
+            if (engine_reload_rules(engine, rules, err, sizeof err))
+                fprintf(stderr, "tunwall: rules reloaded from %s\n", rules);
+            else
+                fprintf(stderr, "tunwall: reload failed, keeping the old rules: %s\n", err);
+            fflush(stderr);
         }
         if (g_dump_stats) {
             g_dump_stats = 0;

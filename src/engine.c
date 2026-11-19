@@ -472,6 +472,28 @@ bool engine_flow_origin(engine_t *e, const pkt_t *p, uint64_t now_ns, dir_t *ori
     return f != NULL;
 }
 
+bool engine_replace_rules(engine_t *e, rules_t *r)
+{
+    if (!r || r->ninside == 0) { rules_free(r); return false; }
+    rules_free(e->rules);
+    e->rules = r;
+    return true;
+}
+
+bool engine_reload_rules(engine_t *e, const char *path, char *err, size_t errlen)
+{
+    rules_t *r = rules_load_file(path, err, errlen);
+    if (!r) return false;
+    if (r->ninside == 0) {
+        if (err && errlen)
+            snprintf(err, errlen, "%s: declares no inside network (add e.g. "
+                     "'inside 10.0.1.0/24'): anti-spoofing needs one", path);
+        rules_free(r);
+        return false;
+    }
+    return engine_replace_rules(e, r);
+}
+
 void engine_get_stats(const engine_t *e, engine_stats_t *out)
 {
     *out = e->st;

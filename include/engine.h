@@ -198,4 +198,20 @@ bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_n
  */
 bool engine_flow_origin(engine_t *e, const pkt_t *p, uint64_t now_ns, dir_t *orig_dir);
 
+/*
+ * Replace the rules while running (tunwall does this on SIGHUP). The new
+ * rules apply to connections that start from now on; existing flows keep
+ * going, as Linux conntrack keeps ESTABLISHED connections when iptables
+ * rules change. The new inside networks take effect at once for the
+ * anti-spoofing check.
+ *
+ * engine_reload_rules: load path; on any error (unreadable file, syntax
+ * error with its line number, no inside network) fill err, keep the old
+ * rules, and return false.
+ * engine_replace_rules: takes ownership of r; false (r freed, old rules
+ * kept) if r is NULL or declares no inside network.
+ */
+bool engine_reload_rules(engine_t *e, const char *path, char *err, size_t errlen);
+bool engine_replace_rules(engine_t *e, rules_t *r);
+
 #endif
