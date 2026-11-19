@@ -5,7 +5,7 @@
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 19, 2026
  *
- * Description: Unit tests for source NAT. The strongest check used here:
+ * Description: Unit tests for source NAT and port forwarding. The strongest check used here:
  *              a translated packet must be byte-for-byte identical to the
  *              same packet built from scratch (by tests/pktbuild.c, which
  *              computes every checksum in full) with the translated
@@ -438,6 +438,263 @@ static void test_stats_line(void)
     nat_destroy(n);
 }
 
+/* ---- port forwarding ----------------------------------------------------- */
+
+#define WEB IP4(10, 0, 1, 3)
+
+static const forward_t FWDS[] = {
+    { FW_PROTO_TCP, 8080, WEB, 80, 1 },
+    { FW_PROTO_UDP, 5300, WEB, 53, 2 },
+};
+
+static nat_t *mk_fwd_nat(void)
+{
+    nat_t *n = mk_nat();
+    CHECK(nat_check_forwards(n, FWDS, 2, NULL, 0));
+    nat_set_forwards(n, FWDS, 2);
+    return n;
+}
+
+/* A packet arriving from the outside. */
+static nat_result_t in(nat_t *n, uint8_t *b, size_t len)
+{
+    pkt_t p = parsed(b, len);
+    return nat_inbound(n, b, &p, 0);
+}
+
+/* A reply leaving from the inside: never allowed to create a mapping, as the
+ * forwarder passes may_create = false for connections the outside started. */
+static nat_result_t reply_out(nat_t *n, uint8_t *b, size_t len)
+{
+    pkt_t p = parsed(b, len);
+    return nat_outbound(n, b, &p, false, 0);
+}
+
+static void test_a_forwarded_port_reaches_the_inside_server_byte_for_byte(void)
+{
+    nat_t *n = mk_fwd_nat();
+    uint8_t b[256], want[256];
+    const char data[] = "GET / HTTP/1.1\r\n\r\n";
+
+    /* the outside client's SYN to NATIP:8080 is sent to WEB:80, keeping the
+     * client's own address (the server sees who connected) */
+    size_t len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    pb_tcp(want, sizeof want, NULL, OTHER, 5555, WEB, 80, TCP_SYN, NULL, 0);
+    CHECK(memcmp(b, want, len) == 0);
+
+    /* the server's answer leaves from NATIP:8080, as the client expects */
+    len = pb_tcp(b, sizeof b, NULL, WEB, 80, OTHER, 5555, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(reply_out(n, b, len) == NAT_TRANSLATED);
+    pb_tcp(want, sizeof want, NULL, NATIP, 8080, OTHER, 5555, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(memcmp(b, want, len) == 0);
+
+    /* later packets of the connection use the same mapping */
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_ACK | TCP_PSH, data, sizeof data - 1);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    pb_tcp(want, sizeof want, NULL, OTHER, 5555, WEB, 80, TCP_ACK | TCP_PSH, data, sizeof data - 1);
+    CHECK(memcmp(b, want, len) == 0);
+    parsed(b, len);
+
+    /* a second client shares port 8080 but gets its own connection */
+    len = pb_tcp(b, sizeof b, NULL, SERVER, 6000, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    len = pb_tcp(b, sizeof b, NULL, WEB, 80, SERVER, 6000, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(reply_out(n, b, len) == NAT_TRANSLATED);
+    pb_tcp(want, sizeof want, NULL, NATIP, 8080, SERVER, 6000, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(memcmp(b, want, len) == 0);
+
+    /* UDP works the same way */
+    len = pb_udp(b, sizeof b, NULL, OTHER, 7000, NATIP, 5300, "query", 5);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    pb_udp(want, sizeof want, NULL, OTHER, 7000, WEB, 53, "query", 5);
+    CHECK(memcmp(b, want, len) == 0);
+    len = pb_udp(b, sizeof b, NULL, WEB, 53, OTHER, 7000, "answer", 6);
+    CHECK(reply_out(n, b, len) == NAT_TRANSLATED);
+    pb_udp(want, sizeof want, NULL, NATIP, 5300, OTHER, 7000, "answer", 6);
+    CHECK(memcmp(b, want, len) == 0);
+
+    nat_stats_t st;
+    nat_get_stats(n, &st);
+    CHECK(st.forwarded == 3 && st.mappings_active == 3);
+    CHECK(st.translated_in == 4 && st.translated_out == 3);
+    nat_destroy(n);
+}
+
+static void test_only_a_first_packet_opens_a_forwarded_connection(void)
+{
+    nat_t *n = mk_fwd_nat();
+    uint8_t b[256];
+    /* an ACK scan, a SYN-ACK, a port nobody forwards, a TCP SYN to the UDP
+     * forward's port, and a ping: none of them opens anything */
+    size_t len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8081, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 5300, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+    len = pb_icmp_echo(b, sizeof b, NULL, OTHER, NATIP, ICMP_ECHO_REQUEST, 9, 1, "abcd", 4);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+    /* and the inside server can't answer a connection that does not exist */
+    len = pb_tcp(b, sizeof b, NULL, WEB, 80, OTHER, 5555, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(reply_out(n, b, len) == NAT_PASS);
+
+    nat_stats_t st;
+    nat_get_stats(n, &st);
+    CHECK(st.forwarded == 0 && st.mappings_active == 0 && st.drop_no_mapping == 5);
+    nat_destroy(n);
+}
+
+static void test_undo_forgets_only_a_connection_the_last_packet_opened(void)
+{
+    nat_t *n = mk_fwd_nat();
+    uint8_t b[256];
+    nat_stats_t st;
+
+    /* the engine refused the SYN: undo leaves nothing behind */
+    size_t len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    nat_undo_inbound(n);
+    nat_get_stats(n, &st);
+    CHECK(st.mappings_active == 0 && st.forwarded == 0);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+    nat_undo_inbound(n);                         /* nothing to undo: harmless */
+
+    /* a packet of an existing connection is not undone */
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    nat_undo_inbound(n);
+    nat_get_stats(n, &st);
+    CHECK(st.mappings_active == 1 && st.forwarded == 1);
+
+    /* nor is one after a source-NAT packet (nothing was opened inbound) */
+    len = pb_tcp(b, sizeof b, NULL, CLIENT, 40000, SERVER, 80, TCP_SYN, NULL, 0);
+    const uint16_t port = out(n, b, len);
+    len = pb_tcp(b, sizeof b, NULL, SERVER, 80, NATIP, port, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    nat_undo_inbound(n);
+    nat_get_stats(n, &st);
+    CHECK(st.mappings_active == 2);
+    nat_destroy(n);
+}
+
+static void test_icmp_errors_about_a_forwarded_connection_are_translated(void)
+{
+    nat_t *n = mk_fwd_nat();
+    uint8_t q[256], a[256], b[512], want[512];
+
+    /* OTHER:7000 -> NATIP:5300 is forwarded to WEB:53 */
+    const size_t qlen = pb_udp(q, sizeof q, NULL, OTHER, 7000, NATIP, 5300, "query", 5);
+    uint8_t q_in[256];
+    memcpy(q_in, q, qlen);
+    CHECK(in(n, q_in, qlen) == NAT_TRANSLATED);        /* now OTHER:7000 -> WEB:53 */
+
+    /* WEB says port unreachable about the query as it got it: the error
+     * leaves from NATIP and embeds the query as the client sent it */
+    size_t len = pb_icmp_error(b, sizeof b, NULL, WEB, OTHER, ICMP_DEST_UNREACH, 3, q_in, qlen);
+    CHECK(reply_out(n, b, len) == NAT_TRANSLATED);
+    CHECK(pb_icmp_error(want, sizeof want, NULL, NATIP, OTHER, ICMP_DEST_UNREACH, 3, q, qlen) == len);
+    CHECK(memcmp(b, want, len) == 0);
+
+    /* the server's answer leaves as NATIP:5300; if the client reports an
+     * error about it, the error reaches WEB about the answer WEB sent */
+    const size_t alen = pb_udp(a, sizeof a, NULL, WEB, 53, OTHER, 7000, "answer", 6);
+    uint8_t a_out[256];
+    memcpy(a_out, a, alen);
+    CHECK(reply_out(n, a_out, alen) == NAT_TRANSLATED);
+    for (int embed_all = 0; embed_all < 2; embed_all++) {
+        const size_t emb = embed_all ? alen : 28;
+        len = pb_icmp_error(b, sizeof b, NULL, OTHER, NATIP, ICMP_DEST_UNREACH, 3, a_out, emb);
+        CHECK(in(n, b, len) == NAT_TRANSLATED);
+        CHECK(pb_icmp_error(want, sizeof want, NULL, OTHER, WEB, ICMP_DEST_UNREACH, 3, a, emb) == len);
+        CHECK(memcmp(b, want, len) == 0);
+        parsed(b, len);
+    }
+
+    /* an error about a forwarded port with no such connection is refused */
+    const size_t xlen = pb_udp(a, sizeof a, NULL, NATIP, 5300, SERVER, 9999, "x", 1);
+    len = pb_icmp_error(b, sizeof b, NULL, SERVER, NATIP, ICMP_DEST_UNREACH, 3, a, xlen);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+
+    nat_stats_t st;
+    nat_get_stats(n, &st);
+    CHECK(st.icmp_errors_translated == 3);
+    nat_destroy(n);
+}
+
+static void test_forward_ports_must_stay_out_of_the_nat_port_range(void)
+{
+    nat_t *n = mk_nat();
+    const forward_t bad[] = {
+        { FW_PROTO_TCP, 8080, WEB, 80, 2 },
+        { FW_PROTO_TCP, 30000, WEB, 22, 3 },
+    };
+    char err[160] = "";
+    CHECK(!nat_check_forwards(n, bad, 2, err, sizeof err));
+    CHECK(strstr(err, "line 3") != NULL && strstr(err, "30000") != NULL);
+    CHECK(nat_check_forwards(n, bad, 1, err, sizeof err));
+    CHECK(!nat_check_forwards(n, bad + 1, 1, NULL, 0));      /* err may be NULL */
+    CHECK(nat_check_forwards(n, NULL, 0, NULL, 0));
+    nat_destroy(n);
+}
+
+static void test_forwards_change_on_reload_and_mappings_follow_their_flows(void)
+{
+    nat_t *n = mk_fwd_nat();
+    uint8_t b[256];
+
+    size_t len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+
+    /* the forward is removed (a reload): the open connection keeps working
+     * both ways, a new one is refused */
+    nat_set_forwards(n, NULL, 0);
+    len = pb_tcp(b, sizeof b, NULL, WEB, 80, OTHER, 5555, TCP_SYN | TCP_ACK, NULL, 0);
+    CHECK(reply_out(n, b, len) == NAT_TRANSLATED);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    pkt_t p = parsed(b, len);
+    CHECK(p.dst_ip == WEB && p.dst_port == 80);
+    len = pb_tcp(b, sizeof b, NULL, SERVER, 6000, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);
+
+    /* the sweep asks about the connection by its inside tuple, and frees the
+     * mapping once its flow is gone */
+    struct sweep_ctx c = { .keep = mk_tcp(WEB, 80, OTHER, 5555, 0) };
+    CHECK(nat_sweep(n, keep_one, &c) == 0 && c.asked == 1);
+    c.keep = mk_tcp(CLIENT, 1, SERVER, 1, 0);
+    CHECK(nat_sweep(n, keep_one, &c) == 1);
+    nat_stats_t st;
+    nat_get_stats(n, &st);
+    CHECK(st.mappings_active == 0);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_NO_MAPPING);           /* gone from both hashes */
+
+    /* an open connection, then the forward moves to another inside port (a
+     * reload): the open connection stays on the old port, new ones use the new */
+    nat_set_forwards(n, FWDS, 2);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    const forward_t moved[] = { { FW_PROTO_TCP, 8080, WEB, 8000, 1 } };
+    nat_set_forwards(n, moved, 1);
+    len = pb_tcp(b, sizeof b, NULL, OTHER, 5555, NATIP, 8080, TCP_ACK, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    p = parsed(b, len);
+    CHECK(p.dst_ip == WEB && p.dst_port == 80);
+    len = pb_tcp(b, sizeof b, NULL, SERVER, 6000, NATIP, 8080, TCP_SYN, NULL, 0);
+    CHECK(in(n, b, len) == NAT_TRANSLATED);
+    p = parsed(b, len);
+    CHECK(p.dst_ip == WEB && p.dst_port == 8000);
+    nat_get_stats(n, &st);
+    CHECK(st.mappings_active == 2);
+    nat_destroy(n);
+}
+
 int main(void)
 {
     RUN(test_checksum_adjust_matches_a_full_recompute);
@@ -454,5 +711,11 @@ int main(void)
     RUN(test_sweep_asks_about_each_connection_by_its_inside_tuple);
     RUN(test_create_checks_arguments_and_survives_oom);
     RUN(test_stats_line);
+    RUN(test_a_forwarded_port_reaches_the_inside_server_byte_for_byte);
+    RUN(test_only_a_first_packet_opens_a_forwarded_connection);
+    RUN(test_undo_forgets_only_a_connection_the_last_packet_opened);
+    RUN(test_icmp_errors_about_a_forwarded_connection_are_translated);
+    RUN(test_forward_ports_must_stay_out_of_the_nat_port_range);
+    RUN(test_forwards_change_on_reload_and_mappings_follow_their_flows);
     TEST_DONE();
 }

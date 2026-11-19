@@ -444,6 +444,62 @@ static void test_reject_is_an_action(void)
                            "expected 'allow', 'deny' or 'reject'"));
 }
 
+static void test_forward_directive(void)
+{
+    /* `inside` may come after the forward that needs it */
+    rules_t *r = parse("forward tcp 8080 10.0.1.3 80   # web server\n"
+                       "\n"
+                       "forward udp 5300 10.0.1.3 53\n"
+                       "inside 10.0.1.0/24\n"
+                       "allow in tcp any 10.0.1.3 80\n");
+    CHECK(r && r->nfwd == 2 && r->n == 1);
+    if (r && r->nfwd == 2) {
+        const forward_t *f = &r->fwd[0];
+        CHECK(f->proto == FW_PROTO_TCP && f->ext_port == 8080 &&
+              f->ip == IP(10, 0, 1, 3) && f->port == 80 && f->line == 1);
+        f = &r->fwd[1];
+        CHECK(f->proto == FW_PROTO_UDP && f->ext_port == 5300 && f->port == 53 && f->line == 3);
+    }
+    rules_free(r);
+    /* the same external port on another protocol is a different forward */
+    r = parse("inside 10.0.1.0/24\nforward tcp 53 10.0.1.3 53\nforward udp 53 10.0.1.3 53\n");
+    CHECK(r && r->nfwd == 2);
+    rules_free(r);
+}
+
+static void test_forward_errors(void)
+{
+    const char *in = "inside 10.0.1.0/24\n";
+    char text[2048];
+    struct { const char *line, *msg; } bad[] = {
+        { "forward tcp 8080 10.0.1.3\n",            "expected 'forward" },
+        { "forward tcp 8080 10.0.1.3 80 extra\n",   "expected 'forward" },
+        { "forward icmp 8080 10.0.1.3 80\n",        "tcp or udp" },
+        { "forward any 8080 10.0.1.3 80\n",         "tcp or udp" },
+        { "forward tcp 0 10.0.1.3 80\n",            "1-65535" },
+        { "forward tcp 8080 10.0.1.3 65536\n",      "1-65535" },
+        { "forward tcp 80-90 10.0.1.3 80\n",        "1-65535" },
+        { "forward tcp -1 10.0.1.3 80\n",           "1-65535" },
+        { "forward tcp 8080 10.0.1.0/24 80\n",      "one address" },
+        { "forward tcp 8080 any 80\n",              "one address" },
+        { "forward tcp 8080 10.0.1.300 80\n",       "one address" },
+        { "forward tcp 8080 10.0.2.2 80\n",         "not in an 'inside' network" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        snprintf(text, sizeof text, "%s%s", in, bad[i].line);
+        CHECK(parse_fails_with(text, "line 2:", bad[i].msg));
+    }
+    CHECK(parse_fails_with("inside 10.0.1.0/24\nforward tcp 8080 10.0.1.3 80\n"
+                           "forward tcp 8080 10.0.1.4 80\n",
+                           "line 3:", "port 8080 is already forwarded on line 2"));
+    /* 16 forwards fit, a 17th does not */
+    size_t len = (size_t)snprintf(text, sizeof text, "%s", in);
+    for (int k = 0; k <= MAX_FORWARDS; k++)
+        len += (size_t)snprintf(text + len, sizeof text - len,
+                                "forward tcp %d 10.0.1.3 80\n", 1000 + k);
+    CHECK(parse_fails_with(text, "line 18:", "too many 'forward' lines"));
+}
+
 int main(void)
 {
     RUN(test_parse_basic_and_comments);
@@ -469,5 +525,7 @@ int main(void)
     RUN(test_load_directory_is_an_error_not_an_empty_ruleset);
     RUN(test_load_file_with_nul_byte_is_an_error);
     RUN(test_reject_is_an_action);
+    RUN(test_forward_directive);
+    RUN(test_forward_errors);
     TEST_DONE();
 }

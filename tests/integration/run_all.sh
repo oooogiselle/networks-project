@@ -162,6 +162,8 @@ cli_says() { # cli_says <name> <wanted exit code> <regex for the output> <tunwal
 }
 printf 'inside 10.0.1.0/24\nallow bogus\n' > "$LOGDIR/bad.conf"
 printf 'allow out tcp any any 80\n' > "$LOGDIR/noinside.conf"
+printf 'inside 10.0.1.0/24\nforward tcp 8080 10.0.1.3 80\n' > "$LOGDIR/forward.conf"
+printf 'inside 10.0.1.0/24\nforward tcp 30000 10.0.1.3 80\n' > "$LOGDIR/forward-range.conf"
 cli_says "no arguments prints usage and exits 2"          2 'usage: tunwall'
 cli_says "-h prints usage and exits 0"                    0 'usage: tunwall' -h
 cli_says "an unknown option exits 2"                      2 'usage: tunwall' -z
@@ -170,6 +172,8 @@ cli_says "a missing rules file names the file, exit 1"    1 '/nonexistent/rules\
 cli_says "a syntax error names the file and the line"     1 'bad\.conf: line 2: ' -r "$LOGDIR/bad.conf"
 cli_says "no inside network is refused with the reason"   1 'noinside\.conf: declares no inside network' -r "$LOGDIR/noinside.conf"
 cli_says "a missing tun device is refused with a hint"    1 'tw-missing0: no such device.*netns\.sh' -r "$RULES" -i tw-missing0
+cli_says "a forward without -n is refused, naming its line" 1 "forward\\.conf: line 2: 'forward' needs source NAT \\(-n ADDR\\)" -r "$LOGDIR/forward.conf"
+cli_says "a forward in the NAT port range is refused"     1 'forward-range\.conf: line 2: forward: port 30000 is in the source-NAT port range' -r "$LOGDIR/forward-range.conf" -n 10.0.2.254
 
 "$NETNS_SCRIPT" down >/dev/null 2>&1
 "$NETNS_SCRIPT" up ${INTERNET:+nat} || { echo "namespace setup failed"; exit 1; }
@@ -460,7 +464,8 @@ fi
 
 echo "== source NAT (tunwall -n 10.0.2.254)"
 # Restart the firewall with source NAT on and its own rule file (the example
-# rules plus TCP 8000, for a server that reports who connected to it). The
+# rules plus TCP 8000, for a server that reports who connected to it, and a
+# port forward from the NAT address's port 8080 to an inside server). The
 # outside loses its route back to the inside, so a reply can only come back
 # through the NAT address: if translation failed, nothing would work.
 NATIP=10.0.2.254
@@ -470,7 +475,9 @@ printf '%s\n' 'inside 10.0.1.0/24' \
     'allow out tcp  10.0.1.0/24 any 80,443,8000' \
     'allow out udp  10.0.1.0/24 10.0.2.2 53' \
     'allow out icmp 10.0.1.0/24 any echo' \
-    'allow in  tcp  any 10.0.1.3 22' > "$LOGDIR/nat.conf"
+    'allow in  tcp  any 10.0.1.3 22' \
+    'forward tcp 8080 10.0.1.3 8080' \
+    'allow in  tcp  any 10.0.1.3 8080' > "$LOGDIR/nat.conf"
 SAVED_RULES=$RULES; SAVED_ARGS=$TUNWALL_ARGS
 RULES=$LOGDIR/nat.conf; TUNWALL_ARGS="$TUNWALL_ARGS -n $NATIP"
 if start_fw; then
@@ -496,6 +503,24 @@ while True:
     expect "DNS (UDP) through NAT gets an answer"               reply probe inside udp 10.0.2.2 53
     expect "an unsolicited connection to the NAT address is silently dropped" timeout probe outside tcp $NATIP 22
     expect "an unsolicited ping to the NAT address is silently dropped"       timeout icmp_probe outside $NATIP
+
+    echo "== port forwarding (forward tcp 8080 10.0.1.3 8080)"
+    # The outside still has no route to the inside: the only way in is the
+    # forward on the NAT address. The inside server answers each connection
+    # with the address it came from, so it proves both directions are
+    # translated and that the server sees the real client.
+    bg ip netns exec inside python3 -c '
+import socket
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("10.0.1.3",8080)); s.listen(8)
+while True:
+    c,a=s.accept(); c.sendall(a[0].encode()); c.close()'
+    wait_listen inside tcp 10.0.1.3 8080 "the inside who-am-i server"
+    peer=$(outside python3 -c 'import socket; s=socket.create_connection(("'$NATIP'",8080),5,("10.0.2.3",0)); print(s.recv(64).decode())' 2>/dev/null)
+    [ "$peer" = "10.0.2.3" ] && ok "outside reaches the inside server through $NATIP:8080, which sees the real client" \
+                             || bad "through $NATIP:8080 the inside server saw '${peer:-nothing}', wanted 10.0.2.3"
+    expect "a port nobody forwards stays silently dropped" timeout probe outside tcp $NATIP 8081
+    logged "the forwarded connection is logged with the inside server" 'FLOW NEW +tcp 10\.0\.2\.3:[0-9]+ -> 10\.0\.1\.3:8080 '
     # Path MTU through NAT: the firewall's kernel reports "fragmentation
     # needed" to the translated source; tunwall must translate the ICMP error
     # (its embedded header included) back to the inside host.
@@ -513,6 +538,7 @@ while True:
     dump_stats
     logged "flows are logged with the real inside address" 'FLOW NEW +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:8000 '
     logged "NAT counters are printed" "^nat: +addr=$NATIP mappings active=[0-9]+ created=[1-9][0-9]* .*translated out=[1-9][0-9]* in=[1-9][0-9]* icmp-errors=[1-9][0-9]* dropped no-mapping=[1-9][0-9]*"
+    logged "port forwards are counted" "^nat: .* forwarded=[1-9][0-9]*\$"
 
     echo "== reloading the rules without a restart (SIGHUP)"
     reload_fw() { # reload_fw: send SIGHUP and wait until tunwall reports the outcome
@@ -536,9 +562,13 @@ while True:
     cp "$LOGDIR/nat.conf" "$LOGDIR/nat.good"
     echo 'allow bogus' >> "$LOGDIR/nat.conf"
     reload_fw
-    logged "a bad file is refused, naming its line" "^tunwall: reload failed, keeping the old rules: .*nat\.conf: line 7: "
+    logged "a bad file is refused, naming its line" "^tunwall: reload failed, keeping the old rules: .*nat\.conf: line 9: "
     check  "tunwall keeps running after a bad reload" pass kill -0 "$FW_PID"
     expect "after a bad reload the old rules still apply" refused probe inside tcp 10.0.2.2 8080
+    cp "$LOGDIR/nat.good" "$LOGDIR/nat.conf"
+    echo 'forward tcp 30000 10.0.1.3 22' >> "$LOGDIR/nat.conf"
+    reload_fw
+    logged "a forward inside the NAT port range is refused" "^tunwall: reload failed, keeping the old rules: .*nat\.conf: line 9: forward: port 30000 is in the source-NAT port range"
     cp "$LOGDIR/nat.good" "$LOGDIR/nat.conf"
 else
     bad "tunwall did not start with -n $NATIP"; cat "$LOGDIR/tunwall.log"

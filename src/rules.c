@@ -154,9 +154,48 @@ static bool parse_compact(char **tok, int n, int i, rule_t *r, int lineno,
     return true;
 }
 
+/* A single port 1-65535. */
+static bool parse_port1(const char *s, uint16_t *out)
+{
+    char *end;
+    if (!isdigit((unsigned char)*s)) return false;
+    long v = strtol(s, &end, 10);
+    if (*end || v < 1 || v > 65535) return false;
+    *out = (uint16_t)v;
+    return true;
+}
+
+/* `forward (tcp|udp) <ext-port> <a.b.c.d> <port>` (tok[0] is "forward"). */
+static bool parse_forward(char **tok, int n, int lineno, forward_t *f,
+                          char *err, size_t errlen)
+{
+    memset(f, 0, sizeof *f);
+    f->line = lineno;
+    if (n != 5) {
+        set_err(err, errlen, lineno, "expected 'forward (tcp|udp) <port> <a.b.c.d> <port>'");
+        return false;
+    }
+    if (strcmp(tok[1], "tcp") == 0) f->proto = FW_PROTO_TCP;
+    else if (strcmp(tok[1], "udp") == 0) f->proto = FW_PROTO_UDP;
+    else { set_err(err, errlen, lineno, "forward: protocol must be tcp or udp"); return false; }
+    addr_match_t a;
+    if (!parse_port1(tok[2], &f->ext_port) || !parse_port1(tok[4], &f->port)) {
+        set_err(err, errlen, lineno, "forward: ports must be 1-65535");
+        return false;
+    }
+    if (strchr(tok[3], '/') || !parse_addr(tok[3], &a) || a.any) {
+        set_err(err, errlen, lineno, "forward: the target must be one address (a.b.c.d)");
+        return false;
+    }
+    f->ip = a.net;
+    return true;
+}
+
 /* Returns 0 = rule parsed, 1 = blank/comment, 2 = `inside` directive (the
- * network is returned in r->src), -1 = error (err filled). */
-static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errlen)
+ * network is returned in r->src), 3 = `forward` directive (returned in *fw),
+ * -1 = error (err filled). */
+static int parse_line(char *line, int lineno, rule_t *r, forward_t *fw,
+                      char *err, size_t errlen)
 {
     char *hash = strchr(line, '#');
     if (hash) *hash = '\0';
@@ -181,6 +220,8 @@ static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errle
         }
         return 2;
     }
+    if (strcmp(tok[0], "forward") == 0)
+        return parse_forward(tok, n, lineno, fw, err, errlen) ? 3 : -1;
 
     r->sport.n = r->dport.n = 1;
     r->sport.r[0] = r->dport.r[0] = (port_range_t){0, 65535};
@@ -256,6 +297,25 @@ static bool rules_push(rules_t *rs, const rule_t *r)
     return true;
 }
 
+static bool add_forward(rules_t *rs, const forward_t *f, char *err, size_t errlen)
+{
+    for (size_t i = 0; i < rs->nfwd; i++) {
+        if (rs->fwd[i].proto == f->proto && rs->fwd[i].ext_port == f->ext_port) {
+            char msg[96];
+            snprintf(msg, sizeof msg, "forward: port %u is already forwarded on line %d",
+                     f->ext_port, rs->fwd[i].line);
+            set_err(err, errlen, f->line, msg);
+            return false;
+        }
+    }
+    if (rs->nfwd == MAX_FORWARDS) {
+        set_err(err, errlen, f->line, "too many 'forward' lines");
+        return false;
+    }
+    rs->fwd[rs->nfwd++] = *f;
+    return true;
+}
+
 rules_t *rules_parse_string(const char *text, char *err, size_t errlen)
 {
     rules_t *rs = fw_calloc(1, sizeof *rs);
@@ -274,12 +334,15 @@ rules_t *rules_parse_string(const char *text, char *err, size_t errlen)
         if (nl) { *nl = '\0'; next = nl + 1; } else { next = NULL; }
         lineno++;
         rule_t r;
-        int rc = parse_line(line, lineno, &r, err, errlen);
+        forward_t fw;
+        int rc = parse_line(line, lineno, &r, &fw, err, errlen);
         if (rc == 2 && rs->ninside == MAX_INSIDE_NETS) {
             set_err(err, errlen, lineno, "too many 'inside' networks");
             rc = -1;
         } else if (rc == 2) {
             rs->inside[rs->ninside++] = r.src;
+        } else if (rc == 3) {
+            rc = add_forward(rs, &fw, err, errlen) ? 3 : -1;
         }
         if (rc < 0 || (rc == 0 && !rules_push(rs, &r))) {
             if (rc == 0) set_err(err, errlen, lineno, "out of memory");
@@ -289,6 +352,15 @@ rules_t *rules_parse_string(const char *text, char *err, size_t errlen)
         }
     }
     free(copy);
+    /* Checked at the end: `inside` may come after the forward that needs it. */
+    for (size_t i = 0; i < rs->nfwd; i++) {
+        if (!rules_is_inside(rs, rs->fwd[i].ip)) {
+            set_err(err, errlen, rs->fwd[i].line,
+                    "forward: the target is not in an 'inside' network");
+            rules_free(rs);
+            return NULL;
+        }
+    }
     return rs;
 }
 

@@ -8,8 +8,9 @@
  * Description: Source NAT with port translation (see nat.h). A preallocated
  *              pool of mappings, a keyed hash for the inside -> outside
  *              lookup, and one array per protocol indexed by NAT port for the
- *              outside -> inside lookup, so both directions are O(1) and no
- *              memory is allocated per packet.
+ *              outside -> inside lookup (port forwards, whose port is shared,
+ *              use a second keyed hash instead), so both directions are O(1)
+ *              and no memory is allocated per packet.
  =============================================================================*/
 
 #include "nat.h"
@@ -25,13 +26,16 @@
 #define NO_ENTRY    (-1)
 
 enum { PI_TCP = 0, PI_UDP, PI_ICMP, PI_COUNT };
+enum { MAP_SNAT = 0, MAP_FWD = 1 };   /* source NAT, or a port forward */
 
 typedef struct mapping {
     uint32_t in_ip, rem_ip;
     uint16_t in_port, rem_port;   /* ICMP echo: the inside host's identifier in both */
     uint16_t nat_port;
     uint8_t  proto;               /* 0 = free slot */
+    uint8_t  kind;                /* MAP_SNAT or MAP_FWD (shares nat_port, no rev slot) */
     int32_t  next;                /* hash chain, or the free list when free */
+    int32_t  onext;               /* MAP_FWD: chain of the outside-side hash */
 } mapping_t;
 
 struct nat {
@@ -42,9 +46,13 @@ struct nat {
     uint32_t   cap;
     int32_t    free_head;
     int32_t   *bucket;               /* NAT_BUCKETS chain heads */
+    int32_t   *obucket;              /* NAT_BUCKETS heads: forward mappings by outside tuple */
     int32_t   *rev[PI_COUNT];        /* [proto][nat_port - port_lo] -> pool index */
     uint32_t   cursor[PI_COUNT];     /* next port to try, round robin */
     uint8_t    hash_key[16];
+    forward_t  fwd[MAX_FORWARDS];    /* port forwards (a copy) */
+    size_t     nfwd;
+    int32_t    pending;              /* forward mapping the last nat_inbound made */
     nat_stats_t st;
 };
 
@@ -156,6 +164,18 @@ static uint32_t hash_tuple(const nat_t *n, uint8_t proto, uint32_t in_ip,
     return (uint32_t)fw_siphash24(n->hash_key, b, sizeof b) & (NAT_BUCKETS - 1);
 }
 
+/* Forward mappings are also hashed by their outside side (proto, NAT port,
+ * remote endpoint): a forwarded port is shared, and its open connections must
+ * be found even after a reload removed or changed the forward. */
+static uint32_t hash_outside(const nat_t *n, uint8_t proto, uint16_t nat_port,
+                             uint32_t rem_ip, uint16_t rem_port)
+{
+    uint8_t b[10];
+    wr32(b, rem_ip); wr16(b + 4, rem_port); wr16(b + 6, nat_port);
+    b[8] = proto; b[9] = 0xfd;           /* never equal to an inside-side key */
+    return (uint32_t)fw_siphash24(n->hash_key, b, sizeof b) & (NAT_BUCKETS - 1);
+}
+
 static int32_t find(const nat_t *n, uint8_t proto, uint32_t in_ip, uint16_t in_port,
                     uint32_t rem_ip, uint16_t rem_port)
 {
@@ -191,6 +211,27 @@ static int alloc_port(nat_t *n, int pi)
     return -1;
 }
 
+/* Take a free mapping and link it into the hash table. */
+static int32_t take(nat_t *n, uint8_t proto, uint8_t kind, uint32_t in_ip, uint16_t in_port,
+                    uint32_t rem_ip, uint16_t rem_port, uint16_t nat_port)
+{
+    const int32_t i = n->free_head;
+    mapping_t *m = &n->pool[i];
+    n->free_head = m->next;
+    *m = (mapping_t){ in_ip, rem_ip, in_port, rem_port, nat_port, proto, kind, NO_ENTRY, NO_ENTRY };
+    const uint32_t h = hash_tuple(n, proto, in_ip, in_port, rem_ip, rem_port);
+    m->next = n->bucket[h];
+    n->bucket[h] = i;
+    if (kind == MAP_FWD) {
+        const uint32_t o = hash_outside(n, proto, nat_port, rem_ip, rem_port);
+        m->onext = n->obucket[o];
+        n->obucket[o] = i;
+    }
+    n->st.mappings_created++;
+    n->st.mappings_active++;
+    return i;
+}
+
 static int32_t create(nat_t *n, uint8_t proto, uint32_t in_ip, uint16_t in_port,
                       uint32_t rem_ip, uint16_t rem_port)
 {
@@ -198,19 +239,54 @@ static int32_t create(nat_t *n, uint8_t proto, uint32_t in_ip, uint16_t in_port,
     if (pi < 0 || n->free_head == NO_ENTRY) return NO_ENTRY;
     const int slot = alloc_port(n, pi);
     if (slot < 0) return NO_ENTRY;
-
-    const int32_t i = n->free_head;
-    mapping_t *m = &n->pool[i];
-    n->free_head = m->next;
-    *m = (mapping_t){ in_ip, rem_ip, in_port, rem_port,
-                      (uint16_t)(n->port_lo + slot), proto, NO_ENTRY };
-    const uint32_t h = hash_tuple(n, proto, in_ip, in_port, rem_ip, rem_port);
-    m->next = n->bucket[h];
-    n->bucket[h] = i;
+    const int32_t i = take(n, proto, MAP_SNAT, in_ip, in_port, rem_ip, rem_port,
+                           (uint16_t)(n->port_lo + slot));
     n->rev[pi][slot] = i;
-    n->st.mappings_created++;
-    n->st.mappings_active++;
     return i;
+}
+
+/* The forward for connections to the NAT address on proto/port, or NULL. */
+static const forward_t *forward_for(const nat_t *n, uint8_t proto, uint16_t port)
+{
+    for (size_t k = 0; k < n->nfwd; k++)
+        if (n->fwd[k].proto == proto && n->fwd[k].ext_port == port) return &n->fwd[k];
+    return NULL;
+}
+
+/*
+ * The mapping for a packet between the remote endpoint rem_ip:rem_port and
+ * the NAT address port nat_port, of either kind, or NO_ENTRY. A source-NAT
+ * port belongs to one connection, which only its remote endpoint may use
+ * (for ICMP echo the remote has no port); a forwarded port is shared, so the
+ * remote endpoint picks the connection.
+ */
+static int32_t lookup_outside(const nat_t *n, uint8_t proto, uint16_t nat_port,
+                              uint32_t rem_ip, uint16_t rem_port)
+{
+    if (nat_port >= n->port_lo && nat_port <= n->port_hi) {
+        const int32_t i = by_nat_port(n, proto, nat_port);
+        if (i == NO_ENTRY) return NO_ENTRY;
+        const mapping_t *m = &n->pool[i];
+        if (m->rem_ip != rem_ip || (proto != FW_PROTO_ICMP && m->rem_port != rem_port))
+            return NO_ENTRY;
+        return i;
+    }
+    for (int32_t i = n->obucket[hash_outside(n, proto, nat_port, rem_ip, rem_port)];
+         i != NO_ENTRY; i = n->pool[i].onext) {
+        const mapping_t *m = &n->pool[i];
+        if (m->proto == proto && m->nat_port == nat_port && m->rem_ip == rem_ip &&
+            m->rem_port == rem_port)
+            return i;
+    }
+    return NO_ENTRY;
+}
+
+/* A packet that may start a forwarded connection: a TCP SYN without ACK, or
+ * any UDP datagram. Anything else must belong to an existing one. */
+static bool starts_connection(const pkt_t *p)
+{
+    if (p->proto == FW_PROTO_UDP) return true;
+    return p->proto == FW_PROTO_TCP && (p->tcp_flags & (TCP_SYN | TCP_ACK)) == TCP_SYN;
 }
 
 static void release(nat_t *n, int32_t i)
@@ -220,7 +296,15 @@ static void release(nat_t *n, int32_t i)
     for (int32_t *link = &n->bucket[h]; *link != NO_ENTRY; link = &n->pool[*link].next) {
         if (*link == i) { *link = m->next; break; }
     }
-    n->rev[proto_index(m->proto)][m->nat_port - n->port_lo] = NO_ENTRY;
+    if (m->kind == MAP_SNAT) {
+        n->rev[proto_index(m->proto)][m->nat_port - n->port_lo] = NO_ENTRY;
+    } else {
+        const uint32_t o = hash_outside(n, m->proto, m->nat_port, m->rem_ip, m->rem_port);
+        for (int32_t *link = &n->obucket[o]; *link != NO_ENTRY; link = &n->pool[*link].onext) {
+            if (*link == i) { *link = m->onext; break; }
+        }
+    }
+    if (n->pending == i) n->pending = NO_ENTRY;
     m->proto = 0;
     m->next = n->free_head;
     n->free_head = i;
@@ -243,17 +327,19 @@ nat_t *nat_create(uint32_t addr, uint16_t port_lo, uint16_t port_hi)
 
     n->pool = fw_calloc(n->cap, sizeof *n->pool);
     n->bucket = fw_calloc(NAT_BUCKETS, sizeof *n->bucket);
-    bool ok = n->pool && n->bucket && fw_random(n->hash_key, sizeof n->hash_key);
+    n->obucket = fw_calloc(NAT_BUCKETS, sizeof *n->obucket);
+    bool ok = n->pool && n->bucket && n->obucket && fw_random(n->hash_key, sizeof n->hash_key);
     for (int pi = 0; ok && pi < PI_COUNT; pi++)
         ok = (n->rev[pi] = fw_calloc(n->nports, sizeof *n->rev[pi])) != NULL;
     if (!ok) { nat_destroy(n); return NULL; }
 
-    for (uint32_t b = 0; b < NAT_BUCKETS; b++) n->bucket[b] = NO_ENTRY;
+    for (uint32_t b = 0; b < NAT_BUCKETS; b++) n->bucket[b] = n->obucket[b] = NO_ENTRY;
     for (int pi = 0; pi < PI_COUNT; pi++)
         for (uint32_t s = 0; s < n->nports; s++) n->rev[pi][s] = NO_ENTRY;
     for (uint32_t i = 0; i < n->cap; i++)
         n->pool[i].next = i + 1 < n->cap ? (int32_t)(i + 1) : NO_ENTRY;
     n->free_head = 0;
+    n->pending = NO_ENTRY;
     return n;
 }
 
@@ -262,6 +348,7 @@ void nat_destroy(nat_t *n)
     if (!n) return;
     for (int pi = 0; pi < PI_COUNT; pi++) free(n->rev[pi]);
     free(n->bucket);
+    free(n->obucket);
     free(n->pool);
     free(n);
 }
@@ -306,6 +393,7 @@ nat_result_t nat_outbound(nat_t *n, uint8_t *buf, const pkt_t *p,
 nat_result_t nat_inbound(nat_t *n, uint8_t *buf, const pkt_t *p, uint64_t now_ns)
 {
     (void)now_ns;
+    n->pending = NO_ENTRY;
     if (p->dst_ip != n->addr) return NAT_PASS;
     const size_t ihl = (size_t)(buf[0] & 0x0f) * 4;
 
@@ -315,13 +403,12 @@ nat_result_t nat_inbound(nat_t *n, uint8_t *buf, const pkt_t *p, uint64_t now_ns
         pkt_t inner;
         int32_t i = NO_ENTRY;
         if (parse_icmp_inner(p, &inner) == PARSE_OK && inner.src_ip == n->addr)
-            i = by_nat_port(n, inner.proto, inner.src_port);
-        const mapping_t *m = i == NO_ENTRY ? NULL : &n->pool[i];
-        if (!m || m->rem_ip != inner.dst_ip ||
-            (inner.proto != FW_PROTO_ICMP && m->rem_port != inner.dst_port)) {
+            i = lookup_outside(n, inner.proto, inner.src_port, inner.dst_ip, inner.dst_port);
+        if (i == NO_ENTRY) {
             n->st.drop_no_mapping++;
             return NAT_NO_MAPPING;
         }
+        const mapping_t *m = &n->pool[i];
         rewrite_endpoint(buf, ihl, true, m->in_ip, 0);
         rewrite_endpoint(buf + ihl + 8, p->ip_len - ihl - 8, false, m->in_ip, m->in_port);
         icmp_recompute(buf);
@@ -330,17 +417,63 @@ nat_result_t nat_inbound(nat_t *n, uint8_t *buf, const pkt_t *p, uint64_t now_ns
         return NAT_TRANSLATED;
     }
 
-    const int32_t i = by_nat_port(n, p->proto, p->dst_port);
-    const mapping_t *m = i == NO_ENTRY ? NULL : &n->pool[i];
-    /* Only the remote endpoint the connection was opened to may answer. */
-    if (!m || m->rem_ip != p->src_ip ||
-        (p->proto != FW_PROTO_ICMP && m->rem_port != p->src_port)) {
+    int32_t i = lookup_outside(n, p->proto, p->dst_port, p->src_ip, p->src_port);
+    if (i == NO_ENTRY && starts_connection(p) && n->free_head != NO_ENTRY &&
+        !(p->dst_port >= n->port_lo && p->dst_port <= n->port_hi)) {
+        /* A new connection to a forwarded port. (A stale forward mapping
+         * for the same inside endpoints, from another external port before a
+         * reload, is replaced: replies could not tell the two apart.) */
+        const forward_t *fw = forward_for(n, p->proto, p->dst_port);
+        const int32_t old = fw ? find(n, p->proto, fw->ip, fw->port, p->src_ip, p->src_port)
+                               : NO_ENTRY;
+        /* The same endpoints already in use by a connection the inside host
+         * started (source NAT) can't be shared: refuse rather than break it. */
+        if (old != NO_ENTRY && n->pool[old].kind == MAP_SNAT) fw = NULL;
+        if (fw) {
+            if (old != NO_ENTRY) release(n, old);
+            i = take(n, p->proto, MAP_FWD, fw->ip, fw->port, p->src_ip, p->src_port,
+                     p->dst_port);
+            n->pending = i;
+            n->st.forwarded++;
+        }
+    }
+    if (i == NO_ENTRY) {
         n->st.drop_no_mapping++;
         return NAT_NO_MAPPING;
     }
+    const mapping_t *m = &n->pool[i];
     rewrite_endpoint(buf, p->ip_len, true, m->in_ip, m->in_port);
     n->st.translated_in++;
     return NAT_TRANSLATED;
+}
+
+void nat_undo_inbound(nat_t *n)
+{
+    if (n->pending == NO_ENTRY) return;
+    release(n, n->pending);          /* clears pending */
+    n->st.forwarded--;
+}
+
+bool nat_check_forwards(const nat_t *n, const forward_t *f, size_t nf,
+                        char *err, size_t errlen)
+{
+    for (size_t k = 0; k < nf; k++) {
+        if (f[k].ext_port >= n->port_lo && f[k].ext_port <= n->port_hi) {
+            if (err && errlen)
+                snprintf(err, errlen, "line %d: forward: port %u is in the source-NAT "
+                         "port range %u-%u; pick a port outside it", f[k].line,
+                         f[k].ext_port, n->port_lo, n->port_hi);
+            return false;
+        }
+    }
+    return true;
+}
+
+void nat_set_forwards(nat_t *n, const forward_t *f, size_t nf)
+{
+    if (nf > MAX_FORWARDS) nf = MAX_FORWARDS;
+    if (nf) memcpy(n->fwd, f, nf * sizeof *f);
+    n->nfwd = nf;
 }
 
 size_t nat_sweep(nat_t *n, nat_alive_fn alive, void *ud)
@@ -374,10 +507,11 @@ void nat_stats_print(const nat_t *n, FILE *out)
     fprintf(out,
             "nat:     addr=%u.%u.%u.%u mappings active=%llu created=%llu freed=%llu "
             "translated out=%llu in=%llu icmp-errors=%llu "
-            "dropped no-mapping=%llu full=%llu\n",
+            "dropped no-mapping=%llu full=%llu forwarded=%llu\n",
             n->addr >> 24, (n->addr >> 16) & 0xff, (n->addr >> 8) & 0xff, n->addr & 0xff,
             (unsigned long long)s->mappings_active, (unsigned long long)s->mappings_created,
             (unsigned long long)s->mappings_freed, (unsigned long long)s->translated_out,
             (unsigned long long)s->translated_in, (unsigned long long)s->icmp_errors_translated,
-            (unsigned long long)s->drop_no_mapping, (unsigned long long)s->drop_full);
+            (unsigned long long)s->drop_no_mapping, (unsigned long long)s->drop_full,
+            (unsigned long long)s->forwarded);
 }

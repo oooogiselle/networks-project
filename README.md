@@ -18,7 +18,7 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva |
 | `src/engine.c` | Fast path / slow path decision logic | Eva |
 | `src/log.c` | Per-flow logs, counters | Eva |
-| `include/nat.h`, `src/nat.c` | Source NAT with port translation: mapping table, RFC 1624 incremental checksums, ICMP error translation (`tunwall -n`) | Giselle |
+| `include/nat.h`, `src/nat.c` | Source NAT with port translation and port forwarding: mapping table, RFC 1624 incremental checksums, ICMP error translation (`tunwall -n`, `forward` rules) | Giselle |
 | `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Giselle |
 | `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Giselle |
@@ -119,7 +119,49 @@ router. This is the first optional feature from the spec (section 7).
   interface owns it). ICMP errors the firewall's own kernel sends to it are
   routed into `tun-out`, so `tunwall` translates them too.
 - **Counters.** SIGUSR1 and exit add a line:
-  `nat: addr= mappings active= created= freed= translated out= in= icmp-errors= dropped no-mapping= full=`.
+  `nat: addr= mappings active= created= freed= translated out= in= icmp-errors= dropped no-mapping= full= forwarded=`.
+
+### Port forwarding (`forward`)
+
+With source NAT on, the outside can't reach an inside server at all: its
+address is hidden. A `forward` line in the rules file publishes one port of the
+NAT address, like a home router's port forwarding:
+
+```
+inside  10.0.1.0/24
+forward tcp 8080 10.0.1.3 80        # 10.0.2.254:8080 from outside -> 10.0.1.3:80
+allow in tcp any 10.0.1.3 80        # the filter still has to allow it
+```
+
+- **What happens.** A new connection from the outside to `ADDR:8080` (a TCP
+  SYN, or a UDP datagram) gets a mapping, and its destination is rewritten to
+  `10.0.1.3:80` before `engine_decide()`. The server's replies are found by
+  that mapping and leave from `ADDR:8080`, so the client sees one consistent
+  peer. The client's own address is kept, so the server and the log show who
+  connected (`FLOW NEW tcp 10.0.2.3:51000 -> 10.0.1.3:80`).
+- **The filter still decides.** A forward only translates. The engine then
+  decides the connection like any other inbound one, so it needs an `allow in`
+  rule (in iptables terms, DNAT in the nat table plus ACCEPT in FORWARD). If the
+  engine refuses the first packet (no rule, a `deny`, a `reject`, or a full flow
+  table), or the write fails, the new mapping is removed at once, so refused
+  SYNs leave nothing behind. A `reject` here drops silently, since its answer
+  would leak the hidden inside address.
+- **Same table as source NAT.** Forward mappings live in the same preallocated
+  table. A forwarded port is shared by every client, so it has no slot in the
+  by-port array; instead forward mappings are also kept in a second keyed hash
+  by their outside side (protocol, port, client address and port), so inbound
+  packets are found in constant time, even after a reload changed the forward.
+  The external port must be outside the source-NAT range
+  (20000-59999), so the two never compete for a port. ICMP errors about a
+  forwarded connection are translated both ways, as for source NAT, and a
+  mapping is freed with its flow.
+- **Checks.** A forward needs `-n`, a single target address inside an `inside`
+  network, tcp or udp, and an external port no other forward uses (up to 16).
+  Any mistake is refused at start-up and on SIGHUP, naming the line, and a bad
+  reload keeps the old rules *and* forwards. Forwards changed by a reload apply
+  to new connections; open ones keep going to the server they started with.
+- **Limits.** No hairpinning (an inside host can't use `ADDR:8080` itself), no
+  forwarding of port ranges or ICMP, and forwards only work with `-n`.
 
 ## Tests
 
@@ -349,7 +391,8 @@ Ports may be a list of numbers and ranges (`80,443`, `22,8000-8100`; up to 8
 items). `inside <cidr>` declares the trusted network(s) and is required: it drives
 the address anti-spoofing check, and without it the firewall refuses to start.
 `out` = connection initiated from the inside (the default); `in` = initiated
-from the outside (exposed services).
+from the outside (exposed services). With source NAT on, `forward tcp|udp <port> <ip> <port>`
+publishes an inside service on the NAT address (see Port forwarding above).
 
 ### Reject rules
 
@@ -387,7 +430,7 @@ refused" in milliseconds instead of hanging. The shipped config rejects telnet
   inside users working, but there are no SYN cookies and no half-open limit
 - Application identification only labels flows: rules cannot match on
   the application, and a flow is never dropped for what it carries
-- Port forwarding (destination NAT) and endpoint-independent NAT mappings
-  (full-cone, for peer-to-peer). Source NAT is symmetric: one mapping per connection
+- Endpoint-independent NAT mappings (full-cone, for peer-to-peer). Source NAT
+  is symmetric: one mapping per connection. Port forwarding has no hairpinning
 - Multi-threaded or offload-aware packet handling (the profile shows the remaining
   cost is in the kernel, so it would take a different architecture)

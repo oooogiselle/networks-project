@@ -32,6 +32,15 @@
  *   identifier. All mappings are allocated up front; nothing is allocated
  *   per packet.
  *
+ * PORT FORWARDING (destination NAT)
+ *   nat_set_forwards() installs the rules file's `forward` lines. A new
+ *   connection from the outside to addr:ext_port (a TCP SYN or a UDP
+ *   datagram) gets a mapping like any other, with ext_port as its NAT port
+ *   and the forward's target as the inside endpoint, and is rewritten to the
+ *   target. Its replies are then found by nat_outbound() exactly like replies
+ *   of a source-NAT connection. External ports must lie outside the
+ *   source-NAT port range, so the two never compete for a port.
+ *
  * ICMP ERRORS
  *   An error about a translated connection is translated too: the outer
  *   address and the embedded original header (address, port, and their
@@ -48,6 +57,7 @@
 #include <stdio.h>
 
 #include "engine.h"
+#include "rules.h"
 
 #define NAT_PORT_LO_DEFAULT 20000
 #define NAT_PORT_HI_DEFAULT 59999
@@ -65,6 +75,7 @@ typedef struct nat_stats {
     uint64_t translated_out, translated_in;   /* packets rewritten each way */
     uint64_t icmp_errors_translated;          /* of those, ICMP errors      */
     uint64_t drop_no_mapping, drop_full;
+    uint64_t forwarded;                       /* port-forward connections made */
 } nat_stats_t;
 
 typedef struct nat nat_t;
@@ -96,6 +107,24 @@ nat_result_t nat_outbound(nat_t *n, uint8_t *buf, const pkt_t *p,
  * NAT_NO_MAPPING. buf must then be parsed again before engine_decide().
  */
 nat_result_t nat_inbound(nat_t *n, uint8_t *buf, const pkt_t *p, uint64_t now_ns);
+
+/*
+ * Undo the mapping the last nat_inbound() call created for a forwarded
+ * connection, if it did: call it when that packet is then not delivered (the
+ * engine refused it, or the write failed), so nothing is left behind.
+ */
+void nat_undo_inbound(nat_t *n);
+
+/*
+ * Port forwarding. nat_check_forwards() refuses (false, err names the line)
+ * a forward whose external port is in the source-NAT port range.
+ * nat_set_forwards() replaces the forwards with a copy of f[0..nf): new
+ * connections use the new list, existing ones keep their mappings. Call
+ * check first; set cannot fail (nf > MAX_FORWARDS is truncated).
+ */
+bool nat_check_forwards(const nat_t *n, const forward_t *f, size_t nf,
+                        char *err, size_t errlen);
+void nat_set_forwards(nat_t *n, const forward_t *f, size_t nf);
 
 /*
  * Free every mapping whose connection is over. alive(ud, t) is asked about
