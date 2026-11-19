@@ -17,6 +17,7 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva |
 | `src/engine.c` | Fast path / slow path decision logic | Eva |
 | `src/log.c` | Per-flow logs, counters | Eva |
+| `include/nat.h`, `src/nat.c` | Source NAT with port translation: mapping table, RFC 1624 incremental checksums, ICMP error translation (`tunwall -n`) | Giselle |
 | `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Giselle |
 | `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Giselle |
@@ -68,8 +69,50 @@ routing (plain kernel forwarding) as the benchmark baseline. `scripts/netns.sh
 up nat` adds a path to the real Internet for the demo: the outside namespace
 becomes a NAT gateway to the host. That changes the host while it is up (a veth
 pair, `ip_forward`, three iptables rules tagged `tunwall-demo`) and `down`
-removes exactly those and restores `ip_forward`. The NAT is plumbing for the
-demo, not part of `tunwall`: the firewall itself does no NAT.
+removes exactly those and restores `ip_forward`. That host NAT is plumbing for
+the demo; `tunwall`'s own source NAT is the `-n` option below.
+
+### Source NAT (`-n`)
+
+```
+sudo ip netns exec firewall build/tunwall -r config/rules.example.conf -n 10.0.2.254
+```
+
+With `-n ADDR`, connections started from the inside leave with the outside
+address `ADDR` and a port from 20000-59999 (for a ping, the echo identifier is
+translated instead), so the outside never sees inside addresses, as on a home
+router. This is the first optional feature from the spec (section 7).
+
+- **Where it happens.** NAT sits around the engine, not inside it. A packet
+  from the outside to `ADDR` is translated back to its inside host *before*
+  `engine_decide()`, and an allowed packet from the inside is translated
+  *after*. Rules, flow tracking, anti-spoofing and the logs therefore only ever
+  see real inside addresses, and none of them needed to change.
+- **Mappings.** There is one mapping per connection (5-tuple), and only the
+  remote endpoint the connection was opened to may answer it (endpoint-dependent
+  filtering, "symmetric" NAT). An unsolicited packet to `ADDR` is dropped
+  silently and counted as `no-mapping`. A mapping lives exactly as long as its
+  engine flow: the once-a-second sweep frees mappings whose flow has expired or
+  closed. All 65,536 mapping slots are allocated at start-up. The inside lookup
+  is a keyed (SipHash) hash, and the outside lookup is an array indexed by port,
+  so both directions take constant time and nothing is allocated per packet.
+  Connections the *outside* started, to an exposed service, are not translated.
+- **Checksums.** Changing an address or port updates the IP header checksum
+  and the TCP/UDP checksum (whose pseudo-header covers the addresses)
+  incrementally with RFC 1624 (`HC' = ~(~HC + ~m + m')`) rather than
+  recomputing them over the whole packet. A UDP checksum of 0 ("none") stays 0.
+- **ICMP errors.** An error about a translated connection is translated too.
+  That covers the outer address and the embedded original header (its address,
+  port and checksums), and then the ICMP checksum is recomputed. Path-MTU
+  discovery and traceroute therefore work through the NAT. This goes both ways:
+  an error from the outside is turned back towards the inside host, and an
+  inside host's error about a translated reply leaves from `ADDR`.
+- **The test address.** `scripts/netns.sh` sets aside 10.0.2.254: the outside
+  reaches it through the firewall's veth (a permanent neighbour entry, since no
+  interface owns it). ICMP errors the firewall's own kernel sends to it are
+  routed into `tun-out`, so `tunwall` translates them too.
+- **Counters.** SIGUSR1 and exit add a line:
+  `nat: addr= mappings active= created= freed= translated out= in= icmp-errors= dropped no-mapping= full=`.
 
 ## Tests
 
@@ -88,7 +131,18 @@ deterministic; replay or lengthen a run with
 the namespace topology against the real `tunwall` (curl with a SHA-256 match,
 DNS, ping, blocked inbound traffic that must be silently dropped rather than
 refused, nmap SYN/ACK/FIN/NULL/Xmas scans, exact log lines, flow expiry,
-kill-the-firewall). They need root, `nmap` and `python3`. CI sets
+source NAT, kill-the-firewall). The NAT section restarts `tunwall` with
+`-n 10.0.2.254` and removes the outside's route back to the inside, so replies
+can only come back through the NAT. It then checks that the outside sees
+connections from 10.0.2.254, that curl (SHA-256), ping and DNS work, that
+unsolicited packets to the NAT address are silently dropped, and that path MTU
+discovery works, which needs ICMP error translation.
+
+`tests/test_nat.c` checks every translated packet byte for byte against the
+same packet built from scratch with the translated addresses. The builder,
+`tests/pktbuild.c`, computes every checksum in full, so the incremental
+updates are proven exact for TCP, UDP (with and without a checksum), ICMP echo,
+and ICMP errors embedding truncated or whole TCP, UDP and echo packets. They need root, `nmap` and `python3`. CI sets
 `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
 `SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. `INTERNET=1`
 also builds the NAT path and tests the real Internet through the firewall (the
@@ -294,9 +348,9 @@ from the outside (exposed services).
 - TCP sequence-number validation (blind RST/injection protection)
 - Full SYN-flood protection: a per-source cap and an outside-flow quota keep
   inside users working, but there are no SYN cookies and no half-open limit
-- Source NAT in the firewall. Application identification only labels flows: rules cannot match on
+- Application identification only labels flows: rules cannot match on
   the application, and a flow is never dropped for what it carries
-- NAT inside `tunwall` itself (the demo's NAT to the Internet is done by the
-  host and the outside namespace, not by the firewall)
+- Port forwarding (destination NAT) and endpoint-independent NAT mappings
+  (full-cone, for peer-to-peer). Source NAT is symmetric: one mapping per connection
 - Multi-threaded or offload-aware packet handling (the profile shows the remaining
   cost is in the kernel, so it would take a different architecture)
