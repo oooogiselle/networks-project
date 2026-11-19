@@ -492,6 +492,33 @@ while True:
     dump_stats
     logged "flows are logged with the real inside address" 'FLOW NEW +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:8000 '
     logged "NAT counters are printed" "^nat: +addr=$NATIP mappings active=[0-9]+ created=[1-9][0-9]* .*translated out=[1-9][0-9]* in=[1-9][0-9]* icmp-errors=[1-9][0-9]* dropped no-mapping=[1-9][0-9]*"
+
+    echo "== reloading the rules without a restart (SIGHUP)"
+    reload_fw() { # reload_fw: send SIGHUP and wait until tunwall reports the outcome
+        local before i
+        before=$(grep -cE "^tunwall: (rules reloaded|reload failed)" "$LOGDIR/tunwall.log")
+        kill -HUP "$FW_PID"
+        for i in $(seq 1 50); do
+            [ "$(grep -cE "^tunwall: (rules reloaded|reload failed)" "$LOGDIR/tunwall.log")" -gt "$before" ] && return 0
+            sleep 0.1
+        done
+        bad "tunwall did not report a reload after SIGHUP"
+    }
+    # Nothing listens on 10.0.2.2:8080, so once the firewall lets the SYN
+    # through, the server's RST comes back: "refused" means allowed.
+    expect "before: inside to 10.0.2.2:8080 is dropped" timeout probe inside tcp 10.0.2.2 8080
+    cp "$LOGDIR/nat.conf" "$LOGDIR/nat.good"
+    echo 'allow out tcp  10.0.1.0/24 10.0.2.2 8080' >> "$LOGDIR/nat.conf"
+    reload_fw
+    logged "the reload is reported" "^tunwall: rules reloaded from .*nat\.conf"
+    expect "after SIGHUP: 10.0.2.2:8080 is allowed (the server's RST comes back)" refused probe inside tcp 10.0.2.2 8080
+    cp "$LOGDIR/nat.conf" "$LOGDIR/nat.good"
+    echo 'allow bogus' >> "$LOGDIR/nat.conf"
+    reload_fw
+    logged "a bad file is refused, naming its line" "^tunwall: reload failed, keeping the old rules: .*nat\.conf: line 7: "
+    check  "tunwall keeps running after a bad reload" pass kill -0 "$FW_PID"
+    expect "after a bad reload the old rules still apply" refused probe inside tcp 10.0.2.2 8080
+    cp "$LOGDIR/nat.good" "$LOGDIR/nat.conf"
 else
     bad "tunwall did not start with -n $NATIP"; cat "$LOGDIR/tunwall.log"
 fi
