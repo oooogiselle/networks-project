@@ -44,6 +44,7 @@ struct flowtable {
     uint8_t   hash_key[16];     /* secret: attackers cannot predict buckets */
     ft_expire_cb expire_hook;   /* sees flows removed lazily by ft_lookup */
     void     *expire_hook_ud;
+    flow_t   *ho_head, *ho_tail;   /* outside TCP flows, oldest first (ft_evict_halfopen) */
 };
 
 const char *tcp_state_str(tcp_state_t s)
@@ -185,9 +186,28 @@ void ft_destroy(flowtable_t *ft)
     free(ft);
 }
 
+static void ho_append(flowtable_t *ft, flow_t *f)
+{
+    f->ho_prev = ft->ho_tail;
+    f->ho_next = NULL;
+    if (ft->ho_tail) ft->ho_tail->ho_next = f; else ft->ho_head = f;
+    ft->ho_tail = f;
+    f->ho_linked = true;
+}
+
+static void ho_unlink(flowtable_t *ft, flow_t *f)
+{
+    if (!f->ho_linked) return;
+    if (f->ho_prev) f->ho_prev->ho_next = f->ho_next; else ft->ho_head = f->ho_next;
+    if (f->ho_next) f->ho_next->ho_prev = f->ho_prev; else ft->ho_tail = f->ho_prev;
+    f->ho_prev = f->ho_next = NULL;
+    f->ho_linked = false;
+}
+
 /* Return an already-unlinked slot to the free list. */
 static void release(flowtable_t *ft, flow_t *f)
 {
+    ho_unlink(ft, f);
     if (f->orig_dir == DIR_OUT && ft->count_out) ft->count_out--;
     if (ft->src) src_dec(ft, f->key.src_ip);
     f->next = ft->free_list;
@@ -274,7 +294,28 @@ flow_t *ft_insert_ex(flowtable_t *ft, const flow_key_t *k, dir_t orig_dir,
     ft->count++;
     if (orig_dir == DIR_OUT) ft->count_out++;
     if (ft->src) src_inc(ft, k->src_ip);
+    if (orig_dir == DIR_OUT && k->proto == FW_PROTO_TCP) ho_append(ft, f);
     return f;
+}
+
+bool ft_source_at_limit(const flowtable_t *ft, uint32_t src_ip)
+{
+    return ft->max_src && src_count(ft, src_ip) >= ft->max_src;
+}
+
+bool ft_evict_halfopen(flowtable_t *ft, ft_expire_cb cb, void *ud)
+{
+    while (ft->ho_head) {
+        flow_t *f = ft->ho_head;
+        if (f->tcp_state != TCPS_SYN_SENT && f->tcp_state != TCPS_SYN_RECV) {
+            ho_unlink(ft, f);                 /* handshake done: never a candidate again */
+            continue;
+        }
+        if (cb) cb(f, ud);
+        ft_remove(ft, f);                     /* unlinks it from the queue too */
+        return true;
+    }
+    return false;
 }
 
 size_t ft_expire(flowtable_t *ft, uint64_t now_ns, ft_expire_cb cb, void *ud)

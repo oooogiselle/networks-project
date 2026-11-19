@@ -53,6 +53,10 @@ void log_scan(uint32_t ip, unsigned nports, uint64_t span_ns, uint32_t block_s,
 /* INFO: ip's scan block ended; dropped = its packets dropped meanwhile. */
 void log_unblock(uint32_t ip, uint64_t dropped, uint64_t now_ns);
 
+/* INFO: under a SYN flood, n half-open connections were evicted in the last
+ * window_ns to admit new ones (one line per sweep at most). */
+void log_synflood(uint64_t n, uint64_t window_ns, uint64_t now_ns);
+
 /* DEBUG: a dropped packet. */
 void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns);
 

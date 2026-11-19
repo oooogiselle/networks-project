@@ -447,6 +447,95 @@ static void test_zero_capacity_table_refuses_everything(void)
     ft_destroy(ft);
 }
 
+
+/* ---- half-open eviction (SYN-flood relief) ------------------------------ */
+
+static flow_t *outside_tcp(flowtable_t *ft, uint32_t src, tcp_state_t st)
+{
+    flow_key_t k = K(src, 4000, IP(10,0,1,3), 22);
+    flow_t *f = ft_insert(ft, &k, DIR_OUT, 0);
+    if (f) { f->tcp_state = st; f->expires_ns = 100 * SEC; }
+    return f;
+}
+
+static int evicted_n;
+static uint32_t evicted_src;
+static void on_evict(const flow_t *f, void *ud) { (void)ud; evicted_n++; evicted_src = f->key.src_ip; }
+
+static void test_evict_takes_the_oldest_half_open_outside_flow(void)
+{
+    flowtable_t *ft = ft_create(64, 100);
+    outside_tcp(ft, IP(198,18,0,1), TCPS_SYN_SENT);
+    outside_tcp(ft, IP(198,18,0,2), TCPS_SYN_RECV);
+    outside_tcp(ft, IP(198,18,0,3), TCPS_SYN_SENT);
+    evicted_n = 0;
+    CHECK(ft_evict_halfopen(ft, on_evict, NULL));
+    CHECK(evicted_n == 1 && evicted_src == IP(198,18,0,1));   /* oldest first */
+    CHECK(ft_count(ft) == 2);
+    CHECK(ft_evict_halfopen(ft, on_evict, NULL));
+    CHECK(evicted_src == IP(198,18,0,2));                     /* SYN_RECV is half-open too */
+    CHECK(ft_evict_halfopen(ft, NULL, NULL));
+    CHECK(ft_count(ft) == 0);
+    CHECK(!ft_evict_halfopen(ft, on_evict, NULL));            /* nothing left */
+    CHECK(evicted_n == 2);
+    ft_destroy(ft);
+}
+
+static void test_evict_never_takes_established_inside_or_udp_flows(void)
+{
+    flowtable_t *ft = ft_create(64, 100);
+    flow_t *est = outside_tcp(ft, IP(198,18,0,1), TCPS_SYN_SENT);
+    outside_tcp(ft, IP(198,18,0,2), TCPS_SYN_SENT);
+    est->tcp_state = TCPS_ESTABLISHED;            /* completed after being queued */
+    outside_tcp(ft, IP(198,18,0,3), TCPS_TIME_WAIT);
+    flow_key_t in = K(IP(10,0,1,2), 5000, IP(1,2,3,4), 80);
+    flow_t *fi = ft_insert(ft, &in, DIR_IN, 0);
+    fi->tcp_state = TCPS_SYN_SENT;               /* inside half-open: never evicted */
+    flow_key_t u = { IP(198,18,0,4), IP(10,0,1,3), 4000, 53, FW_PROTO_UDP };
+    ft_insert(ft, &u, DIR_OUT, 0);
+    evicted_n = 0;
+    CHECK(ft_evict_halfopen(ft, on_evict, NULL));
+    CHECK(evicted_src == IP(198,18,0,2));         /* skipped the established one */
+    CHECK(!ft_evict_halfopen(ft, on_evict, NULL));
+    CHECK(evicted_n == 1);
+    CHECK(ft_count(ft) == 4);                     /* established, time-wait, inside, udp */
+    bool r;
+    CHECK(ft_lookup(ft, &est->key, SEC, &r) == est);
+    ft_destroy(ft);
+}
+
+static void test_removed_flows_leave_the_queue(void)
+{
+    flowtable_t *ft = ft_create(64, 100);
+    flow_t *a = outside_tcp(ft, IP(198,18,0,1), TCPS_SYN_SENT);
+    flow_t *b = outside_tcp(ft, IP(198,18,0,2), TCPS_SYN_SENT);
+    flow_t *c = outside_tcp(ft, IP(198,18,0,3), TCPS_SYN_SENT);
+    ft_remove(ft, b);                             /* the middle */
+    ft_remove(ft, a);                             /* the head */
+    b = outside_tcp(ft, IP(198,18,0,4), TCPS_SYN_SENT);   /* slot reused, queued at the tail */
+    (void)c; (void)b;
+    CHECK(ft_expire(ft, 100 * SEC, NULL, NULL) == 2);     /* the sweep unlinks too */
+    CHECK(!ft_evict_halfopen(ft, NULL, NULL));
+    outside_tcp(ft, IP(198,18,0,5), TCPS_SYN_SENT);
+    evicted_n = 0;
+    CHECK(ft_evict_halfopen(ft, on_evict, NULL) && evicted_src == IP(198,18,0,5));
+    ft_destroy(ft);
+}
+
+static void test_source_at_limit(void)
+{
+    flowtable_t *ft = ft_create(64, 100);
+    CHECK(!ft_source_at_limit(ft, IP(198,18,0,1)));           /* no limit set */
+    CHECK(ft_set_limits(ft, 2, 0));
+    outside_tcp(ft, IP(198,18,0,1), TCPS_SYN_SENT);
+    CHECK(!ft_source_at_limit(ft, IP(198,18,0,1)));
+    flow_key_t k = K(IP(198,18,0,1), 4001, IP(10,0,1,3), 22);
+    ft_insert(ft, &k, DIR_OUT, 0);
+    CHECK(ft_source_at_limit(ft, IP(198,18,0,1)));
+    CHECK(!ft_source_at_limit(ft, IP(198,18,0,2)));
+    ft_destroy(ft);
+}
+
 int main(void)
 {
     RUN(test_insert_and_lookup_both_directions);
@@ -469,5 +558,9 @@ int main(void)
     RUN(test_slots_are_reused_not_reallocated);
     RUN(test_churn_never_exceeds_capacity);
     RUN(test_zero_capacity_table_refuses_everything);
+    RUN(test_evict_takes_the_oldest_half_open_outside_flow);
+    RUN(test_evict_never_takes_established_inside_or_udp_flows);
+    RUN(test_removed_flows_leave_the_queue);
+    RUN(test_source_at_limit);
     TEST_DONE();
 }

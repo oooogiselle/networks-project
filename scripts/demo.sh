@@ -17,7 +17,7 @@
 #                                         (no tmux), then tear down; exit 0 = ok
 #                scripts/demo.sh stop     tear everything down (safe any time)
 #
-#              It needs sudo (namespaces), tmux, nmap, dig, curl, and the host
+#              It needs sudo (namespaces), tmux, nmap, hping3, dig, curl, and the host
 #              must be online. It changes the HOST temporarily (a veth pair,
 #              ip_forward and three iptables rules tagged "tunwall-demo"); stop
 #              removes exactly those. Set DEMO_UPSTREAM_DNS to use another
@@ -67,7 +67,7 @@ stop() {
 
 # Topology + Internet path + the little servers the demo talks to.
 setup() {
-    need nmap "apt install nmap"; need dig "apt install dnsutils"; need curl curl
+    need nmap "apt install nmap"; need hping3 "apt install hping3"; need dig "apt install dnsutils"; need curl curl
     need python3 python3; need sudo sudo
     sudo -n true 2>/dev/null || sudo -v || exit 1      # cache the password now, not mid-demo
     make -s tunwall || { echo "demo.sh: the build failed" >&2; exit 1; }

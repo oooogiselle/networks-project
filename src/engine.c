@@ -52,6 +52,9 @@ struct engine {
     bool         reclaimed_once;
     uint64_t     reject_window_ns;   /* start of the current REJECTS_PER_SEC window */
     unsigned     rejects_in_window;
+    uint64_t     evicted_since_sweep;   /* for the once-a-second SYNFLOOD line */
+    uint64_t     last_sweep_ns;         /* 0 until the first engine_expire() */
+    uint64_t     first_evict_ns;        /* first eviction since the last sweep */
     /* The existing flow the last engine_decide() changed, and a copy of it as
      * it was before, so engine_undo_new_flow() can put it back if the packet
      * is never delivered. NULL when the last decision changed no flow. */
@@ -420,6 +423,17 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
     f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);
     if (!f && reclaim_expired(e, now_ns))     /* timed-out flows may be holding the room */
         f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);
+    /* SYN flood: forged SYNs fill the room with connections that will never
+     * complete. Push out the oldest one, as Linux does with its SYN backlog,
+     * so real clients still get in. Only an outside TCP flow that never
+     * finished its handshake is ever evicted, and never to make room for a
+     * source that is over its own cap. */
+    if (!f && (why == FT_FULL || why == FT_OUTSIDE_QUOTA) &&
+        !ft_source_at_limit(e->ft, p->src_ip) && ft_evict_halfopen(e->ft, NULL, NULL)) {
+        e->st.flows_evicted++;
+        if (e->evicted_since_sweep++ == 0) e->first_evict_ns = now_ns;
+        f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);
+    }
     if (!f)
         return do_drop(e, p, dir, now_ns,
                        why == FT_SRC_LIMIT      ? DROP_SRC_LIMIT :
@@ -477,6 +491,12 @@ static void unblock_cb(uint32_t ip, uint64_t dropped, void *ud)
 size_t engine_expire(engine_t *e, uint64_t now_ns)
 {
     e->clock_ns = now_ns;
+    if (e->evicted_since_sweep) {
+        const uint64_t since = e->last_sweep_ns ? e->last_sweep_ns : e->first_evict_ns;
+        log_synflood(e->evicted_since_sweep, now_ns - since, now_ns);
+        e->evicted_since_sweep = 0;
+    }
+    e->last_sweep_ns = now_ns;
     if (e->scan) scan_expire(e->scan, now_ns, unblock_cb, e);
     return ft_expire(e->ft, now_ns, expire_cb, e);
 }
@@ -502,9 +522,14 @@ bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_n
          * payload was and has already been counted and logged. */
         flow_t *u = e->undo_flow;
         flow_t *next = u->next;
+        flow_t *ho_prev = u->ho_prev, *ho_next = u->ho_next;
+        const bool ho_linked = u->ho_linked;
         const uint8_t app = u->app, app_tries = u->app_tries;
         *u = e->undo_copy;
         u->next = next;
+        u->ho_prev = ho_prev;          /* the half-open queue links, like the chain */
+        u->ho_next = ho_next;
+        u->ho_linked = ho_linked;
         u->app = app;
         u->app_tries = app_tries;
         if (e->undo_icmp_related) e->st.icmp_related--;

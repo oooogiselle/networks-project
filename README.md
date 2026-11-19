@@ -14,10 +14,10 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `include/reject.h`, `src/reject.c` | Builds the answer to a `reject` rule: a TCP RST or an ICMP unreachable, with checksums (pure function) | Giselle |
 | `include/nat.h`, `src/nat.c` | Source NAT with port translation and port forwarding: mapping table, RFC 1624 incremental checksums, ICMP error translation (`tunwall -n`, `forward` rules) | Giselle |
 | `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | Eva |
-| `src/flowtable.c` | 5-tuple hash table, expiry | Eva |
+| `src/flowtable.c` | 5-tuple hash table, expiry | Eva; half-open eviction queue for SYN-flood relief: Giselle |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines: Giselle |
-| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection hooks: Giselle |
+| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection and SYN-flood hooks: Giselle |
 | `src/log.c` | Per-flow logs, counters | Eva |
 | `include/scandetect.h`, `src/scandetect.c` | Port-scan detection: distinct ports per outside host in a sliding window, temporary blocking (`tunwall -s`) | Giselle |
 | `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Eva; NAT, port forwarding and reject hooks: Giselle |
@@ -210,6 +210,39 @@ affected.
   legitimate outside host blocked for 60 s by faking a scan from its address.
   An allowlist of never-blocked hosts would fix this.
 
+### SYN-flood relief
+
+A SYN flood from many forged source addresses would fill the table with
+**half-open** connections (a SYN with no completed handshake), each living
+30 s, and shut real clients out of the exposed services. The per-source cap
+does not help when every source is different, and the connections have not
+timed out yet, so sweeping them does not free room either.
+
+When a new connection is refused because the table is full or the outside
+share is used up, tunwall **evicts the oldest outside connection that never
+finished its handshake** and admits the new one, exactly as the Linux kernel
+drops the oldest entry from a full SYN backlog. Established connections and
+connections started from the inside are never evicted; nor is anything evicted
+to make room for a source that is already over its own per-source cap. It is
+always on, costs nothing on the fast path, and only ever turns a refusal into
+an admission. The outside-started connections are kept in a FIFO queue
+(`ft_evict_halfopen` in `src/flowtable.c`); entries that completed their
+handshake are dropped from the queue as they are passed over, so each eviction
+is O(1) amortized.
+
+Under a flood the counters show `flows: ... evicted=N`, and once a second (not
+per packet, which at flood rates would just trip the log limiter) a summary
+line is written: `SYNFLOOD table under pressure: evicted N half-open
+connections in the last 1.0s to admit new ones`.
+
+Not done, and why: **SYN cookies** would need the firewall to answer the SYN
+itself (a SYN proxy), since it is a middlebox, not the connection's endpoint.
+A real handshake must still complete within roughly `3/4 of the table / flood
+rate` (about 0.3 s at ~170k SYN/s) before its own half-open entry is evicted —
+the Linux SYN backlog has the same property. A **UDP** flood to an allowed port
+is not covered: UDP has no handshake that tells a real datagram from a forged
+one.
+
 ## Tests
 
 Line coverage of the library (everything in `src/` except `main.c` and
@@ -228,8 +261,8 @@ the namespace topology against the real `tunwall` (curl with a SHA-256 match,
 DNS, ping, blocked inbound traffic that must be silently dropped rather than
 refused, reject rules, nmap SYN/ACK/FIN/NULL/Xmas scans, application
 identification, exact log lines, flow expiry, TTL and path MTU, source NAT,
-port forwarding, SIGHUP reload, kill-the-firewall). They need root, `nmap` and
-`python3`.
+port forwarding, SYN-flood relief, SIGHUP reload, kill-the-firewall). They
+need root, `nmap`, `hping3` and `python3`.
 - **Source NAT.** The section restarts `tunwall` with `-n 10.0.2.254` and removes
   the outside's route back to the inside, so replies can only come back through
   the NAT. It checks that the outside sees connections from 10.0.2.254, that curl
@@ -409,9 +442,12 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
    many spoofed sources, which a per-source cap alone cannot stop. When the
    table is full, flows that already timed out are
    swept out first (at most once per second, so a flood cannot make every
-   packet pay for a scan); if it is still full, new connections are refused and
-   existing ones keep working. A finished TCP connection (TIME_WAIT or CLOSED)
-   is not kept alive by traffic and cannot carry data.
+   packet pay for a scan); failing that, under a SYN flood the oldest outside
+   connection that never finished its handshake is evicted so real clients
+   still get in (see [SYN-flood relief](#syn-flood-relief)); if it is still
+   full, new connections are refused and existing ones keep working. A finished
+   TCP connection (TIME_WAIT or CLOSED) is not kept alive by traffic and cannot
+   carry data.
    A packet that was allowed but could not be written to the other side does
    not leave a flow behind (`write-failed`). Because the kernel takes 1 off
    the TTL when it routes a packet into the tun device and again when it routes
@@ -497,8 +533,6 @@ refused" in milliseconds instead of hanging. The shipped config rejects telnet
 ## Not done yet / ideas
 
 - TCP sequence-number validation (blind RST/injection protection)
-- Full SYN-flood protection: a per-source cap and an outside-flow quota keep
-  inside users working, but there are no SYN cookies and no half-open limit
 - Application identification only labels flows: rules cannot match on
   the application, and a flow is never dropped for what it carries
 - Endpoint-independent NAT mappings (full-cone, for peer-to-peer). Source NAT
