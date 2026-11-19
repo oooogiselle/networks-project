@@ -482,6 +482,10 @@ while True:
     # Path MTU through NAT: the firewall's kernel reports "fragmentation
     # needed" to the translated source; tunwall must translate the ICMP error
     # (its embedded header included) back to the inside host.
+    # The earlier MTU test left a cached path MTU for 10.0.2.2 in the inside
+    # namespace; without flushing it the client would refuse the big packet
+    # itself and this check would pass without any ICMP error crossing NAT.
+    ip -n inside route flush cache
     ip -n firewall link set veth-out mtu 1400
     expect "through NAT, a DF packet that fits the 1400-byte link passes"   reply mtu_probe 1372
     expect "through NAT, a larger DF packet is told 'fragmentation needed'" frag-needed mtu_probe 1400
