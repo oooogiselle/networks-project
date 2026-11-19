@@ -7,24 +7,30 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 
 ## Layout
 
-| Path | Module | Owner |
+| Path | Module | Written by |
 |---|---|---|
 | `include/engine.h` | Shared interface: `pkt_t`, `engine_decide()` | shared |
 | `include/parser.h`, `src/parser.c` | Packet parse + checksums → `pkt_t` | Giselle |
 | `include/reject.h`, `src/reject.c` | Builds the answer to a `reject` rule: a TCP RST or an ICMP unreachable, with checksums (pure function) | Giselle |
-| `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | shared |
+| `include/nat.h`, `src/nat.c` | Source NAT with port translation and port forwarding: mapping table, RFC 1624 incremental checksums, ICMP error translation (`tunwall -n`, `forward` rules) | Giselle |
+| `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | Eva |
 | `src/flowtable.c` | 5-tuple hash table, expiry | Eva |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
-| `src/rules.c` | Rule file parser + first-match evaluation | Eva |
-| `src/engine.c` | Fast path / slow path decision logic | Eva |
+| `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines: Giselle |
+| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload: Giselle |
 | `src/log.c` | Per-flow logs, counters | Eva |
-| `include/nat.h`, `src/nat.c` | Source NAT with port translation and port forwarding: mapping table, RFC 1624 incremental checksums, ICMP error translation (`tunwall -n`, `forward` rules) | Giselle |
-| `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Giselle |
-| `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Giselle |
-| `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Giselle |
-| `bench/` | iperf3 and latency-percentile benchmark (`run_bench.sh`, `summary.py`), the CPU profile (`profile.sh`), and the rule files | Giselle |
-| `scripts/demo.sh`, `scripts/demo_steps.sh`, `scripts/demo_log.awk`, `scripts/dns_forwarder.py` | The recorded demo: a tmux window with the live firewall log above and narrated, self-checking steps below, using the real Internet (see `DEMO.md`) | shared |
-| `tests/` | Unit tests (`tests/pktbuild.c` builds real wire packets) | shared |
+| `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Eva; NAT, port forwarding and reject hooks: Giselle |
+| `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Eva; `-n` and SIGHUP reload: Giselle |
+| `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Eva; the NAT test address: Giselle |
+| `bench/` | iperf3 and latency-percentile benchmark (`run_bench.sh`, `summary.py`), the CPU profile (`profile.sh`), and the rule files | Eva |
+| `scripts/demo.sh`, `scripts/demo_steps.sh`, `scripts/demo_log.awk`, `scripts/dns_forwarder.py` | The recorded demo: a tmux window with the live firewall log above and narrated, self-checking steps below, using the real Internet (see `DEMO.md`) | Eva |
+| `tests/` | Unit tests (`tests/pktbuild.c`, by Giselle, builds real wire packets); each module's tests are by its author | shared |
+| `tests/integration/run_all.sh` | End-to-end tests in the namespace topology | Eva; NAT, port forwarding and reload sections: Giselle |
+
+The first plan gave the tun I/O, the namespace topology and the benchmarks to
+Giselle. Eva's versions of those were merged first (#6), so Giselle's own
+harness was kept as a record in draft PR #11 rather than merged. Giselle then
+took the parser, reject rules, source NAT, port forwarding and rule reload.
 
 ## Build and test
 
@@ -44,7 +50,8 @@ sudo ip netns exec inside curl http://10.0.2.2/   # in another terminal
 sudo scripts/netns.sh down
 ```
 
-`tunwall -r <rules> [-i tun-in] [-o tun-out] [-f | -q]`. By default every flow
+`tunwall -r <rules> [-i tun-in] [-o tun-out] [-n ADDR] [-f | -q]` (`-n`
+turns on source NAT, below). By default every flow
 open/close and every dropped packet (with its reason) is logged to stderr. The
 logging is rate-limited to 1000 lines per second (bursts of 1000, shared by all
 kinds of line) so a flood or a scan cannot turn into a flood of log writes; when
@@ -179,20 +186,24 @@ deterministic; replay or lengthen a run with
 `make tunwall && sudo tests/integration/run_all.sh` runs the end-to-end tests in
 the namespace topology against the real `tunwall` (curl with a SHA-256 match,
 DNS, ping, blocked inbound traffic that must be silently dropped rather than
-refused, nmap SYN/ACK/FIN/NULL/Xmas scans, exact log lines, flow expiry,
-source NAT, kill-the-firewall). The NAT section restarts `tunwall` with
-`-n 10.0.2.254` and removes the outside's route back to the inside, so replies
-can only come back through the NAT. It then checks that the outside sees
-connections from 10.0.2.254, that curl (SHA-256), ping and DNS work, that
-unsolicited packets to the NAT address are silently dropped, and that path MTU
-discovery works, which needs ICMP error translation.
+refused, reject rules, nmap SYN/ACK/FIN/NULL/Xmas scans, application
+identification, exact log lines, flow expiry, TTL and path MTU, source NAT,
+port forwarding, SIGHUP reload, kill-the-firewall). They need root, `nmap` and
+`python3`.
+- **Source NAT.** The section restarts `tunwall` with `-n 10.0.2.254` and removes
+  the outside's route back to the inside, so replies can only come back through
+  the NAT. It checks that the outside sees connections from 10.0.2.254, that curl
+  (SHA-256), ping and DNS work, that unsolicited packets to the NAT address are
+  silently dropped, and that path MTU discovery works, which needs ICMP error
+  translation.
+- **Port forwarding.** The outside reaches an inside server through
+  `10.0.2.254:8080`, the server sees the real client address, and a port nobody
+  forwards stays silently dropped.
+- **Reload.** Appending a rule and sending SIGHUP opens a port that was dropped.
+  A broken file is refused, `tunwall` keeps running, and the old rules still
+  apply.
 
-`tests/test_nat.c` checks every translated packet byte for byte against the
-same packet built from scratch with the translated addresses. The builder,
-`tests/pktbuild.c`, computes every checksum in full, so the incremental
-updates are proven exact for TCP, UDP (with and without a checksum), ICMP echo,
-and ICMP errors embedding truncated or whole TCP, UDP and echo packets. They need root, `nmap` and `python3`. CI sets
-`REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
+CI sets `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
 `SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. `INTERNET=1`
 also builds the NAT path and tests the real Internet through the firewall (the
 same page, byte for byte, as the host fetches directly; non-web ports dropped;
@@ -200,6 +211,18 @@ flows labelled; and that tearing down restores the host). It needs the host to
 be online, so it is off by default and CI does not run it. The suite fails when the firewall
 is wrong: with the slow tests skipped, an allow-nothing policy fails 26 checks and an
 allow-everything policy fails 16.
+
+`tests/test_nat.c` checks every translated packet byte for byte against the
+same packet built from scratch with the translated addresses. The builder,
+`tests/pktbuild.c`, computes every checksum in full, so the incremental
+updates are proven exact for TCP, UDP (with and without a checksum), ICMP echo,
+and ICMP errors embedding truncated or whole TCP, UDP and echo packets, both
+for source NAT and for port forwarding. `tests/test_reload.c` checks that
+swapped rules govern new connections while existing flows keep going, and that
+a bad file (syntax error, no `inside` network, missing) changes nothing.
+`tests/test_reject.c` checks each reject answer (RST, port unreachable,
+administratively prohibited), and that RSTs and ICMP errors are
+never answered.
 
 ### Benchmarks
 
