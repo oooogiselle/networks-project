@@ -441,6 +441,62 @@ if [ -n "${INTERNET:-}" ]; then
     fi
 fi
 
+echo "== source NAT (tunwall -n 10.0.2.254)"
+# Restart the firewall with source NAT on and its own rule file (the example
+# rules plus TCP 8000, for a server that reports who connected to it). The
+# outside loses its route back to the inside, so a reply can only come back
+# through the NAT address: if translation failed, nothing would work.
+NATIP=10.0.2.254
+cp "$LOGDIR/tunwall.log" "$LOGDIR/tunwall-before-nat.log"
+kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""
+printf '%s\n' 'inside 10.0.1.0/24' \
+    'allow out tcp  10.0.1.0/24 any 80,443,8000' \
+    'allow out udp  10.0.1.0/24 10.0.2.2 53' \
+    'allow out icmp 10.0.1.0/24 any echo' \
+    'allow in  tcp  any 10.0.1.3 22' > "$LOGDIR/nat.conf"
+SAVED_RULES=$RULES; SAVED_ARGS=$TUNWALL_ARGS
+RULES=$LOGDIR/nat.conf; TUNWALL_ARGS="$TUNWALL_ARGS -n $NATIP"
+if start_fw; then
+    ok "tunwall starts with source NAT"
+    logged "it says NAT is on" "^tunwall: running .*source NAT to $NATIP"
+    ip -n outside route replace unreachable 10.0.1.0/24
+    expect "control: the outside cannot reach the inside directly any more" unreachable probe outside tcp 10.0.1.3 22
+
+    # A server that answers each connection with the address it came from.
+    bg ip netns exec outside python3 -c '
+import socket
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(("10.0.2.2",8000)); s.listen(8)
+while True:
+    c,a=s.accept(); c.sendall(a[0].encode()); c.close()'
+    wait_listen outside tcp 10.0.2.2 8000 "the who-am-i server"
+    peer=$(inside python3 -c 'import socket; s=socket.create_connection(("10.0.2.2",8000),5); print(s.recv(64).decode())' 2>/dev/null)
+    [ "$peer" = "$NATIP" ] && ok "the outside sees the connection come from $NATIP, not the inside host" \
+                           || bad "the outside saw the connection come from '${peer:-nothing}', wanted $NATIP"
+    check  "inside curl downloads the page through NAT"        pass inside curl -sf --max-time 5 -o "$LOGDIR/got-nat.bin" http://10.0.2.2/index.bin
+    check  "the page is byte for byte the same (sha256)"       pass same_sha256 "$SRV/index.bin" "$LOGDIR/got-nat.bin"
+    expect "ping through NAT gets replies"                      reply icmp_probe inside 10.0.2.2
+    expect "DNS (UDP) through NAT gets an answer"               reply probe inside udp 10.0.2.2 53
+    expect "an unsolicited connection to the NAT address is silently dropped" timeout probe outside tcp $NATIP 22
+    expect "an unsolicited ping to the NAT address is silently dropped"       timeout icmp_probe outside $NATIP
+    # Path MTU through NAT: the firewall's kernel reports "fragmentation
+    # needed" to the translated source; tunwall must translate the ICMP error
+    # (its embedded header included) back to the inside host.
+    ip -n firewall link set veth-out mtu 1400
+    expect "through NAT, a DF packet that fits the 1400-byte link passes"   reply mtu_probe 1372
+    expect "through NAT, a larger DF packet is told 'fragmentation needed'" frag-needed mtu_probe 1400
+    ip -n firewall link set veth-out mtu 1500
+    ip -n outside route replace 10.0.1.0/24 via 10.0.2.1
+    expect "the exposed service still works with NAT on (not translated)" open probe outside tcp 10.0.1.3 22
+
+    dump_stats
+    logged "flows are logged with the real inside address" 'FLOW NEW +tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:8000 '
+    logged "NAT counters are printed" "^nat: +addr=$NATIP mappings active=[0-9]+ created=[1-9][0-9]* .*translated out=[1-9][0-9]* in=[1-9][0-9]* icmp-errors=[1-9][0-9]* dropped no-mapping=[1-9][0-9]*"
+else
+    bad "tunwall did not start with -n $NATIP"; cat "$LOGDIR/tunwall.log"
+fi
+RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID"; rc=$?; FW_PID=""
 [ "$rc" = 0 ] && ok "tunwall exits 0 on SIGTERM" || bad "tunwall exited $rc on SIGTERM"
