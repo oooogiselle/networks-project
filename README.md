@@ -16,19 +16,55 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva |
 | `src/engine.c` | Fast path / slow path decision logic | Eva |
 | `src/log.c` | Per-flow logs, counters | Eva |
-| `src/tun_io.c`, `src/main.c` | tun devices, I/O loop | Giselle (TODO) |
-| `scripts/` | Namespace harness, benchmarks | Giselle (TODO) |
+| `include/pipeline.h`, `src/pipeline.c` | Raw bytes → parse → engine; parse-drop counters | Giselle |
+| `src/tun_io.c`, `src/main.c` | TUN devices, poll() I/O loop, signals (Linux) | Giselle |
+| `scripts/` | Namespace harness, test servers, diagnostics | Giselle |
 | `tests/` | Unit tests (`tests/pktbuild.c` builds real wire packets) | shared |
+| `tests/integration/` | End-to-end tests on the namespace network | shared |
 
 ## Build and test
 
 ```
-make          # builds build/libfwengine.a (parser + engine)
+make          # builds build/libfwengine.a, plus ./tunwall on Linux
 make test     # unit tests (run on macOS or Linux, no root needed)
 make asan     # same tests under AddressSanitizer + UBSan
 ```
 
 On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
+
+## Running on the VM (Linux, root)
+
+One-time tools: `sudo apt-get install -y iproute2 iputils-ping curl dnsutils
+nmap dnsmasq-base ethtool python3` (the scripts tell you if anything is missing).
+
+```
+make
+sudo tests/integration/run.sh          # full end-to-end test (~1 min)
+sudo SLOW=1 tests/integration/run.sh   # also checks idle-flow expiry (+40 s)
+```
+
+If something fails, the run prints `scripts/ns_diag.sh` output and the
+tunwall log: paste the whole thing when asking for help.
+
+By hand:
+
+```
+sudo scripts/ns_setup.sh               # inside / fw / outside namespaces
+sudo scripts/servers.sh start          # HTTP + DNS on 10.0.2.2, listeners on 10.0.1.3:22/3389
+sudo ip netns exec fw ./tunwall -r config/rules.example.conf -v
+
+# in another terminal
+sudo ip netns exec inside curl http://10.0.2.2/
+sudo ip netns exec inside ping -I 10.0.1.2 10.0.2.2
+sudo ip netns exec outside nmap -Pn -S 10.0.2.3 -e eth0 -p 20-25,3389 10.0.1.3
+sudo ip netns exec fw pkill -USR1 tunwall   # print counters
+sudo scripts/ns_diag.sh                # dump routing state
+sudo scripts/ns_teardown.sh            # remove everything
+```
+
+Until tunwall is running (or after it dies), nothing crosses between inside
+and outside: `fw` routes all inside/outside traffic into the TUN devices and
+has blackhole rules behind them.
 
 ## How a packet is decided
 
@@ -62,8 +98,9 @@ from the outside (exposed services).
   side done via `parse_icmp_inner()`, engine side TODO)
 - Address-based anti-spoofing: outside packets claiming an inside source, and
   inside packets with a non-inside source (spec item 7)
-- Parse failures counted/logged alongside engine drop reasons (spec item 8)
 - Comma-separated port lists in rules (`80,443`, as in the spec example)
+- Established TCP idle timeout is 300 s; the spec says 1 hour (item 5)
+- Benchmarks (iperf3/ping vs kernel forwarding) and perf profiling
 - TCP sequence-number validation (blind RST/injection protection)
 - SYN-flood protection (SYN cookies / half-open limits)
 - Application identification (HTTP/DNS by payload) or source NAT
