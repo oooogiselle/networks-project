@@ -130,6 +130,10 @@ static void test_nmap_style_scans_dropped(void)
     engine_get_stats(e, &s);
     CHECK(s.flows_created == 0);       /* scans never allocate state */
     CHECK(s.flows_active == 0);
+    CHECK(s.scans_detected == 1);      /* and the scanner is cut off after 20 ports */
+    CHECK(s.hosts_blocked == 1);
+    CHECK(s.drops[DROP_NO_RULE] == SCAN_DEFAULT_PORTS);
+    CHECK(s.drops[DROP_SCAN_BLOCKED] == 1024 - SCAN_DEFAULT_PORTS + sizeof odd);
     engine_destroy(e);
 }
 
@@ -1636,6 +1640,202 @@ static void test_answers_to_reject_rules_are_rate_limited(void)
     engine_destroy(e);
 }
 
+/* ---- port-scan detection ------------------------------------------------- */
+
+#define OTHER_OUT IP(203,0,113,9)
+static const char *EXPOSE_SSH =
+    "allow in tcp from any to 10.0.0.3 port 22\n"
+    "allow out tcp from 10.0.0.0/24 to any port 80\n";
+
+/* SYNs from src to CLIENT_B ports first..first+n-1 at time t. */
+static void syn_sweep(engine_t *e, uint32_t src, uint16_t first, int n, uint64_t t)
+{
+    drop_reason_t w;
+    for (int i = 0; i < n; i++)
+        send_pkt(e, mk_tcp(src, 40000, CLIENT_B, (uint16_t)(first + i), TCP_SYN),
+                 DIR_OUT, t, &w);
+}
+
+static void test_scan_blocks_the_scanner_only(void)
+{
+    engine_t *e = make_engine(EXPOSE_SSH);
+    drop_reason_t w;
+    syn_sweep(e, ATTACKER, 1000, SCAN_DEFAULT_PORTS - 1, SEC);
+    /* 19 ports: still allowed to the exposed service. */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40001, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    syn_sweep(e, ATTACKER, 2000, 1, SEC);
+    /* The 20th port: blocked, even where a rule would allow it, and for any protocol. */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40002, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SCAN_BLOCKED);
+    CHECK(send_pkt(e, mk_icmp(ATTACKER, CLIENT_B, ICMP_ECHO_REQUEST, 7), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SCAN_BLOCKED);
+    /* Other outside hosts are unaffected. */
+    CHECK(send_pkt(e, mk_tcp(OTHER_OUT, 40000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.scans_detected == 1);
+    CHECK(s.hosts_blocked == 1);
+    CHECK(s.pkts_allowed + s.pkts_dropped == s.pkts_total);
+    engine_destroy(e);
+}
+
+static void test_scan_block_cuts_existing_flows(void)
+{
+    engine_t *e = make_engine(EXPOSE_SSH);
+    drop_reason_t w;
+    const uint64_t t = SEC;
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 5555, CLIENT_B, 22, TCP_SYN), DIR_OUT, t, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 22, ATTACKER, 5555, TCP_SYN|TCP_ACK), DIR_IN, t, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 5555, CLIENT_B, 22, TCP_ACK), DIR_OUT, t, &w) == VERDICT_ALLOW);
+    syn_sweep(e, ATTACKER, 1000, SCAN_DEFAULT_PORTS, t);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 5555, CLIENT_B, 22, TCP_ACK|TCP_PSH), DIR_OUT, t, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SCAN_BLOCKED);
+    /* Only traffic FROM the scanner is blocked; the inside side still flows. */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 22, ATTACKER, 5555, TCP_ACK|TCP_PSH), DIR_IN, t, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_scan_ignores_inside_allowed_and_icmp(void)
+{
+    engine_t *e = make_engine(EXPOSE_SSH);
+    drop_reason_t w;
+    /* An inside host hitting 30 refused ports outbound is never blocked. */
+    for (uint16_t port = 1000; port < 1030; port++)
+        send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, port, TCP_SYN), DIR_IN, SEC, &w);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50001, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    /* Allowed SYNs from outside (many source ports) don't count. */
+    for (uint16_t sp = 1; sp <= 30; sp++)
+        CHECK(send_pkt(e, mk_tcp(ATTACKER, sp, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    /* ICMP drops don't count (no ports). */
+    for (uint16_t id = 1; id <= 30; id++)
+        send_pkt(e, mk_icmp(ATTACKER, CLIENT_A, ICMP_ECHO_REQUEST, id), DIR_OUT, SEC, &w);
+    /* Drops for a wrong destination don't count: not a probe of our network. */
+    for (uint16_t port = 1; port <= 30; port++)
+        send_pkt(e, mk_tcp(ATTACKER, 40000, OTHER_OUT, port, TCP_SYN), DIR_OUT, SEC, &w);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 99, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.scans_detected == 0);
+    engine_destroy(e);
+}
+
+static void test_scan_counts_ack_scans_and_reject_rules(void)
+{
+    engine_t *e = make_engine(EXPOSE_SSH);
+    drop_reason_t w;
+    for (uint16_t port = 1; port <= SCAN_DEFAULT_PORTS; port++) {
+        CHECK(send_pkt(e, mk_tcp(ATTACKER, 40000, CLIENT_B, port, TCP_ACK), DIR_OUT, SEC, &w) == VERDICT_DROP);
+        CHECK(w == DROP_NOT_SYN);
+    }
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SCAN_BLOCKED);
+    engine_destroy(e);
+
+    /* A port answered by a reject rule is still a probe; once blocked, the
+     * scanner gets no more answers either. */
+    e = make_engine("reject in tcp from any to 10.0.0.3 port 1-1000\n");
+    int rejected = 0;
+    for (uint16_t port = 1; port <= SCAN_DEFAULT_PORTS + 5; port++)
+        rejected += send_pkt(e, mk_tcp(ATTACKER, 40000, CLIENT_B, port, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_REJECT;
+    CHECK(rejected == SCAN_DEFAULT_PORTS);
+    CHECK(w == DROP_SCAN_BLOCKED);
+    engine_destroy(e);
+}
+
+static void test_scan_block_expires(void)
+{
+    engine_t *e = make_engine(EXPOSE_SSH);
+    drop_reason_t w;
+    const uint64_t t = 5 * SEC;
+    syn_sweep(e, ATTACKER, 1000, SCAN_DEFAULT_PORTS, t);
+    const uint64_t end = t + SCAN_DEFAULT_BLOCK_S * SEC;
+    engine_expire(e, end - SEC);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40001, CLIENT_B, 22, TCP_SYN), DIR_OUT, end - SEC, &w) == VERDICT_DROP);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.hosts_blocked == 1);
+    engine_expire(e, end + SEC);
+    engine_get_stats(e, &s);
+    CHECK(s.hosts_blocked == 0);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40002, CLIENT_B, 22, TCP_SYN), DIR_OUT, end + SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_scan_settings(void)
+{
+    engine_t *e = make_engine(EXPOSE_SSH);
+    drop_reason_t w;
+    CHECK(engine_set_scan(e, &(scan_cfg_t){ 0, 0, 0 }));          /* off */
+    syn_sweep(e, ATTACKER, 1, 1024, SEC);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40001, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.drops[DROP_SCAN_BLOCKED] == 0);
+    CHECK(s.scans_detected == 0);
+
+    CHECK(!engine_set_scan(e, &(scan_cfg_t){ SCAN_MAX_PORTS + 1, 5, 60 })); /* invalid */
+    CHECK(!engine_set_scan(e, &(scan_cfg_t){ 20, 0, 60 }));
+    CHECK(engine_set_scan(e, &(scan_cfg_t){ 3, 5, 10 }));
+    syn_sweep(e, ATTACKER, 1, 3, 2 * SEC);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40002, CLIENT_B, 22, TCP_SYN), DIR_OUT, 2 * SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SCAN_BLOCKED);
+    engine_expire(e, 12 * SEC);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40003, CLIENT_B, 22, TCP_SYN), DIR_OUT, 12 * SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+
+    /* The _sized constructor applies no defaults: no scan detection. */
+    char err[128];
+    e = engine_create_with_rules_sized(rules_parse_string(with_inside(EXPOSE_SSH), err, sizeof err), 64);
+    syn_sweep(e, ATTACKER, 1, 100, SEC);
+    engine_get_stats(e, &s);
+    CHECK(s.scans_detected == 0);
+    engine_destroy(e);
+}
+
+/* Unsolicited packets source NAT drops before the engine (to the NAT
+ * address) count toward detection too, and only toward detection. */
+static void test_scan_counts_packets_nat_dropped(void)
+{
+    engine_t *e = make_engine(EXPOSE_SSH);
+    drop_reason_t w;
+    for (uint16_t port = 1; port <= SCAN_DEFAULT_PORTS; port++) {
+        pkt_t p = mk_tcp(ATTACKER, 40000, IP(203,0,113,254), port, TCP_SYN);
+        engine_note_unsolicited(e, &p, DIR_OUT, SEC);
+    }
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.scans_detected == 1);
+    CHECK(s.pkts_total == 0);          /* NAT counts these, not the engine */
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40001, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_SCAN_BLOCKED);
+    engine_destroy(e);
+}
+
+/* The SCAN and UNBLOCK lines, as they appear in tunwall's log. */
+static void test_scan_log_lines(void)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *out = open_memstream(&buf, &len);
+    fw_log_set(out, LOG_INFO);
+    engine_t *e = make_engine(EXPOSE_SSH);
+    for (int i = 0; i < SCAN_DEFAULT_PORTS; i++) {
+        drop_reason_t w;
+        send_pkt(e, mk_tcp(ATTACKER, 40000, CLIENT_B, (uint16_t)(1000 + i), TCP_SYN),
+                 DIR_OUT, 10 * SEC + (uint64_t)i * (SEC / 10), &w);
+    }
+    drop_reason_t w;
+    send_pkt(e, mk_tcp(ATTACKER, 40001, CLIENT_B, 22, TCP_SYN), DIR_OUT, 12 * SEC, &w);
+    engine_expire(e, 75 * SEC);
+    fflush(out);
+    CHECK(strstr(buf, "SCAN    198.51.100.66 dropped on 20 ports in 1.90s, blocking for 60s\n") != NULL);
+    CHECK(strstr(buf, "UNBLOCK 198.51.100.66 (dropped 1 packets while blocked)\n") != NULL);
+    fw_log_set(NULL, LOG_OFF);
+    fclose(out);
+    free(buf);
+    engine_destroy(e);
+}
+
 int main(void)
 {
     RUN(test_web_fetch_allowed);
@@ -1709,5 +1909,13 @@ int main(void)
     RUN(test_engine_create_reports_bad_files);
     RUN(test_a_reject_rule_rejects_and_creates_no_flow);
     RUN(test_answers_to_reject_rules_are_rate_limited);
+    RUN(test_scan_blocks_the_scanner_only);
+    RUN(test_scan_block_cuts_existing_flows);
+    RUN(test_scan_ignores_inside_allowed_and_icmp);
+    RUN(test_scan_counts_ack_scans_and_reject_rules);
+    RUN(test_scan_block_expires);
+    RUN(test_scan_settings);
+    RUN(test_scan_counts_packets_nat_dropped);
+    RUN(test_scan_log_lines);
     TEST_DONE();
 }

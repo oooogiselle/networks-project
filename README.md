@@ -17,15 +17,16 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/flowtable.c` | 5-tuple hash table, expiry | Eva |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines: Giselle |
-| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload: Giselle |
+| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection hooks: Giselle |
 | `src/log.c` | Per-flow logs, counters | Eva |
+| `include/scandetect.h`, `src/scandetect.c` | Port-scan detection: distinct ports per outside host in a sliding window, temporary blocking (`tunwall -s`) | Giselle |
 | `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Eva; NAT, port forwarding and reject hooks: Giselle |
-| `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Eva; `-n` and SIGHUP reload: Giselle |
+| `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Eva; `-n`, `-s` and SIGHUP reload: Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Eva; the NAT test address: Giselle |
 | `bench/` | iperf3 and latency-percentile benchmark (`run_bench.sh`, `summary.py`), the CPU profile (`profile.sh`), and the rule files | Eva |
 | `scripts/demo.sh`, `scripts/demo_steps.sh`, `scripts/demo_log.awk`, `scripts/dns_forwarder.py` | The recorded demo: a tmux window with the live firewall log above and narrated, self-checking steps below, using the real Internet (see `DEMO.md`) | Eva |
 | `tests/` | Unit tests (`tests/pktbuild.c`, by Giselle, builds real wire packets); each module's tests are by its author | shared |
-| `tests/integration/run_all.sh` | End-to-end tests in the namespace topology | Eva; NAT, port forwarding and reload sections: Giselle |
+| `tests/integration/run_all.sh` | End-to-end tests in the namespace topology | Eva; NAT, port forwarding, reload and port-scan sections: Giselle |
 
 The first plan gave the tun I/O, the namespace topology and the benchmarks to
 Giselle. Eva's versions of those were merged first (#6), so Giselle's own
@@ -50,8 +51,8 @@ sudo ip netns exec inside curl http://10.0.2.2/   # in another terminal
 sudo scripts/netns.sh down
 ```
 
-`tunwall -r <rules> [-i tun-in] [-o tun-out] [-n ADDR] [-f | -q]` (`-n`
-turns on source NAT, below). By default every flow
+`tunwall -r <rules> [-i tun-in] [-o tun-out] [-n ADDR] [-s P,W,B] [-f | -q]`
+(`-n` turns on source NAT, `-s` tunes port-scan detection, both below). By default every flow
 open/close and every dropped packet (with its reason) is logged to stderr. The
 logging is rate-limited to 1000 lines per second (bursts of 1000, shared by all
 kinds of line) so a flood or a scan cannot turn into a flood of log writes; when
@@ -170,6 +171,45 @@ allow in tcp any 10.0.1.3 80        # the filter still has to allow it
 - **Limits.** No hairpinning (an inside host can't use `ADDR:8080` itself), no
   forwarding of port ranges or ICMP, and forwards only work with `-n`.
 
+### Port-scan detection (`-s`)
+
+An outside host that gets dropped on **20 different ports within 5 seconds** is
+treated as a port scanner: tunwall logs it and drops **everything** it sends
+for **60 seconds**, existing connections included. Other hosts are not
+affected.
+
+```
+[  12.345678] SCAN    10.0.2.3 dropped on 20 ports in 0.84s, blocking for 60s
+[  72.401234] UNBLOCK 10.0.2.3 (dropped 1874 packets while blocked)
+```
+
+- **What counts.** An outside TCP or UDP packet refused by the policy (no
+  rule, `deny`, `reject`) or a TCP packet with no connection that is not a SYN,
+  so SYN, ACK, FIN, NULL, Xmas and UDP scans all count. The port is the
+  destination (protocol, port), on any inside host. With `-n`, unsolicited
+  packets to the NAT address count too (they never reach the rules), so a scan
+  of the public address is caught. Allowed packets, ICMP, inside hosts, drops
+  on existing flows, spoofed sources and wrong destinations never count.
+- **Sliding window.** Each port remembers when it was last hit, and hits older
+  than 5 s are forgotten, so a scan split across a window boundary is still
+  caught.
+- **Bounded.** 4096 sources are tracked in a fixed table (about 1.5 MB, allocated
+  at start-up; nothing per packet), chosen by a keyed SipHash so forged
+  addresses cannot be aimed at one slot. When a slot is needed the least
+  recently seen unblocked source gives way. While nobody is blocked, the check
+  costs nothing on the fast path.
+- **Settings.** `-s PORTS[,WINDOW_S[,BLOCK_S]]` changes them (default
+  `-s 20,5,60`); `-s 0` turns detection off. The counters show
+  `scan: detected= blocked-now=` and `drop[scan-blocked]=`.
+- **What nmap shows.** nmap tries common ports such as 22 first, so a plain
+  `nmap -p 1-1000` usually finds 22 open before the 20th drop; after that it
+  gets no answers and slows to a crawl (about 6 s without detection, 100 s or
+  more with it). With `-r` (ports in order) 22 comes after the cut-off and is
+  never found. The demo uses that.
+- **Limitation.** A source address can be forged, so someone can get a
+  legitimate outside host blocked for 60 s by faking a scan from its address.
+  An allowlist of never-blocked hosts would fix this.
+
 ## Tests
 
 Line coverage of the library (everything in `src/` except `main.c` and
@@ -202,6 +242,11 @@ port forwarding, SIGHUP reload, kill-the-firewall). They need root, `nmap` and
 - **Reload.** Appending a rule and sending SIGHUP opens a port that was dropped.
   A broken file is refused, `tunwall` keeps running, and the old rules still
   apply.
+- **Port-scan detection.** Its own run at the end with `-s 20,5,10` (a 10 s
+  block, to keep it short). An nmap scan of client B from 10.0.2.3 is
+  detected, nmap never finds port 22, 10.0.2.3 is cut off while 10.0.2.2 still
+  connects, and 10.0.2.3 gets back in after the block. Then a scan of the NAT
+  address is detected and closes the port forward to the scanner only.
 
 CI sets `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
 `SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. `INTERNET=1`
@@ -332,6 +377,9 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
      `inside` network or the firewall refuses to start): outside
      packets may not carry an inside source address, and inside packets must
      (`DROP_BAD_SRC`).
+   - **Scan block**: an outside host blocked for port scanning has every
+     packet dropped (`scan-blocked`), on existing flows too. See
+     [Port-scan detection](#port-scan-detection--s).
    - **ICMP errors** (unreachable, time exceeded, parameter problem) are
      allowed only if all of these hold: the packet they embed belongs to a
      tracked flow; the error travels back toward that packet's sender and is

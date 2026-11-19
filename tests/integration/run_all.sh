@@ -174,6 +174,8 @@ cli_says "no inside network is refused with the reason"   1 'noinside\.conf: dec
 cli_says "a missing tun device is refused with a hint"    1 'tw-missing0: no such device.*netns\.sh' -r "$RULES" -i tw-missing0
 cli_says "a forward without -n is refused, naming its line" 1 "forward\\.conf: line 2: 'forward' needs source NAT \\(-n ADDR\\)" -r "$LOGDIR/forward.conf"
 cli_says "a forward in the NAT port range is refused"     1 'forward-range\.conf: line 2: forward: port 30000 is in the source-NAT port range' -r "$LOGDIR/forward-range.conf" -n 10.0.2.254
+cli_says "a bad -s value is refused with the format"      2 'tunwall: -s needs PORTS\[,WINDOW_S\[,BLOCK_S\]\]' -r "$RULES" -s 1
+cli_says "-s with too many fields is refused"             2 'tunwall: -s needs PORTS' -r "$RULES" -s 20,5,60,1
 
 "$NETNS_SCRIPT" down >/dev/null 2>&1
 "$NETNS_SCRIPT" up ${INTERNET:+nat} || { echo "namespace setup failed"; exit 1; }
@@ -574,6 +576,82 @@ else
     bad "tunwall did not start with -n $NATIP"; cat "$LOGDIR/tunwall.log"
 fi
 RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+
+echo "== port-scan detection (tunwall -s 20,5,10)"
+# Its own run at the end, so the tests above never lose 10.0.2.3 (or 10.0.2.2,
+# the web server) to a block. Same NAT rules as above; a 10 s block (60 s by
+# default) keeps the unblock check short. nmap runs in the background so the
+# checks happen while the block is on; -r probes ports in order, so 22 comes
+# after the 20th dropped port and is cut off too.
+probe_from() { # probe_from <src ip> <dst ip> <port>: open | refused | timeout | error
+    ip netns exec outside python3 - "$@" <<'PY' 2>/dev/null
+import socket, sys
+src, dst, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    socket.create_connection((dst, port), 3, (src, 0)).close(); print("open")
+except socket.timeout: print("timeout")
+except ConnectionRefusedError: print("refused")
+except OSError: print("error")
+PY
+}
+wait_log_count() { # wait_log_count <regex> <count> <seconds>: until the log has that many matching lines
+    local i
+    for i in $(seq 1 $(($3 * 10))); do
+        [ "$(grep -cE "$1" "$LOGDIR/tunwall.log")" -ge "$2" ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+if [ -f "$LOGDIR/nat.conf" ] && need_tool nmap; then
+    [ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+    cp "$LOGDIR/tunwall.log" "$LOGDIR/tunwall-nat.log"
+    RULES=$LOGDIR/nat.conf; TUNWALL_ARGS="$SAVED_ARGS -n $NATIP -s 20,5,10"
+    if start_fw; then
+        logged "it says scan detection is on" '^tunwall: scan detection on: 20 ports in 5 s blocks the host for 10 s'
+        ip -n outside route replace 10.0.1.0/24 via 10.0.2.1
+        expect "before: 10.0.2.3 reaches ssh on client B" open probe_from 10.0.2.3 10.0.1.3 22
+        SCAN_RE='SCAN +10\.0\.2\.3 dropped on 20 ports in [0-9.]+s, blocking for 10s'
+        UNBLOCK_RE='UNBLOCK 10\.0\.2\.3 \(dropped [0-9]+ packets while blocked\)'
+
+        outside nmap -n -Pn --send-ip -S 10.0.2.3 -e veth-sout -T4 -r --max-retries 1 \
+            -p 1-100 10.0.1.3 > "$LOGDIR/nmap-scan.out" 2>&1 &
+        NMAP_PID=$!
+        if wait_log_count "$SCAN_RE" 1 15; then ok "log: a SYN scan of client B from 10.0.2.3 is detected"
+        else bad "log: no SCAN line for 10.0.2.3 within 15 s of starting nmap"; fi
+        expect "the scanner 10.0.2.3 is cut off from ssh on client B" timeout probe_from 10.0.2.3 10.0.1.3 22
+        expect "another outside host (10.0.2.2) still reaches it"      open    probe_from 10.0.2.2 10.0.1.3 22
+        wait "$NMAP_PID"
+        if grep -q "Nmap done" "$LOGDIR/nmap-scan.out" && ! grep -qE '^22/tcp +open' "$LOGDIR/nmap-scan.out"; then
+            ok "nmap finishes without finding port 22 (scanned after the cut-off)"
+        else bad "nmap found port 22 open or did not finish: $(grep -E 'Nmap done|/tcp' "$LOGDIR/nmap-scan.out" | head -3 | tr '\n' ' ')"; fi
+        # nmap may re-trigger the block after the first one ends: wait for the last.
+        nscan=$(grep -cE "$SCAN_RE" "$LOGDIR/tunwall.log")
+        if wait_log_count "$UNBLOCK_RE" "$nscan" 25; then ok "log: the block ends (UNBLOCK) after 10 s"
+        else bad "log: no UNBLOCK line for 10.0.2.3 within 25 s"; fi
+        expect "after the block: 10.0.2.3 reaches ssh again" open probe_from 10.0.2.3 10.0.1.3 22
+
+        # A scan of the NAT address never reaches the rules (NAT drops it as
+        # unsolicited), but it is still detected, and the block then also
+        # closes the port forward to the scanner.
+        outside nmap -n -Pn --send-ip -S 10.0.2.3 -e veth-sout -T4 --max-retries 1 \
+            -p 1000-1100 $NATIP > "$LOGDIR/nmap-nat.out" 2>&1 &
+        NMAP_PID=$!
+        if wait_log_count "$SCAN_RE" $((nscan + 1)) 15; then ok "log: a scan of the NAT address $NATIP is detected"
+        else bad "log: no SCAN line for a scan of the NAT address $NATIP"; fi
+        expect "the scanner cannot use the port forward $NATIP:8080" timeout probe_from 10.0.2.3 $NATIP 8080
+        expect "10.0.2.2 still can"                                    open    probe_from 10.0.2.2 $NATIP 8080
+        wait "$NMAP_PID"
+
+        dump_stats
+        logged "stats: the scans are counted" '^scan: +detected=[2-9][0-9]* blocked-now=[0-9]+'
+        logged "stats: packets dropped for a block are counted" '^drop\[scan-blocked\]=[1-9][0-9]*'
+        logged "blocked packets are logged with their reason" 'DROP tcp 10\.0\.2\.3:[0-9]+ -> 10\.0\.1\.3:22 .*why=scan-blocked'
+        not_logged "10.0.2.2 was never blocked" 'SCAN +10\.0\.2\.2 '
+    else
+        bad "tunwall did not start with -s 20,5,10"; cat "$LOGDIR/tunwall.log"
+    fi
+    RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+fi
 
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID"; rc=$?; FW_PID=""

@@ -154,7 +154,11 @@ static void handle_packet(forwarder_t *f, dir_t dir, size_t len)
     if (f->nat && dir == DIR_OUT) {
         const nat_result_t nr = nat_inbound(f->nat, f->buf, &pkt, now);
         nat_translated_in = nr == NAT_TRANSLATED;
-        if (nr == NAT_NO_MAPPING) return;
+        if (nr == NAT_NO_MAPPING) {
+            /* still a probe: scan detection must see scans of the NAT address */
+            engine_note_unsolicited(f->engine, &pkt, dir, now);
+            return;
+        }
         if (nr == NAT_TRANSLATED) {
             const parse_result_t again = parse_packet(f->buf, len, &pkt);
             if (again != PARSE_OK) {          /* cannot happen: checksums are kept exact */
