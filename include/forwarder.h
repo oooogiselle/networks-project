@@ -21,6 +21,7 @@
 #include <stdio.h>
 
 #include "engine.h"
+#include "nat.h"
 
 #define FWD_MAX_PACKET        65535                 /* largest IPv4 packet */
 #define FWD_BURST             64                    /* packets per fd per wakeup */
@@ -50,6 +51,14 @@ void         fwd_destroy(forwarder_t *f);
 void fwd_set_clock(forwarder_t *f, fwd_clock_fn clock);
 
 /*
+ * Turn on source NAT (see nat.h); NULL turns it off. Connections started
+ * from the inside then leave with the NAT address, and packets to that
+ * address are translated back before the engine sees them, so the rules and
+ * flows keep using real inside addresses. The forwarder does not own n.
+ */
+void fwd_set_nat(forwarder_t *f, nat_t *n);
+
+/*
  * Wait with this signal mask installed atomically (ppoll), so a program that
  * keeps its stop/stats signals blocked everywhere else cannot lose one that
  * arrives just before the wait begins. NULL = ordinary poll (the default).
@@ -68,7 +77,8 @@ int fwd_step(forwarder_t *f, int timeout_ms);
 
 void fwd_get_counters(const forwarder_t *f, fwd_counters_t *out);
 
-/* Engine counters and drop reasons, then one "io:" line with the I/O counters. */
+/* Engine counters and drop reasons, one "io:" line with the I/O counters,
+ * and a "nat:" line when NAT is on. */
 void fwd_print_stats(const forwarder_t *f, FILE *out);
 
 #endif

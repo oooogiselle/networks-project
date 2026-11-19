@@ -32,6 +32,8 @@
 # 10.0.2.2, where scripts/dns_forwarder.py answers (the example rules only let
 # the inside use that one resolver).
 #
+# 10.0.2.254 is set aside as the source NAT address (tunwall -n 10.0.2.254).
+#
 # Usage: sudo scripts/netns.sh up [kernel|nat] | down | status
 # Start the firewall with: sudo ip netns exec firewall build/tunwall -r <rules>
 # ============================================================================
@@ -188,6 +190,14 @@ up() {
         mac_out=$(ip -n "$FW" link show veth-out | awk '/link\/ether/ {print $2}')
         ip -n "$IN"  neigh replace 10.0.1.1 lladdr "$mac_in"  dev veth-cin  nud permanent
         ip -n "$OUT" neigh replace 10.0.2.1 lladdr "$mac_out" dev veth-sout nud permanent
+        # Source NAT address for "tunwall -n 10.0.2.254". No interface owns it:
+        # the outside reaches it through veth-out (so it lands in tun-out like
+        # any other packet from the outside), and ICMP errors the firewall's own
+        # kernel sends to it (e.g. "fragmentation needed" for a translated
+        # packet) are routed into tun-out too, so tunwall translates them back
+        # to the inside host. Harmless without -n: tunwall drops such packets.
+        ip -n "$OUT" neigh replace 10.0.2.254 lladdr "$mac_out" dev veth-sout nud permanent
+        ip -n "$FW" route add 10.0.2.254/32 dev tun-out src 10.0.2.1
     fi
 
     # Forwarding goes on LAST, once everything that must govern it is in place.

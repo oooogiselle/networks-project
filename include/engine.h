@@ -180,4 +180,13 @@ bool engine_set_limits(engine_t *e, size_t max_per_source, size_t max_outside);
  */
 bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_ns);
 
+/*
+ * Is there a live flow for p's tuple (in either direction)? If so and
+ * orig_dir is not NULL, *orig_dir is the side that started it. Read-only
+ * apart from reaping the flow if it has already expired. Used by source NAT
+ * (nat.h): only connections started from the inside are translated, and a
+ * NAT mapping lives as long as its flow.
+ */
+bool engine_flow_origin(engine_t *e, const pkt_t *p, uint64_t now_ns, dir_t *orig_dir);
+
 #endif

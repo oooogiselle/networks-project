@@ -24,6 +24,7 @@
 #include "engine.h"
 #include "forwarder.h"
 #include "fwalloc.h"
+#include "nat.h"
 #include "parser.h"
 #include "pktbuild.h"
 #include "rules.h"
@@ -647,6 +648,79 @@ static void test_create_rejects_bad_arguments_and_survives_oom(void)
     rig_down(&r);
 }
 
+static void test_nat_translates_connections_started_from_the_inside(void)
+{
+    struct rig r;
+    if (!rig_up(&r, RULES)) return;
+    const uint32_t natip = IP4(10, 0, 2, 254);
+    nat_t *nat = nat_create(natip, NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT);
+    CHECK(nat != NULL);
+    fwd_set_nat(r.f, nat);
+    uint8_t p[256], got[256];
+    pkt_t pk;
+
+    /* the client's SYN leaves with the NAT address and a NAT port */
+    size_t n = syn(p, CLIENT, 40000, SERVER, 80, TCP_SYN);
+    send_pkt(r.in_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.out_t, got, sizeof got) == (ssize_t)n);
+    CHECK(parse_packet(got, n, &pk) == PARSE_OK);
+    CHECK(pk.src_ip == natip && pk.dst_ip == SERVER && pk.dst_port == 80);
+    CHECK(got[8] == 65);                                 /* still one hop */
+    const uint16_t port = pk.src_port;
+
+    /* the server's answer to the NAT port reaches the client */
+    n = syn(p, SERVER, 80, natip, port, TCP_SYN | TCP_ACK);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.in_t, got, sizeof got) == (ssize_t)n);
+    CHECK(parse_packet(got, n, &pk) == PARSE_OK);
+    CHECK(pk.dst_ip == CLIENT && pk.dst_port == 40000 && pk.src_ip == SERVER);
+
+    /* an unsolicited packet to the NAT address goes nowhere */
+    n = syn(p, ATTACKER, 5555, natip, port, TCP_SYN);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.in_t, got, sizeof got) < 0);
+
+    /* an exposed inside service (allow in ... 10.0.1.3 22) answers with its
+     * own address: connections the outside started are not translated */
+    n = syn(p, ATTACKER, 5555, IP4(10, 0, 1, 3), 22, TCP_SYN);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.in_t, got, sizeof got) == (ssize_t)n);
+    n = syn(p, IP4(10, 0, 1, 3), 22, ATTACKER, 5555, TCP_SYN | TCP_ACK);
+    send_pkt(r.in_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.out_t, got, sizeof got) == (ssize_t)n);
+    CHECK(parse_packet(got, n, &pk) == PARSE_OK && pk.src_ip == IP4(10, 0, 1, 3));
+
+    nat_stats_t st;
+    nat_get_stats(nat, &st);
+    CHECK(st.mappings_active == 1 && st.translated_out == 1 && st.translated_in == 1);
+    CHECK(st.drop_no_mapping == 1);
+
+    /* when the flow times out, the sweep frees its mapping too */
+    fake_now += 600 * SEC;
+    CHECK(fwd_step(r.f, 0) == 0);
+    nat_get_stats(nat, &st);
+    CHECK(st.mappings_active == 0 && st.mappings_freed == 1);
+
+    /* the stats report gains a nat: line */
+    FILE *f = tmpfile();
+    if (f) {
+        char line[512];
+        bool seen = false;
+        fwd_print_stats(r.f, f);
+        rewind(f);
+        while (fgets(line, sizeof line, f)) seen |= strncmp(line, "nat:", 4) == 0;
+        CHECK(seen);
+        fclose(f);
+    }
+    rig_down(&r);
+    nat_destroy(nat);
+}
+
 int main(void)
 {
     RUN(test_allowed_packets_cross_unchanged_in_both_directions);
@@ -669,5 +743,6 @@ int main(void)
     RUN(test_expired_flows_are_swept_about_once_a_second);
     RUN(test_stats_report_includes_io_counters);
     RUN(test_create_rejects_bad_arguments_and_survives_oom);
+    RUN(test_nat_translates_connections_started_from_the_inside);
     TEST_DONE();
 }
