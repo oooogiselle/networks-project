@@ -15,12 +15,12 @@
  *
  * File syntax (one rule per line, '#' starts a comment):
  *
- *   (allow|deny) [in|out] (tcp|udp|icmp|any)
+ *   (allow|deny|reject) [in|out] (tcp|udp|icmp|any)
  *       from <addr> [port <ports>] to <addr> [port <ports>]
  *
  * or the compact form used in the requirements spec:
  *
- *   (allow|deny) [in|out] (tcp|udp|icmp|any) <addr> <addr> [<ports>|echo]
+ *   (allow|deny|reject) [in|out] (tcp|udp|icmp|any) <addr> <addr> [<ports>|echo]
  *       e.g.  allow out tcp 10.0.1.0/24 any 80,443
  *             allow out icmp 10.0.1.0/24 any echo
  *             allow in  tcp any 10.0.1.3 22
@@ -51,6 +51,12 @@
  * with it (engine_create* fail): without it there is no way to tell a spoofed
  * source from a real one.
  *
+ * `reject` refuses a new connection like `deny`, but also tells the sender
+ * at once instead of letting it time out: a TCP RST for TCP, ICMP port
+ * unreachable for UDP, ICMP administratively prohibited for an echo request
+ * (see reject.h). Use it for traffic from your own users that should fail
+ * fast. The default policy stays a SILENT drop, so a scanner learns nothing.
+ *
  * Rules are evaluated in file order, first match wins, and if nothing
  * matches the policy is DENY. Rules are only consulted for the first packet
  * of a flow; later packets use the flow table.
@@ -60,7 +66,8 @@
 
 #include "engine.h"
 
-typedef enum { ACT_DENY = 0, ACT_ALLOW = 1 } action_t;
+/* ACT_REJECT drops like deny and also answers (TCP RST / ICMP unreachable). */
+typedef enum { ACT_DENY = 0, ACT_ALLOW = 1, ACT_REJECT = 2 } action_t;
 
 typedef struct { bool any; uint32_t net, mask; } addr_match_t;
 typedef struct { uint16_t lo, hi; } port_range_t;

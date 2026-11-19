@@ -24,6 +24,7 @@
 #include "fwalloc.h"
 #include "log.h"
 #include "parser.h"
+#include "reject.h"
 
 struct forwarder {
     engine_t      *engine;
@@ -115,6 +116,24 @@ static void give_back_one_hop(uint8_t *pkt)
     pkt[11] = (uint8_t)~sum;
 }
 
+/*
+ * Answer a packet a `reject` rule matched. The answer goes back out the side
+ * the packet came from, posing as the host it was sent to: the same path a
+ * genuine reply from that host takes. Built on the stack, never allocated.
+ */
+static void send_reject(forwarder_t *f, dir_t dir, size_t len)
+{
+    uint8_t out[REJECT_MAX_LEN];
+    const size_t n = reject_build(f->buf, len, out, sizeof out);
+    if (n == 0) return;
+    if (write(f->fd[dir], out, n) == (ssize_t)n) {
+        f->counters.rejects_sent++;
+    } else {
+        f->counters.write_errors++;
+        f->counters.last_write_errno = errno;
+    }
+}
+
 /* Decide one packet that arrived on `dir` and forward it if allowed. */
 static void handle_packet(forwarder_t *f, dir_t dir, size_t len)
 {
@@ -131,8 +150,10 @@ static void handle_packet(forwarder_t *f, dir_t dir, size_t len)
     /* Source NAT, outside -> inside: give a reply to the NAT address back its
      * inside destination first, so the engine only ever sees inside hosts.
      * Unsolicited packets to the NAT address go no further (NAT counts them). */
+    bool nat_translated_in = false;
     if (f->nat && dir == DIR_OUT) {
         const nat_result_t nr = nat_inbound(f->nat, f->buf, &pkt, now);
+        nat_translated_in = nr == NAT_TRANSLATED;
         if (nr == NAT_NO_MAPPING) return;
         if (nr == NAT_TRANSLATED) {
             const parse_result_t again = parse_packet(f->buf, len, &pkt);
@@ -142,7 +163,15 @@ static void handle_packet(forwarder_t *f, dir_t dir, size_t len)
             }
         }
     }
-    if (engine_decide(f->engine, &pkt, dir, now, NULL) != VERDICT_ALLOW)
+    const verdict_t v = engine_decide(f->engine, &pkt, dir, now, NULL);
+    if (v == VERDICT_REJECT) {
+        /* A packet the NAT translated now carries the hidden inside address
+         * as its destination; an answer would leak it as its source. Such a
+         * packet is dropped silently instead (it is counted as rejected). */
+        if (!nat_translated_in) send_reject(f, dir, len);
+        return;
+    }
+    if (v != VERDICT_ALLOW)
         return;
 
     /* Source NAT, inside -> outside: only connections the inside started get
@@ -250,12 +279,13 @@ void fwd_print_stats(const forwarder_t *f, FILE *out)
     engine_get_stats(f->engine, &st);
     engine_stats_print(&st, out);
     fprintf(out,
-            "io:      rx in=%llu out=%llu forwarded in=%llu out=%llu write-errors=%llu\n",
+            "io:      rx in=%llu out=%llu forwarded in=%llu out=%llu write-errors=%llu rejects=%llu\n",
             (unsigned long long)f->counters.rx[DIR_IN],
             (unsigned long long)f->counters.rx[DIR_OUT],
             (unsigned long long)f->counters.forwarded[DIR_IN],
             (unsigned long long)f->counters.forwarded[DIR_OUT],
-            (unsigned long long)f->counters.write_errors);
+            (unsigned long long)f->counters.write_errors,
+            (unsigned long long)f->counters.rejects_sent);
     if (f->nat) nat_stats_print(f->nat, out);
     fprintf(out, "log:     suppressed=%llu\n", (unsigned long long)fw_log_suppressed());
 }

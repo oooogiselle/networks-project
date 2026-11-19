@@ -35,7 +35,9 @@ typedef uint64_t (*fwd_clock_fn)(void);
 typedef struct fwd_counters {
     uint64_t rx[2];            /* packets read, indexed by the dir_t they arrived on */
     uint64_t forwarded[2];     /* of those, written to the other side              */
-    uint64_t write_errors;     /* allowed packets the other side refused           */
+    uint64_t write_errors;     /* allowed packets the other side refused, and
+                                  reject answers the sender's side refused        */
+    uint64_t rejects_sent;     /* answers to `reject` rules (RST / ICMP) written   */
     int      last_write_errno; /* errno of the most recent refusal                 */
 } fwd_counters_t;
 

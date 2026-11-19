@@ -721,6 +721,75 @@ static void test_nat_translates_connections_started_from_the_inside(void)
     nat_destroy(nat);
 }
 
+static void test_a_rejected_syn_is_answered_with_a_rst_on_its_own_side(void)
+{
+    struct rig r;
+    if (!rig_up(&r, "inside 10.0.1.0/24\nreject out tcp 10.0.1.0/24 any 23\n")) return;
+    uint8_t p[256], got[256];
+    size_t n = syn(p, CLIENT, 40002, SERVER, 23, TCP_SYN);
+    send_pkt(r.in_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.out_t, got, sizeof got) < 0);           /* nothing crossed */
+    ssize_t g = recv_pkt(r.in_t, got, sizeof got);           /* the answer came back */
+    CHECK(g == 40);
+    pkt_t a;
+    CHECK(g > 0 && parse_packet(got, (size_t)g, &a) == PARSE_OK);
+    CHECK(a.src_ip == SERVER && a.dst_ip == CLIENT && a.src_port == 23 && a.dst_port == 40002);
+    CHECK(a.tcp_flags == (TCP_RST | TCP_ACK));
+    fwd_counters_t c;
+    fwd_get_counters(r.f, &c);
+    CHECK(c.rejects_sent == 1 && c.forwarded[DIR_IN] == 0 && c.write_errors == 0);
+
+    /* the sender's side refusing the answer is counted, not fatal */
+    static const uint8_t junk[64];
+    int queued = 0;
+    while (queued < 100000 && send(r.in_f, junk, sizeof junk, 0) == (ssize_t)sizeof junk) queued++;
+    CHECK(queued > 0);
+    n = syn(p, CLIENT, 40003, SERVER, 23, TCP_SYN);
+    send_pkt(r.in_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    fwd_get_counters(r.f, &c);
+    CHECK(c.rejects_sent == 1 && c.write_errors == 1);
+    rig_down(&r);
+}
+
+static void test_a_reject_never_answers_from_an_address_the_nat_hides(void)
+{
+    struct rig r;
+    if (!rig_up(&r, "inside 10.0.1.0/24\nallow out udp 10.0.1.0/24 any 53\nreject in udp any any\n")) return;
+    const uint32_t natip = IP4(10, 0, 2, 254);
+    nat_t *nat = nat_create(natip, NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT);
+    CHECK(nat != NULL);
+    fwd_set_nat(r.f, nat);
+    uint8_t p[256], got[256];
+    pkt_t pk;
+    size_t n = pb_udp(p, sizeof p, NULL, CLIENT, 5000, SERVER, 53, "q", 1);
+    send_pkt(r.in_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.out_t, got, sizeof got) == (ssize_t)n);
+    CHECK(parse_packet(got, n, &pk) == PARSE_OK && pk.src_ip == natip);
+    const uint16_t port = pk.src_port;
+
+    /* The flow times out; before the next sweep frees the mapping, the
+     * server answers. NAT still translates it (to 10.0.1.2), the engine has
+     * no flow, and `reject in udp` matches. Answering would send an ICMP
+     * error FROM 10.0.1.2 to the outside, leaking the address NAT hides. */
+    fake_now += 31 * SEC;
+    n = pb_udp(p, sizeof p, NULL, SERVER, 53, natip, port, "a", 1);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.out_t, got, sizeof got) < 0);           /* no answer outward */
+    CHECK(recv_pkt(r.in_t, got, sizeof got) < 0);            /* nothing crossed */
+    engine_stats_t st;
+    engine_get_stats(r.e, &st);
+    CHECK(st.drops[DROP_RULE_REJECT] == 1);                  /* it did reach the reject rule */
+    fwd_counters_t c;
+    fwd_get_counters(r.f, &c);
+    CHECK(c.rejects_sent == 0);
+    rig_down(&r);
+    nat_destroy(nat);
+}
+
 int main(void)
 {
     RUN(test_allowed_packets_cross_unchanged_in_both_directions);
@@ -744,5 +813,7 @@ int main(void)
     RUN(test_stats_report_includes_io_counters);
     RUN(test_create_rejects_bad_arguments_and_survives_oom);
     RUN(test_nat_translates_connections_started_from_the_inside);
+    RUN(test_a_rejected_syn_is_answered_with_a_rst_on_its_own_side);
+    RUN(test_a_reject_never_answers_from_an_address_the_nat_hides);
     TEST_DONE();
 }

@@ -105,6 +105,7 @@ const char *drop_reason_str(drop_reason_t r)
     case DROP_SRC_LIMIT:   return "per-source-limit";
     case DROP_OUTSIDE_QUOTA: return "outside-quota";
     case DROP_WRITE_FAILED: return "write-failed";
+    case DROP_RULE_REJECT: return "rule-reject";
     case DROP_REASON_COUNT: break;
     }
     return "?";
@@ -172,4 +173,7 @@ void engine_stats_print(const engine_stats_t *s, FILE *out)
         if (s->drops[i])
             fprintf(out, "drop[%s]=%" PRIu64 "\n", drop_reason_str((drop_reason_t)i),
                     s->drops[i]);
+    if (s->rejects_limited)
+        fprintf(out, "reject:  over-the-rate-limit(dropped-silently)=%" PRIu64 "\n",
+                s->rejects_limited);
 }

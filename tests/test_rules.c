@@ -320,7 +320,7 @@ static void test_shipped_example_config_loads(void)
     if (!r) fprintf(stderr, "  %s\n", err);
     CHECK(r != NULL);
     if (!r) return;
-    CHECK(r->n == 5 && r->ninside == 1);
+    CHECK(r->n == 7 && r->ninside == 1);
     pkt_t web = mk_tcp(IP(10,0,1,2), 40000, IP(93,184,216,34), 443, TCP_SYN);
     pkt_t ssh = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 22, TCP_SYN);
     pkt_t rdp = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 3389, TCP_SYN);
@@ -329,6 +329,13 @@ static void test_shipped_example_config_loads(void)
     CHECK(rules_match(r, &ssh, DIR_OUT) && rules_match(r, &ssh, DIR_OUT)->action == ACT_ALLOW);
     CHECK(!rules_match(r, &rdp, DIR_OUT));
     CHECK(rules_match(r, &rogue, DIR_IN) && rules_match(r, &rogue, DIR_IN)->action == ACT_DENY);
+    /* telnet and TFTP out are refused out loud; from outside they stay silent */
+    pkt_t telnet = mk_tcp(IP(10,0,1,2), 40000, IP(10,0,2,2), 23, TCP_SYN);
+    pkt_t tftp = mk_udp(IP(10,0,1,2), 40000, IP(10,0,2,2), 69);
+    pkt_t telnet_in = mk_tcp(IP(10,0,2,3), 4444, IP(10,0,1,3), 23, TCP_SYN);
+    CHECK(rules_match(r, &telnet, DIR_IN) && rules_match(r, &telnet, DIR_IN)->action == ACT_REJECT);
+    CHECK(rules_match(r, &tftp, DIR_IN) && rules_match(r, &tftp, DIR_IN)->action == ACT_REJECT);
+    CHECK(!rules_match(r, &telnet_in, DIR_OUT));
     rules_free(r);
 }
 
@@ -423,6 +430,20 @@ static void test_load_missing_file(void)
     CHECK(strstr(err, "cannot open") != NULL);
 }
 
+static void test_reject_is_an_action(void)
+{
+    rules_t *r = parse("reject out tcp 10.0.1.0/24 any 23\n"
+                       "reject udp from 10.0.1.0/24 to any port 69\n");
+    CHECK(r && r->n == 2);
+    if (r) {
+        CHECK(r->v[0].action == ACT_REJECT && r->v[0].proto == FW_PROTO_TCP);
+        CHECK(r->v[1].action == ACT_REJECT && r->v[1].dport.r[0].lo == 69);
+    }
+    rules_free(r);
+    CHECK(parse_fails_with("inside 10.0.1.0/24\nrefuse tcp from any to any\n", "line 2:",
+                           "expected 'allow', 'deny' or 'reject'"));
+}
+
 int main(void)
 {
     RUN(test_parse_basic_and_comments);
@@ -447,5 +468,6 @@ int main(void)
     RUN(test_ports_only_allowed_on_tcp_and_udp_rules);
     RUN(test_load_directory_is_an_error_not_an_empty_ruleset);
     RUN(test_load_file_with_nul_byte_is_an_error);
+    RUN(test_reject_is_an_action);
     TEST_DONE();
 }

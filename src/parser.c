@@ -119,8 +119,7 @@ uint16_t csum_fold(uint32_t sum)
 }
 
 /* TCP/UDP pseudo-header: src, dst, zero, protocol, L4 length. */
-static uint32_t pseudo_sum(uint32_t src, uint32_t dst, uint8_t proto,
-                           uint16_t l4len)
+uint32_t csum_pseudo(uint32_t src, uint32_t dst, uint8_t proto, uint16_t l4len)
 {
     return (src >> 16) + (src & 0xffff) + (dst >> 16) + (dst & 0xffff) +
            proto + l4len;
@@ -202,7 +201,7 @@ static parse_result_t parse_tcp(const uint8_t *l4, uint16_t l4len, pkt_t *out)
     if (out->src_port == 0 || out->dst_port == 0)
         return PARSE_MALFORMED;
 
-    uint32_t sum = pseudo_sum(out->src_ip, out->dst_ip, FW_PROTO_TCP, l4len);
+    uint32_t sum = csum_pseudo(out->src_ip, out->dst_ip, FW_PROTO_TCP, l4len);
     if (csum_fold(csum_partial(l4, l4len, sum)) != 0)
         return PARSE_BAD_CSUM;
 
@@ -225,7 +224,7 @@ static parse_result_t parse_udp(const uint8_t *l4, uint16_t l4len, pkt_t *out)
 
     if (rd16(l4 + 6) != 0) { /* 0 means the sender computed no checksum */
         uint32_t sum =
-            pseudo_sum(out->src_ip, out->dst_ip, FW_PROTO_UDP, l4len);
+            csum_pseudo(out->src_ip, out->dst_ip, FW_PROTO_UDP, l4len);
         if (csum_fold(csum_partial(l4, l4len, sum)) != 0)
             return PARSE_BAD_CSUM;
     }
