@@ -35,6 +35,14 @@ need() { command -v "$1" >/dev/null || { echo "demo.sh: $1 is required ($2)" >&2
 
 in_ns() { local ns=$1; shift; sudo ip netns exec "$ns" "$@"; }
 
+# Start a helper server in a namespace, detached: setsid -f puts it in its own
+# session with no terminal, so it keeps running after this script exits (with
+# DEMO_NO_ATTACH=1 that is right away) or the terminal closes. On a terminal,
+# sudo runs its command on a pseudo-terminal that dies with this script, and a
+# plain `&` would take the helper down with it. `stop` still finds and kills
+# it, because it lives in the namespace.
+in_ns_bg() { local ns=$1; shift; sudo setsid -f ip netns exec "$ns" "$@" </dev/null >/dev/null 2>&1; }
+
 # Everything the demo started inside the namespaces, killed by namespace so
 # nothing else on the machine is touched.
 kill_in_namespaces() {
@@ -70,11 +78,11 @@ setup() {
     sudo scripts/netns.sh up nat || exit 1
 
     mkdir -p "$WEBDIR"; echo "<h1>tunwall demo server</h1>" > "$WEBDIR/index.html"
-    in_ns outside python3 scripts/dns_forwarder.py 10.0.2.2 "$UPSTREAM" >/dev/null 2>&1 &
+    in_ns_bg outside python3 scripts/dns_forwarder.py 10.0.2.2 "$UPSTREAM"
     # HTTP spoken on port 443 (outside), and two services on the inside client B
-    in_ns outside python3 -m http.server 443 --bind 10.0.2.3 --directory "$WEBDIR" >/dev/null 2>&1 &
-    in_ns inside  python3 -m http.server 22   --bind 10.0.1.3 --directory "$WEBDIR" >/dev/null 2>&1 &
-    in_ns inside  python3 -m http.server 3389 --bind 10.0.1.3 --directory "$WEBDIR" >/dev/null 2>&1 &
+    in_ns_bg outside python3 -m http.server 443 --bind 10.0.2.3 --directory "$WEBDIR"
+    in_ns_bg inside  python3 -m http.server 22   --bind 10.0.1.3 --directory "$WEBDIR"
+    in_ns_bg inside  python3 -m http.server 3389 --bind 10.0.1.3 --directory "$WEBDIR"
     sleep 1
 }
 
