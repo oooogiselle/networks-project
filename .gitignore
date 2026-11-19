@@ -21,3 +21,4 @@ perf.data*
 bench/results/
 config/*.conf
 !config/rules.example.conf
+__pycache__/

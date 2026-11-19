@@ -14,12 +14,24 @@ jobs:
         cc: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
-      - name: Build
+      - name: Build (library + tunwall)
         run: make CC=${{ matrix.cc }} all
       - name: Unit tests
         run: make CC=${{ matrix.cc }} test
       - name: Unit tests (ASan + UBSan)
         run: make CC=${{ matrix.cc }} asan
 
-  # Integration tests (network namespaces, needs sudo) are added in week 9
-  # once tests/integration/run_all.sh exists.
+  integration:
+    name: integration (namespaces + TUN)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 iputils-ping curl dnsutils nmap \
+            dnsmasq-base ethtool python3
+      - name: Build
+        run: make all
+      - name: Integration tests
+        run: sudo SLOW=1 tests/integration/run.sh
