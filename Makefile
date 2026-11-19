@@ -23,11 +23,11 @@ FLAGS_STAMP := $(BUILD)/.flags
 # Firewall core library: packet parser + decision engine (flow table, TCP
 # state, rules, engine, logging). tun I/O and main() link against this.
 LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
-           src/engine.c src/log.c src/fwalloc.c src/siphash.c src/forwarder.c src/appid.c
+           src/engine.c src/log.c src/fwalloc.c src/siphash.c src/forwarder.c src/appid.c src/nat.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
-TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail test_forwarder test_appid
+TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail test_forwarder test_appid test_nat
 # tun_open() uses the Linux tun driver, so its tests only run on Linux.
 ifeq ($(shell uname -s),Linux)
 TESTS += test_tun_io
@@ -54,7 +54,7 @@ $(BUILD)/tunwall: src/main.c src/tun_io.c include/tun_io.h $(LIB) $(FLAGS_STAMP)
 	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c src/tun_io.c $(LIB) -o $@
 
 # The parser, engine and fuzz tests also need the test packet builder.
-$(BUILD)/test_parser $(BUILD)/test_engine $(BUILD)/test_fuzz $(BUILD)/test_forwarder: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB) $(FLAGS_STAMP)
+$(BUILD)/test_parser $(BUILD)/test_engine $(BUILD)/test_fuzz $(BUILD)/test_forwarder $(BUILD)/test_nat: $(BUILD)/%: tests/%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB) $(FLAGS_STAMP)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/$*.c tests/pktbuild.c $(LIB) -o $@
 
 $(BUILD)/test_tun_io: tests/test_tun_io.c src/tun_io.c include/tun_io.h tests/testutil.h $(FLAGS_STAMP) | $(BUILD)
