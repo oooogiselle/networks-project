@@ -46,6 +46,8 @@ struct engine {
     uint64_t     clock_ns;       /* time of the packet/sweep being handled, for log lines */
     uint64_t     last_reclaim_ns;
     bool         reclaimed_once;
+    uint64_t     reject_window_ns;   /* start of the current REJECTS_PER_SEC window */
+    unsigned     rejects_in_window;
     /* The existing flow the last engine_decide() changed, and a copy of it as
      * it was before, so engine_undo_new_flow() can put it back if the packet
      * is never delivered. NULL when the last decision changed no flow. */
@@ -124,6 +126,23 @@ static void save_for_undo(engine_t *e, flow_t *f)
 {
     e->undo_flow = f;
     e->undo_copy = *f;
+}
+
+/* A reject rule matched: a drop that is also answered, within the budget. */
+static verdict_t do_reject(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now,
+                           drop_reason_t *out)
+{
+    do_drop(e, p, dir, now, DROP_RULE_REJECT, out);
+    if (now - e->reject_window_ns >= RECLAIM_MIN_INTERVAL_NS || now < e->reject_window_ns) {
+        e->reject_window_ns = now;
+        e->rejects_in_window = 0;
+    }
+    if (e->rejects_in_window >= REJECTS_PER_SEC) {
+        e->st.rejects_limited++;
+        return VERDICT_DROP;
+    }
+    e->rejects_in_window++;
+    return VERDICT_REJECT;
 }
 
 static verdict_t do_allow(engine_t *e, drop_reason_t *out)
@@ -339,8 +358,15 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
     const rule_t *r = rules_match(e->rules, p, dir);
     if (!r)
         return do_drop(e, p, dir, now_ns, DROP_NO_RULE, reason);
-    if (r->action == ACT_DENY)
+    switch (r->action) {
+    case ACT_ALLOW:
+        break;
+    case ACT_REJECT:
+        return do_reject(e, p, dir, now_ns, reason);
+    case ACT_DENY:
+    default:                       /* an unknown action never allows */
         return do_drop(e, p, dir, now_ns, DROP_RULE_DENY, reason);
+    }
 
     ft_status_t why = FT_OK;
     f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);

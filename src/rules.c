@@ -188,7 +188,8 @@ static int parse_line(char *line, int lineno, rule_t *r, char *err, size_t errle
 
     if (strcmp(tok[i], "allow") == 0) r->action = ACT_ALLOW;
     else if (strcmp(tok[i], "deny") == 0) r->action = ACT_DENY;
-    else { set_err(err, errlen, lineno, "expected 'allow' or 'deny'"); return -1; }
+    else if (strcmp(tok[i], "reject") == 0) r->action = ACT_REJECT;
+    else { set_err(err, errlen, lineno, "expected 'allow', 'deny' or 'reject'"); return -1; }
     i++;
 
     /* Keywords name the traffic direction, as in the spec: "out" = outbound

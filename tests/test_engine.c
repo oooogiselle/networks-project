@@ -1578,6 +1578,64 @@ static void test_engine_create_reports_bad_files(void)
     unlink(path);
 }
 
+/* ---- reject rules -------------------------------------------------------- */
+
+static void test_a_reject_rule_rejects_and_creates_no_flow(void)
+{
+    engine_t *e = make_engine("reject tcp from 10.0.0.0/24 to any port 23\n"
+                              "reject udp from 10.0.0.0/24 to any port 69\n"
+                              "reject icmp from 10.0.0.0/24 to any\n"
+                              "allow tcp from 10.0.0.0/24 to any port 80\n");
+    drop_reason_t w = DROP_NONE;
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 40000, SERVER, 23, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_REJECT);
+    CHECK(w == DROP_RULE_REJECT);
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 5000, SERVER, 69), DIR_IN, SEC, &w) == VERDICT_REJECT);
+    CHECK(send_pkt(e, mk_icmp(CLIENT_A, SERVER, ICMP_ECHO_REQUEST, 9), DIR_IN, SEC, &w) == VERDICT_REJECT);
+    /* no rule: still the silent default deny */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 40001, SERVER, 25, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_NO_RULE);
+    /* a rejected first packet leaves nothing behind, so its replies have no flow */
+    CHECK(send_pkt(e, mk_tcp(SERVER, 23, CLIENT_A, 40000, TCP_SYN | TCP_ACK), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_created == 0 && st.flows_active == 0);
+    CHECK(st.drops[DROP_RULE_REJECT] == 3 && st.pkts_dropped == 5 && st.pkts_allowed == 0);
+    CHECK(strcmp(drop_reason_str(DROP_RULE_REJECT), "rule-reject") == 0);
+    engine_destroy(e);
+}
+
+static void test_answers_to_reject_rules_are_rate_limited(void)
+{
+    engine_t *e = make_engine("reject tcp from 10.0.0.0/24 to any port 23\n");
+    drop_reason_t w;
+    int answered = 0, silent = 0;
+    for (int i = 0; i < REJECTS_PER_SEC + 20; i++) {
+        verdict_t v = send_pkt(e, mk_tcp(CLIENT_A, (uint16_t)(1024 + i), SERVER, 23, TCP_SYN),
+                               DIR_IN, SEC + (uint64_t)i, &w);
+        if (v == VERDICT_REJECT) answered++;
+        else if (v == VERDICT_DROP && w == DROP_RULE_REJECT) silent++;
+    }
+    CHECK(answered == REJECTS_PER_SEC && silent == 20);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.rejects_limited == 20 && st.drops[DROP_RULE_REJECT] == REJECTS_PER_SEC + 20);
+    /* a second later the budget is back */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 9999, SERVER, 23, TCP_SYN), DIR_IN, 2 * SEC + 200, &w) == VERDICT_REJECT);
+    FILE *out = tmpfile();
+    if (out) {
+        char text[2048] = "";
+        engine_get_stats(e, &st);
+        engine_stats_print(&st, out);
+        rewind(out);
+        size_t n = fread(text, 1, sizeof text - 1, out);
+        text[n] = '\0';
+        CHECK(strstr(text, "drop[rule-reject]=121") != NULL);
+        CHECK(strstr(text, "over-the-rate-limit(dropped-silently)=20") != NULL);
+        fclose(out);
+    }
+    engine_destroy(e);
+}
+
 int main(void)
 {
     RUN(test_web_fetch_allowed);
@@ -1649,5 +1707,7 @@ int main(void)
     RUN(test_the_label_is_in_every_flow_log_line_after_it_is_known);
     RUN(test_engine_create_from_the_shipped_config);
     RUN(test_engine_create_reports_bad_files);
+    RUN(test_a_reject_rule_rejects_and_creates_no_flow);
+    RUN(test_answers_to_reject_rules_are_rate_limited);
     TEST_DONE();
 }

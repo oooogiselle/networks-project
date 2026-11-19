@@ -280,6 +280,18 @@ expect "inside web to non-allowed port"    timeout probe inside  tcp 10.0.2.2 80
 expect "inside DNS to untrusted resolver"  timeout probe inside  udp 10.0.2.3 53
 expect "outside to ssh on client A (no rule)" timeout probe outside tcp 10.0.1.2 22
 
+echo "== reject rules answer at once (outbound only)"
+# The shipped rules reject telnet and TFTP from the inside: the client must be
+# told at once (RST / ICMP port unreachable), unlike the silent drops above.
+expect "inside telnet is refused, not left hanging" refused probe inside tcp 10.0.2.2 23
+expect "inside TFTP gets port unreachable"          refused probe inside udp 10.0.2.2 69
+expect "a port with no rule still times out"        timeout probe inside tcp 10.0.2.2 25
+t0=$(date +%s%N)
+probe inside tcp 10.0.2.2 23 >/dev/null 2>&1
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$ms" -lt 1000 ] && ok "the refusal arrives in ${ms} ms" || bad "the refusal took ${ms} ms (wanted < 1000)"
+logged "the reject is logged with its reason" 'DROP tcp 10\.0\.1\.2:[0-9]+ -> 10\.0\.2\.2:23 .*why=rule-reject'
+
 echo "== exposed service"
 expect "outside reaches ssh on client B"   open probe outside tcp 10.0.1.3 22
 
@@ -354,26 +366,6 @@ s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
 s.sendto(q, ("10.0.2.2", 53)); assert s.recv(512) == q'; }
 check "a real DNS query is answered" pass dns_query
 
-echo "== TTL and path MTU"
-ttl_probe() { # ttl_probe <ttl>: reply | ttl-exceeded | timeout
-    local out; out=$(ip netns exec inside ping -t "$1" -c 2 -W 2 10.0.2.2 2>&1)
-    if echo "$out" | grep -qi "time to live exceeded"; then echo ttl-exceeded
-    elif echo "$out" | grep -qE " 0% packet loss"; then echo reply
-    else echo timeout; fi
-}
-mtu_probe() { # mtu_probe <payload size>: reply | frag-needed | timeout (DF set)
-    local out; out=$(ip netns exec inside ping -M do -s "$1" -c 2 -W 2 10.0.2.2 2>&1)
-    if echo "$out" | grep -qiE "frag needed|message too long"; then echo frag-needed
-    elif echo "$out" | grep -qE " 0% packet loss"; then echo reply
-    else echo timeout; fi
-}
-expect "TTL 1 expires at the firewall (hop 1)"                       ttl-exceeded ttl_probe 1
-expect "TTL 2 gets through: the firewall counts as ONE hop, not two" reply ttl_probe 2
-ip -n firewall link set veth-out mtu 1400
-expect "a DF packet that fits the 1400-byte link passes"             reply mtu_probe 1372
-expect "a larger DF packet is told 'fragmentation needed'"           frag-needed mtu_probe 1400
-ip -n firewall link set veth-out mtu 1500
-
 echo "== logging and stats"
 dump_stats
 
@@ -397,6 +389,7 @@ not_logged "allowed web traffic is never dropped by a rule" 'DROP tcp 10\.0\.1\.
 not_logged "allowed ssh is never dropped by a rule" 'DROP tcp 10\.0\.2\.[0-9]+:[0-9]+ -> 10\.0\.1\.3:22 .*why=(no-rule|rule-deny)'
 logged "stats: default-deny count printed" '^drop\[no-rule\(default-deny\)\]=[1-9][0-9]*'
 logged "stats: rule-deny count printed" '^drop\[rule-deny\]=[1-9][0-9]*'
+logged "stats: the reject answers are counted" '^io: .* rejects=[1-9][0-9]*$'
 logged "stats: flows were created" '^flows: +created=[1-9][0-9]* '
 
 echo "== idle flows expire"
@@ -412,6 +405,30 @@ if [ -n "${HALFCLOSE_PID:-}" ]; then
     wait "$HALFCLOSE_PID" && ok "a half-closed connection survives a 75 s wait for the server's answer" \
                           || bad "half-close: the server's late answer did not arrive (flow expired?)"
 fi
+
+# Runs after the background flow tests above have finished: it shrinks the
+# outside link's MTU for a moment, which would silently drop the full-size
+# segments of any connection still in flight on that link (the half-close
+# server's late answer, for one).
+echo "== TTL and path MTU"
+ttl_probe() { # ttl_probe <ttl>: reply | ttl-exceeded | timeout
+    local out; out=$(ip netns exec inside ping -t "$1" -c 2 -W 2 10.0.2.2 2>&1)
+    if echo "$out" | grep -qi "time to live exceeded"; then echo ttl-exceeded
+    elif echo "$out" | grep -qE " 0% packet loss"; then echo reply
+    else echo timeout; fi
+}
+mtu_probe() { # mtu_probe <payload size>: reply | frag-needed | timeout (DF set)
+    local out; out=$(ip netns exec inside ping -M do -s "$1" -c 2 -W 2 10.0.2.2 2>&1)
+    if echo "$out" | grep -qiE "frag needed|message too long"; then echo frag-needed
+    elif echo "$out" | grep -qE " 0% packet loss"; then echo reply
+    else echo timeout; fi
+}
+expect "TTL 1 expires at the firewall (hop 1)"                       ttl-exceeded ttl_probe 1
+expect "TTL 2 gets through: the firewall counts as ONE hop, not two" reply ttl_probe 2
+ip -n firewall link set veth-out mtu 1400
+expect "a DF packet that fits the 1400-byte link passes"             reply mtu_probe 1372
+expect "a larger DF packet is told 'fragmentation needed'"           frag-needed mtu_probe 1400
+ip -n firewall link set veth-out mtu 1500
 
 if [ -n "${INTERNET:-}" ]; then
     echo "== the real Internet through the firewall"

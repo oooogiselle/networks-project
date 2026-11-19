@@ -11,6 +11,7 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 |---|---|---|
 | `include/engine.h` | Shared interface: `pkt_t`, `engine_decide()` | shared |
 | `include/parser.h`, `src/parser.c` | Packet parse + checksums → `pkt_t` | Giselle |
+| `include/reject.h`, `src/reject.c` | Builds the answer to a `reject` rule: a TCP RST or an ICMP unreachable, with checksums (pure function) | Giselle |
 | `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | shared |
 | `src/flowtable.c` | 5-tuple hash table, expiry | Eva |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
@@ -322,7 +323,8 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
    packet with no payload, or ICMP, is never labelled. Rules cannot match on the
    application, so, for example, TLS on 8080 is allowed or refused by the port
    rules exactly as before.
-4. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, and calls
+4. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, answers on
+   `VERDICT_REJECT` (see [Reject rules](#reject-rules)), and calls
    `engine_expire()` about once a second.
 
 For ICMP errors, `pkt.payload` is the embedded original packet;
@@ -342,6 +344,35 @@ items). `inside <cidr>` declares the trusted network(s) and is required: it driv
 the address anti-spoofing check, and without it the firewall refuses to start.
 `out` = connection initiated from the inside (the default); `in` = initiated
 from the outside (exposed services).
+
+### Reject rules
+
+`reject` (an optional feature from spec section 7) refuses a new connection
+like `deny`, but tells the sender at once instead of letting it time out:
+
+| First packet | Answer |
+|---|---|
+| TCP SYN | RST (with ACK, acknowledging the SYN, per RFC 793) |
+| UDP datagram | ICMP port unreachable (3/3) quoting the datagram |
+| ICMP echo request | ICMP administratively prohibited (3/13) |
+
+The answer poses as the host the packet was sent to and goes back out the
+interface the packet came in on, the same path a real reply takes, so the
+client's kernel matches it to the socket: `curl` fails with "Connection
+refused" in milliseconds instead of hanging. The shipped config rejects telnet
+(23) and TFTP (69) from the inside. Safeguards:
+- the default policy is still a **silent** drop, so `nmap` from outside still
+  sees only `filtered` ports. Use `reject` for your own users' outbound traffic.
+- a RST, an ICMP error or an echo reply is never answered, so two firewalls
+  can't answer each other forever.
+- at most `REJECTS_PER_SEC` (100) answers are sent per second. Past that,
+  rejected packets are dropped silently and counted
+  (`reject: over-the-rate-limit(dropped-silently)=N`), so forged floods can't
+  aim RSTs at someone else.
+- with source NAT on, a packet the NAT translated back to an inside address is
+  never answered (it is dropped silently): the answer would carry that hidden
+  inside address as its source.
+- the log says `why=rule-reject`, and the `io:` counter line says `rejects=N`.
 
 ## Not done yet / ideas
 

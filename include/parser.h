@@ -99,5 +99,8 @@ parse_result_t parse_icmp_inner(const pkt_t *p, pkt_t *inner);
 /* RFC 1071 Internet checksum helpers (exposed for tests and for NAT later). */
 uint32_t csum_partial(const void *data, size_t len, uint32_t sum);
 uint16_t csum_fold(uint32_t sum);
+/* Unfolded sum of the TCP/UDP pseudo-header (addresses in host order); pass
+ * it as the starting sum to csum_partial() over the L4 header and data. */
+uint32_t csum_pseudo(uint32_t src, uint32_t dst, uint8_t proto, uint16_t l4len);
 
 #endif /* FW_PARSER_H */

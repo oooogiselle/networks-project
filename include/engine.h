@@ -74,7 +74,9 @@ typedef enum {
     DIR_OUT = 1    /* arrived on tun-out: from the untrusted/outside network */
 } dir_t;
 
-typedef enum { VERDICT_DROP = 0, VERDICT_ALLOW = 1 } verdict_t;
+/* VERDICT_REJECT: drop it, and answer the sender (reject.h). Callers that
+ * only test for VERDICT_ALLOW treat it as a drop. */
+typedef enum { VERDICT_DROP = 0, VERDICT_ALLOW = 1, VERDICT_REJECT = 2 } verdict_t;
 
 /* Defaults applied by engine_create() / engine_create_with_rules(): one source
  * address may hold 1/16 of the table, and flows started from the outside at
@@ -85,6 +87,11 @@ typedef enum { VERDICT_DROP = 0, VERDICT_ALLOW = 1 } verdict_t;
 
 /* Related ICMP errors allowed per flow per second; more are dropped. */
 #define ICMP_ERRORS_PER_FLOW_PER_SEC 8
+
+/* Answers to `reject` rules sent per second, in all; past that a rejected
+ * packet is dropped silently, so a flood (with forged source addresses, say)
+ * cannot turn the firewall into a source of RSTs aimed at someone else. */
+#define REJECTS_PER_SEC 100
 
 typedef enum {
     DROP_NONE = 0,
@@ -104,6 +111,7 @@ typedef enum {
     DROP_SRC_LIMIT,        /* this source already holds its share of flows  */
     DROP_OUTSIDE_QUOTA,    /* outside-started flows already hold their share */
     DROP_WRITE_FAILED,     /* allowed, but the other side would not take it */
+    DROP_RULE_REJECT,      /* new flow, a reject rule matched (and may be answered) */
     DROP_REASON_COUNT
 } drop_reason_t;
 
@@ -127,6 +135,7 @@ typedef struct engine_stats {
      * never change a verdict. */
     uint64_t app_flows[APP_COUNT];
     uint64_t app_mismatch;
+    uint64_t rejects_limited;      /* reject matches dropped silently: over REJECTS_PER_SEC */
 } engine_stats_t;
 
 typedef struct engine engine_t;
