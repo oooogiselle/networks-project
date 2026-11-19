@@ -51,6 +51,18 @@
  * with it (engine_create* fail): without it there is no way to tell a spoofed
  * source from a real one.
  *
+ * Port forwarding (destination NAT; needs source NAT, `tunwall -n ADDR`):
+ *
+ *   forward (tcp|udp) <ext-port> <a.b.c.d> <port>      (up to 16)
+ *       e.g.  forward tcp 8080 10.0.1.3 80
+ *
+ * A connection from the outside to ADDR:<ext-port> is sent to the inside
+ * host <a.b.c.d>:<port>, and its replies leave from ADDR:<ext-port>. The
+ * target must be in an `inside` network and the external port must not be in
+ * the source-NAT port range. A forward only translates: the connection is
+ * then decided like any other, so it also needs a rule such as
+ *   allow in tcp any 10.0.1.3 80
+ *
  * `reject` refuses a new connection like `deny`, but also tells the sender
  * at once instead of letting it time out: a TCP RST for TCP, ICMP port
  * unreachable for UDP, ICMP administratively prohibited for an echo request
@@ -82,6 +94,18 @@ typedef struct {
 /* Max `inside` networks a rules file may declare. */
 #define MAX_INSIDE_NETS 8
 
+/* Max `forward` lines a rules file may declare. */
+#define MAX_FORWARDS 16
+
+/* A `forward` line: outside -> NAT address:ext_port goes to ip:port. */
+typedef struct forward {
+    uint8_t  proto;              /* FW_PROTO_TCP or FW_PROTO_UDP */
+    uint16_t ext_port;
+    uint32_t ip;
+    uint16_t port;
+    int      line;
+} forward_t;
+
 typedef struct rule {
     action_t     action;
     dir_t        dir;
@@ -96,6 +120,8 @@ struct rules {
     size_t  n, cap;
     addr_match_t inside[MAX_INSIDE_NETS];   /* `inside` directives */
     size_t       ninside;
+    forward_t    fwd[MAX_FORWARDS];         /* `forward` directives */
+    size_t       nfwd;
 };
 
 rules_t *rules_load_file(const char *path, char *err, size_t errlen);
