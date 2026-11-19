@@ -112,6 +112,7 @@ typedef enum {
     DROP_OUTSIDE_QUOTA,    /* outside-started flows already hold their share */
     DROP_WRITE_FAILED,     /* allowed, but the other side would not take it */
     DROP_RULE_REJECT,      /* new flow, a reject rule matched (and may be answered) */
+    DROP_SCAN_BLOCKED,     /* source is blocked after a port scan (scandetect.h) */
     DROP_REASON_COUNT
 } drop_reason_t;
 
@@ -136,7 +137,26 @@ typedef struct engine_stats {
     uint64_t app_flows[APP_COUNT];
     uint64_t app_mismatch;
     uint64_t rejects_limited;      /* reject matches dropped silently: over REJECTS_PER_SEC */
+    uint64_t scans_detected;       /* outside hosts that crossed the scan threshold */
+    uint64_t hosts_blocked;        /* blocked for scanning right now */
 } engine_stats_t;
+
+/*
+ * Port-scan detection: an outside host whose packets are dropped on `ports`
+ * distinct TCP/UDP ports within `window_s` seconds is blocked (everything it
+ * sends is dropped, existing flows included) for `block_s` seconds.
+ * engine_create() / engine_create_with_rules() turn it on with the defaults;
+ * engine_create_with_rules_sized() leaves it off. ports == 0 means off.
+ */
+typedef struct scan_cfg {
+    uint16_t ports;
+    uint32_t window_s, block_s;
+} scan_cfg_t;
+
+#define SCAN_DEFAULT_PORTS     20
+#define SCAN_DEFAULT_WINDOW_S  5
+#define SCAN_DEFAULT_BLOCK_S   60
+#define SCAN_MAX_PORTS         100   /* memory per tracked source is sized by this */
 
 typedef struct engine engine_t;
 typedef struct rules rules_t;
@@ -222,5 +242,20 @@ bool engine_replace_rules(engine_t *e, rules_t *r);
  */
 rules_t       *engine_load_rules(const char *path, char *err, size_t errlen);
 const rules_t *engine_rules(const engine_t *e);
+
+/*
+ * Replace the scan-detection settings (see scan_cfg_t); current tracking and
+ * blocks are forgotten. False if cfg is invalid (ports above SCAN_MAX_PORTS,
+ * window_s or block_s 0) or out of memory; the old settings then stay.
+ */
+bool engine_set_scan(engine_t *e, const scan_cfg_t *cfg);
+
+/*
+ * A packet from the outside that was dropped before engine_decide() saw it:
+ * source NAT drops unsolicited packets to its address (nat.h) itself. It
+ * counts toward scan detection like a default-deny drop, and nothing else
+ * (NAT has its own counter for it).
+ */
+void engine_note_unsolicited(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_ns);
 
 #endif

@@ -166,7 +166,8 @@ static void test_engine_create_survives_each_failure(void)
 
 static void test_default_engine_with_limits_survives_each_failure(void)
 {
-    /* engine_create_with_rules() also allocates the per-source counter table */
+    /* engine_create_with_rules() also allocates the per-source counter table
+     * and the port-scan tracker */
     char err[128];
     int failures = 0;
     for (long k = 1; k < MAX_SWEEP; k++) {
@@ -183,7 +184,8 @@ static void test_default_engine_with_limits_survives_each_failure(void)
         CHECK(e == NULL);               /* and nothing leaks: run under make asan */
     }
     fw_alloc_fail_nth(0);
-    CHECK(failures == 6);               /* engine, the flow table's four, the per-source counters */
+    CHECK(failures == 10);   /* engine, the flow table's four, the per-source counters,
+                              * the scan tracker's four (struct, slots, ports, hash key) */
 }
 
 static void test_engine_create_from_file_survives_each_failure(void)

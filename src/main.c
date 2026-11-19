@@ -9,9 +9,10 @@
  *              (refusing to start on any error), opens the two tun devices,
  *              and runs the packet loop until SIGINT or SIGTERM. SIGUSR1
  *              prints the counters (they are also printed on exit), and
- *              SIGHUP reloads the rules file without a restart. Flow
- *              opens/closes and dropped packets (with the reason) are logged
- *              to stderr, rate-limited so a flood cannot flood the log.
+ *              SIGHUP reloads the rules file without a restart. An outside
+ *              host that probes too many ports is blocked for a while (-s).
+ *              Flow opens/closes and dropped packets (with the reason) are
+ *              logged to stderr, rate-limited so a flood cannot flood the log.
  =============================================================================*/
 
 #include <arpa/inet.h>
@@ -41,20 +42,54 @@ static void on_hup(int sig)   { (void)sig; g_reload = 1; }
 static void usage(FILE *out)
 {
     fprintf(out,
-        "usage: tunwall -r <rules-file> [-i <tun-in>] [-o <tun-out>] [-n <addr>] [-f | -q]\n"
+        "usage: tunwall -r <rules-file> [-i <tun-in>] [-o <tun-out>] [-n <addr>] [-s <scan>] [-f | -q]\n"
         "  -r FILE   rules file (required); the program refuses to start on a syntax error\n"
         "  -i NAME   tun device facing the trusted network   (default tun-in)\n"
         "  -o NAME   tun device facing the untrusted network (default tun-out)\n"
         "  -n ADDR   source NAT: connections from the inside leave as ADDR, with\n"
         "            ports %d-%d (ADDR must route to the outside tun device);\n"
         "            also turns on the rules file's 'forward' lines (port forwarding)\n"
+        "  -s P[,W[,B]]  port-scan detection: an outside host dropped on P distinct\n"
+        "            ports within W s is blocked for B s (default %d,%d,%d; -s 0 = off)\n"
         "  -f        log flow opens/closes only, not individual dropped packets\n"
         "  -q        log nothing but errors\n"
         "  -d        accepted for old scripts: logging drops is now the default\n"
         "By default every flow open/close and every dropped packet (with its reason)\n"
         "is logged to stderr, limited to %d lines/s (a summary line says how many\n"
         "were suppressed). SIGUSR1 prints the counters; SIGHUP reloads the rules file\n"
-        "(a bad file keeps the old rules); SIGINT/SIGTERM stop it and print them.\n", NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT, FW_LOG_LINES_PER_SEC);
+        "(a bad file keeps the old rules); SIGINT/SIGTERM stop it and print them.\n", NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT,
+        SCAN_DEFAULT_PORTS, SCAN_DEFAULT_WINDOW_S, SCAN_DEFAULT_BLOCK_S, FW_LOG_LINES_PER_SEC);
+}
+
+/* One decimal field of -s in [lo, hi], ending at ',' or the end. */
+static bool parse_field(const char **sp, unsigned long lo, unsigned long hi,
+                        unsigned long *out)
+{
+    char *end;
+    errno = 0;
+    const unsigned long v = strtoul(*sp, &end, 10);
+    if (end == *sp || errno || v < lo || v > hi || (*end && *end != ','))
+        return false;
+    *out = v;
+    *sp = *end ? end + 1 : end;
+    return true;
+}
+
+/* -s "P[,W[,B]]" or "0" (off). Fields left out keep their defaults. */
+static bool parse_scan(const char *arg, scan_cfg_t *cfg)
+{
+    if (strcmp(arg, "0") == 0) { cfg->ports = 0; return true; }
+    unsigned long v;
+    const char *s = arg;
+    if (!parse_field(&s, 2, SCAN_MAX_PORTS, &v)) return false;
+    cfg->ports = (uint16_t)v;
+    if (!*s) return true;
+    if (!parse_field(&s, 1, 3600, &v)) return false;
+    cfg->window_s = (uint32_t)v;
+    if (!*s) return true;
+    if (!parse_field(&s, 1, 86400, &v) || *s) return false;
+    cfg->block_s = (uint32_t)v;
+    return true;
 }
 
 /*
@@ -120,13 +155,22 @@ int main(int argc, char **argv)
 
     const char *rules = NULL, *in_name = "tun-in", *out_name = "tun-out", *nat_arg = NULL;
     log_level_t level = LOG_DEBUG;
+    scan_cfg_t scan = { SCAN_DEFAULT_PORTS, SCAN_DEFAULT_WINDOW_S, SCAN_DEFAULT_BLOCK_S };
     int opt;
-    while ((opt = getopt(argc, argv, "r:i:o:n:fqdh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:i:o:n:s:fqdh")) != -1) {
         switch (opt) {
         case 'r': rules = optarg; break;
         case 'i': in_name = optarg; break;
         case 'o': out_name = optarg; break;
         case 'n': nat_arg = optarg; break;
+        case 's':
+            if (!parse_scan(optarg, &scan)) {
+                fprintf(stderr, "tunwall: -s needs PORTS[,WINDOW_S[,BLOCK_S]] with PORTS "
+                        "2-%d, WINDOW_S 1-3600, BLOCK_S 1-86400, or 0 for off; got '%s'\n",
+                        SCAN_MAX_PORTS, optarg);
+                return 2;
+            }
+            break;
         case 'f': level = LOG_INFO; break;
         case 'q': level = LOG_OFF; break;
         case 'd': level = LOG_DEBUG; break;
@@ -150,6 +194,11 @@ int main(int argc, char **argv)
     engine_t *engine = engine_create(rules, err, sizeof err);
     if (!engine) {
         fprintf(stderr, "tunwall: %s\n", err);       /* the message names the file */
+        return 1;
+    }
+    if (!engine_set_scan(engine, &scan)) {
+        fprintf(stderr, "tunwall: out of memory\n");
+        engine_destroy(engine);
         return 1;
     }
 
@@ -201,6 +250,13 @@ int main(int argc, char **argv)
     if (level != LOG_OFF)
         fprintf(stderr, "tunwall: running (rules %s, inside %s, outside %s%s%s)\n",
                 rules, in_name, out_name, nat ? ", source NAT to " : "", nat ? nat_arg : "");
+    if (level != LOG_OFF) {
+        if (scan.ports)
+            fprintf(stderr, "tunwall: scan detection on: %u ports in %u s blocks the host for %u s\n",
+                    (unsigned)scan.ports, (unsigned)scan.window_s, (unsigned)scan.block_s);
+        else
+            fprintf(stderr, "tunwall: scan detection off\n");
+    }
 
     int rc = 0;
     uint64_t reported_write_errors = 0;

@@ -14,6 +14,7 @@
 /*
  * engine.c - ties the flow table, TCP state machine and rules together.
  *
+ *   blocked source -> dropped (a port scanner, see scandetect.h)
  *   existing flow  -> FAST PATH: hash lookup + state update, no rules
  *   no flow        -> SLOW PATH: sanity-check, evaluate rules, maybe create
  */
@@ -28,6 +29,7 @@
 #include "log.h"
 #include "parser.h"
 #include "rules.h"
+#include "scandetect.h"
 #include "tcpstate.h"
 
 
@@ -42,6 +44,8 @@ static void identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns
 struct engine {
     rules_t     *rules;
     flowtable_t *ft;
+    scan_t      *scan;           /* port-scan detection; NULL = off */
+    scan_cfg_t   scan_cfg;
     engine_stats_t st;
     uint64_t     clock_ns;       /* time of the packet/sweep being handled, for log lines */
     uint64_t     last_reclaim_ns;
@@ -75,7 +79,10 @@ engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows)
 engine_t *engine_create_with_rules(rules_t *rules)
 {
     engine_t *e = engine_create_with_rules_sized(rules, FW_DEFAULT_MAX_FLOWS);
-    if (e && !engine_set_limits(e, FW_DEFAULT_MAX_PER_SOURCE, FW_DEFAULT_MAX_OUTSIDE)) {
+    const scan_cfg_t scan = { SCAN_DEFAULT_PORTS, SCAN_DEFAULT_WINDOW_S,
+                              SCAN_DEFAULT_BLOCK_S };
+    if (e && (!engine_set_limits(e, FW_DEFAULT_MAX_PER_SOURCE, FW_DEFAULT_MAX_OUTSIDE) ||
+              !engine_set_scan(e, &scan))) {
         engine_destroy(e);
         return NULL;
     }
@@ -114,8 +121,24 @@ void engine_destroy(engine_t *e)
 {
     if (!e) return;
     ft_destroy(e->ft);
+    scan_destroy(e->scan);
     rules_free(e->rules);
     free(e);
+}
+
+/*
+ * Count one probe toward port-scan detection: an outside TCP/UDP packet the
+ * policy refused. Logs SCAN when it pushes its source over the threshold.
+ */
+static void scan_count(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now)
+{
+    uint64_t span;
+    if (e->scan && dir == DIR_OUT &&
+        (p->proto == FW_PROTO_TCP || p->proto == FW_PROTO_UDP) &&
+        scan_hit(e->scan, p->src_ip, p->proto, p->dst_port, now, &span)) {
+        e->st.scans_detected++;
+        log_scan(p->src_ip, e->scan_cfg.ports, span, e->scan_cfg.block_s, now);
+    }
 }
 
 static verdict_t do_drop(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now,
@@ -125,7 +148,19 @@ static verdict_t do_drop(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now,
     e->st.drops[why]++;
     log_drop(p, dir, why, now);
     if (out) *out = why;
+    /* Probing for open ports: refused by the policy, or a TCP packet with no
+     * connection (ACK, FIN, Xmas, NULL scans). Drops on existing flows, of
+     * spoofed sources, of wrong destinations and for full tables do not count. */
+    if (why == DROP_NO_RULE || why == DROP_RULE_DENY || why == DROP_RULE_REJECT ||
+        why == DROP_NOT_SYN)
+        scan_count(e, p, dir, now);
     return VERDICT_DROP;
+}
+
+void engine_note_unsolicited(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_ns)
+{
+    e->clock_ns = now_ns;
+    scan_count(e, p, dir, now_ns);
 }
 
 /* Remember f as it is now, before this packet changes it. */
@@ -262,6 +297,12 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
      * use them. engine creation guarantees an `inside` network exists. */
     if (rules_is_inside(e->rules, p->src_ip) != (dir == DIR_IN))
         return do_drop(e, p, dir, now_ns, DROP_BAD_SRC, reason);
+
+    /* A blocked port scanner gets nothing through, not even on existing
+     * flows. Costs nothing while nobody is blocked. */
+    if (dir == DIR_OUT && e->scan && scan_nblocked(e->scan) &&
+        scan_blocked(e->scan, p->src_ip, now_ns))
+        return do_drop(e, p, dir, now_ns, DROP_SCAN_BLOCKED, reason);
 
     if (p->proto == FW_PROTO_ICMP && icmp_is_error(p->icmp_type)) {
         /* Checked before the flow lookup: an error's own (ip, ip, 0, 0)
@@ -427,9 +468,16 @@ static void expire_cb(const flow_t *f, void *ud)
     if (!f->close_logged) log_flow("EXPIRE", f, e->clock_ns);
 }
 
+static void unblock_cb(uint32_t ip, uint64_t dropped, void *ud)
+{
+    const engine_t *e = ud;
+    log_unblock(ip, dropped, e->clock_ns);
+}
+
 size_t engine_expire(engine_t *e, uint64_t now_ns)
 {
     e->clock_ns = now_ns;
+    if (e->scan) scan_expire(e->scan, now_ns, unblock_cb, e);
     return ft_expire(e->ft, now_ns, expire_cb, e);
 }
 
@@ -503,4 +551,18 @@ void engine_get_stats(const engine_t *e, engine_stats_t *out)
     *out = e->st;
     out->flows_expired = ft_expired_total(e->ft);
     out->flows_active = ft_count(e->ft);
+    out->hosts_blocked = e->scan ? scan_nblocked(e->scan) : 0;
+}
+
+bool engine_set_scan(engine_t *e, const scan_cfg_t *cfg)
+{
+    scan_t *s = NULL;
+    if (cfg->ports) {
+        s = scan_create(cfg);
+        if (!s) return false;
+    }
+    scan_destroy(e->scan);
+    e->scan = s;
+    e->scan_cfg = *cfg;
+    return true;
 }

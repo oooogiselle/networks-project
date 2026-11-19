@@ -18,7 +18,7 @@ set -u
 cd "$(dirname "$0")/.."
 AUTO=${DEMO_AUTO:-}
 LOG=${DEMO_LOG:-}
-TOTAL=11
+TOTAL=12
 
 B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; C=$'\033[36m'; Z=$'\033[0m'
 pass=0; failn=0; n=0
@@ -149,6 +149,24 @@ check "the exposed service answered" contains "$out" "tunwall demo server"
 check "the inbound flow was logged" log_has "FLOW NEW +tcp 10\\.0\\.2\\.[0-9]+:[0-9]+ -> 10\\.0\\.1\\.3:22"
 
 # ---------------------------------------------------------------------------
+step "A port scanner gets cut off" \
+     "Now 10.0.2.3 scans client B's ports 1-100, in order. After 20 dropped ports in" \
+     "5 seconds the firewall decides it is a scan and drops EVERYTHING from that host" \
+     "for 60 s, so port 22, open a moment ago, is never found. Log: a yellow SCAN line." \
+     "Other outside hosts are not affected."
+cmd "nmap -Pn -n -S 10.0.2.3 -T4 -r -p 1-100 10.0.1.3      (from the outside namespace)"
+out=$(outside nmap -Pn -n --send-ip -S 10.0.2.3 -e veth-sout -T4 -r --max-retries 1 -p 1-100 10.0.1.3 2>&1)
+echo "$out" | grep -E "^PORT|/tcp|Not shown|Nmap done" | sed 's/^/     /'
+check "the scan was detected" log_has "SCAN +10\\.0\\.2\\.3 dropped on 20 ports"
+check "nmap did not find port 22 (scanned after the cut-off)" test "$(echo "$out" | grep -cE '^22/tcp +open')" = 0
+cmd "curl http://10.0.1.3:22/ from the scanner, then from 10.0.2.2"
+outside curl -s -m 4 --interface 10.0.2.3 -o /dev/null http://10.0.1.3:22/; rc=$?
+say "   from 10.0.2.3: curl exit $rc (28 = timed out)"
+check "the scanner can no longer reach port 22" test "$rc" = 28
+out=$(outside curl -s -m 5 --interface 10.0.2.2 http://10.0.1.3:22/)
+check "10.0.2.2 still can" contains "$out" "tunwall demo server"
+
+# ---------------------------------------------------------------------------
 step "The counters" \
      "Sending SIGUSR1 prints the statistics: packets allowed and dropped, drops by" \
      "reason, flows, the identified applications, and any log lines suppressed."
@@ -156,6 +174,7 @@ cmd "kill -USR1 tunwall"
 sudo pkill -USR1 -x tunwall; sleep 1
 check "the counters were printed" log_has "^apps: +http=[1-9]"
 check "drops are broken down by reason" log_has "^drop\\[no-rule\\(default-deny\\)\\]=[1-9]"
+check "the scan is counted" log_has "^scan: +detected=1 "
 
 # ---------------------------------------------------------------------------
 step "Performance against the Linux kernel" \

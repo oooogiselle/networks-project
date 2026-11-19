@@ -106,6 +106,7 @@ const char *drop_reason_str(drop_reason_t r)
     case DROP_OUTSIDE_QUOTA: return "outside-quota";
     case DROP_WRITE_FAILED: return "write-failed";
     case DROP_RULE_REJECT: return "rule-reject";
+    case DROP_SCAN_BLOCKED: return "scan-blocked";
     case DROP_REASON_COUNT: break;
     }
     return "?";
@@ -132,6 +133,24 @@ void log_flow(const char *event, const flow_t *f, uint64_t now_ns)
     if (strcmp(event, "APP") == 0 && expected != APP_UNKNOWN && expected != (app_t)f->app)
         fprintf(g_out, " mismatch(port suggests %s)", app_name(expected));
     fputc('\n', g_out);
+}
+
+void log_scan(uint32_t ip, unsigned nports, uint64_t span_ns, uint32_t block_s,
+              uint64_t now_ns)
+{
+    if (!fw_log_enabled(LOG_INFO) || !log_allowed(now_ns)) return;
+    char a[16];
+    fprintf(g_out, "[%10.6f] SCAN    %s dropped on %u ports in %.2fs, blocking for %us\n",
+            now_ns / 1e9, ip_str(ip, a, sizeof a), nports, span_ns / 1e9,
+            (unsigned)block_s);
+}
+
+void log_unblock(uint32_t ip, uint64_t dropped, uint64_t now_ns)
+{
+    if (!fw_log_enabled(LOG_INFO) || !log_allowed(now_ns)) return;
+    char a[16];
+    fprintf(g_out, "[%10.6f] UNBLOCK %s (dropped %" PRIu64 " packets while blocked)\n",
+            now_ns / 1e9, ip_str(ip, a, sizeof a), dropped);
 }
 
 void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns)
@@ -165,6 +184,8 @@ void engine_stats_print(const engine_stats_t *s, FILE *out)
             s->app_flows[APP_OTHER], s->app_mismatch);
     fprintf(out, "flows:   created=%" PRIu64 " expired=%" PRIu64 " active=%" PRIu64 "\n",
             s->flows_created, s->flows_expired, s->flows_active);
+    fprintf(out, "scan:    detected=%" PRIu64 " blocked-now=%" PRIu64 "\n",
+            s->scans_detected, s->hosts_blocked);
     for (int i = 1; i < PARSE_RESULT_COUNT; i++)
         if (s->parse_fail[i])
             fprintf(out, "parse-fail[%s]=%" PRIu64 "\n",

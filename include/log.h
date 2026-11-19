@@ -46,6 +46,13 @@ const char *proto_str(uint8_t proto);
 /* INFO: flow lifecycle. event is "NEW", "EXPIRE", "CLOSE", ... */
 void log_flow(const char *event, const flow_t *f, uint64_t now_ns);
 
+/* INFO: a port scan from ip was detected; it is blocked for block_s seconds.
+ * span_ns is the time its last nports distinct ports took. */
+void log_scan(uint32_t ip, unsigned nports, uint64_t span_ns, uint32_t block_s,
+              uint64_t now_ns);
+/* INFO: ip's scan block ended; dropped = its packets dropped meanwhile. */
+void log_unblock(uint32_t ip, uint64_t dropped, uint64_t now_ns);
+
 /* DEBUG: a dropped packet. */
 void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns);
 
