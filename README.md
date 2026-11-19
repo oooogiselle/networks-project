@@ -50,7 +50,13 @@ kinds of line) so a flood or a scan cannot turn into a flood of log writes; when
 lines had to be dropped a `N log lines suppressed` line says how many, and the
 counters are never limited. `-f` logs flows only, `-q` logs only errors, `-d` is
 accepted for old scripts. SIGUSR1 prints the counters; SIGINT/SIGTERM stop it
-and print them (exit status 0). It refuses to start, naming the file, on a rules
+and print them (exit status 0). SIGHUP reloads the rules file without a restart
+(`sudo ip netns exec firewall pkill -HUP tunwall`): the new rules govern
+connections that start from then on, existing flows keep going (as Linux
+conntrack keeps ESTABLISHED connections when iptables rules change), and a
+file with an error (reported with its line number), with no `inside` network,
+or that cannot be read is refused while the running rules stay exactly as
+they were. It refuses to start, naming the file, on a rules
 syntax error (with the line number), on a missing `inside` network, or if a tun
 device does not exist. Restarting `tunwall` forgets all flow state, so
 connections that were established before the restart stall (their packets are
