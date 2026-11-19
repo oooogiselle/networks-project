@@ -46,7 +46,8 @@ static void usage(FILE *out)
         "  -i NAME   tun device facing the trusted network   (default tun-in)\n"
         "  -o NAME   tun device facing the untrusted network (default tun-out)\n"
         "  -n ADDR   source NAT: connections from the inside leave as ADDR, with\n"
-        "            ports %d-%d (ADDR must route to the outside tun device)\n"
+        "            ports %d-%d (ADDR must route to the outside tun device);\n"
+        "            also turns on the rules file's 'forward' lines (port forwarding)\n"
         "  -f        log flow opens/closes only, not individual dropped packets\n"
         "  -q        log nothing but errors\n"
         "  -d        accepted for old scripts: logging drops is now the default\n"
@@ -54,6 +55,28 @@ static void usage(FILE *out)
         "is logged to stderr, limited to %d lines/s (a summary line says how many\n"
         "were suppressed). SIGUSR1 prints the counters; SIGHUP reloads the rules file\n"
         "(a bad file keeps the old rules); SIGINT/SIGTERM stop it and print them.\n", NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT, FW_LOG_LINES_PER_SEC);
+}
+
+/*
+ * Can these rules' `forward` lines be used? They need source NAT (-n), and
+ * their external ports must stay out of its port range. False with err
+ * (naming the file) if not.
+ */
+static bool forwards_ok(const nat_t *nat, const rules_t *r, const char *path,
+                        char *err, size_t errlen)
+{
+    if (r->nfwd == 0) return true;
+    if (!nat) {
+        snprintf(err, errlen, "%s: line %d: 'forward' needs source NAT (-n ADDR)",
+                 path, r->fwd[0].line);
+        return false;
+    }
+    char msg[200];
+    if (!nat_check_forwards(nat, r->fwd, r->nfwd, msg, sizeof msg)) {
+        snprintf(err, errlen, "%s: %s", path, msg);
+        return false;
+    }
+    return true;
 }
 
 /* Installed first thing, so no signal can arrive while it is still unhandled
@@ -130,12 +153,34 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Source NAT and the rules' port forwards, checked before touching the
+     * tun devices so a bad configuration is refused the same way anywhere. */
+    nat_t *nat = NULL;
+    if (nat_ip) {
+        nat = nat_create(nat_ip, NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT);
+        if (!nat) { fprintf(stderr, "tunwall: out of memory\n"); engine_destroy(engine); return 1; }
+    }
+    const rules_t *loaded = engine_rules(engine);
+    if (!forwards_ok(nat, loaded, rules, err, sizeof err)) {
+        fprintf(stderr, "tunwall: %s\n", err);
+        nat_destroy(nat);
+        engine_destroy(engine);
+        return 1;
+    }
+    if (nat) nat_set_forwards(nat, loaded->fwd, loaded->nfwd);
+
     const int fd_in = tun_open(in_name, err, sizeof err);
-    if (fd_in < 0) { fprintf(stderr, "tunwall: %s\n", err); engine_destroy(engine); return 1; }
+    if (fd_in < 0) {
+        fprintf(stderr, "tunwall: %s\n", err);
+        nat_destroy(nat);
+        engine_destroy(engine);
+        return 1;
+    }
     const int fd_out = tun_open(out_name, err, sizeof err);
     if (fd_out < 0) {
         fprintf(stderr, "tunwall: %s\n", err);
         close(fd_in);
+        nat_destroy(nat);
         engine_destroy(engine);
         return 1;
     }
@@ -144,22 +189,12 @@ int main(int argc, char **argv)
     if (!fwd) {
         fprintf(stderr, "tunwall: out of memory\n");
         close(fd_in); close(fd_out);
+        nat_destroy(nat);
         engine_destroy(engine);
         return 1;
     }
 
-    nat_t *nat = NULL;
-    if (nat_ip) {
-        nat = nat_create(nat_ip, NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT);
-        if (!nat) {
-            fprintf(stderr, "tunwall: out of memory\n");
-            fwd_destroy(fwd);
-            close(fd_in); close(fd_out);
-            engine_destroy(engine);
-            return 1;
-        }
-        fwd_set_nat(fwd, nat);
-    }
+    if (nat) fwd_set_nat(fwd, nat);
 
     fw_log_set(stderr, level);
     block_signals_outside_the_wait(fwd);
@@ -177,13 +212,22 @@ int main(int argc, char **argv)
             break;
         }
         if (g_reload) {
-            /* New rules apply to new connections; existing flows keep going.
-             * Any error leaves the running rules exactly as they were. */
+            /* New rules (and port forwards) apply to new connections;
+             * existing flows keep going. Any error leaves the running rules
+             * and forwards exactly as they were. */
             g_reload = 0;
-            if (engine_reload_rules(engine, rules, err, sizeof err))
+            rules_t *r = engine_load_rules(rules, err, sizeof err);
+            if (r && !forwards_ok(nat, r, rules, err, sizeof err)) {
+                rules_free(r);
+                r = NULL;
+            }
+            if (r && engine_replace_rules(engine, r)) {
+                const rules_t *now = engine_rules(engine);
+                if (nat) nat_set_forwards(nat, now->fwd, now->nfwd);
                 fprintf(stderr, "tunwall: rules reloaded from %s\n", rules);
-            else
+            } else {
                 fprintf(stderr, "tunwall: reload failed, keeping the old rules: %s\n", err);
+            }
             fflush(stderr);
         }
         if (g_dump_stats) {

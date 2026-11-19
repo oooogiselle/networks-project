@@ -790,6 +790,109 @@ static void test_a_reject_never_answers_from_an_address_the_nat_hides(void)
     nat_destroy(nat);
 }
 
+/* A forwarder with source NAT on and the rules' `forward` lines installed. */
+static nat_t *rig_nat(struct rig *r, uint32_t natip)
+{
+    nat_t *nat = nat_create(natip, NAT_PORT_LO_DEFAULT, NAT_PORT_HI_DEFAULT);
+    CHECK(nat != NULL);
+    const rules_t *rules = engine_rules(r->e);
+    CHECK(nat_check_forwards(nat, rules->fwd, rules->nfwd, NULL, 0));
+    nat_set_forwards(nat, rules->fwd, rules->nfwd);
+    fwd_set_nat(r->f, nat);
+    return nat;
+}
+
+static void test_a_forwarded_port_reaches_the_inside_server_and_back(void)
+{
+    struct rig r;
+    if (!rig_up(&r, "inside 10.0.1.0/24\n"
+                    "forward tcp 8080 10.0.1.3 80\n"
+                    "allow in tcp any 10.0.1.3 80\n")) return;
+    const uint32_t natip = IP4(10, 0, 2, 254), web = IP4(10, 0, 1, 3);
+    nat_t *nat = rig_nat(&r, natip);
+    uint8_t p[256], got[256];
+    pkt_t pk;
+
+    /* the outside's SYN to NATIP:8080 reaches the server, from the client's
+     * real address */
+    size_t n = syn(p, ATTACKER, 5555, natip, 8080, TCP_SYN);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.in_t, got, sizeof got) == (ssize_t)n);
+    CHECK(parse_packet(got, n, &pk) == PARSE_OK);
+    CHECK(pk.src_ip == ATTACKER && pk.src_port == 5555 && pk.dst_ip == web && pk.dst_port == 80);
+
+    /* the server's answer leaves from NATIP:8080 */
+    n = syn(p, web, 80, ATTACKER, 5555, TCP_SYN | TCP_ACK);
+    send_pkt(r.in_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.out_t, got, sizeof got) == (ssize_t)n);
+    CHECK(parse_packet(got, n, &pk) == PARSE_OK);
+    CHECK(pk.src_ip == natip && pk.src_port == 8080 && pk.dst_ip == ATTACKER && pk.dst_port == 5555);
+
+    /* the handshake completes through the forward */
+    n = syn(p, ATTACKER, 5555, natip, 8080, TCP_ACK);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.in_t, got, sizeof got) == (ssize_t)n);
+
+    nat_stats_t st;
+    nat_get_stats(nat, &st);
+    CHECK(st.forwarded == 1 && st.mappings_active == 1);
+    CHECK(st.translated_in == 2 && st.translated_out == 1);
+
+    /* when the flow times out, the sweep frees the mapping too */
+    fake_now += 7200 * SEC;
+    CHECK(fwd_step(r.f, 0) == 0);
+    nat_get_stats(nat, &st);
+    CHECK(st.mappings_active == 0);
+    rig_down(&r);
+    nat_destroy(nat);
+}
+
+static void test_a_forwarded_connection_the_engine_refuses_leaves_no_mapping(void)
+{
+    /* no allow rule for 80; a reject rule for 81 (answered silently, since an
+     * answer would come from the hidden inside address); and 82 allowed but
+     * the inside side refuses the write */
+    struct rig r;
+    if (!rig_up(&r, "inside 10.0.1.0/24\n"
+                    "forward tcp 8080 10.0.1.3 80\n"
+                    "forward tcp 8081 10.0.1.3 81\n"
+                    "forward tcp 8082 10.0.1.3 82\n"
+                    "reject in tcp any 10.0.1.3 81\n"
+                    "allow in tcp any 10.0.1.3 82\n")) return;
+    const uint32_t natip = IP4(10, 0, 2, 254);
+    nat_t *nat = rig_nat(&r, natip);
+    uint8_t p[256], got[256];
+    nat_stats_t st;
+
+    for (uint16_t port = 8080; port <= 8081; port++) {
+        size_t n = syn(p, ATTACKER, 5555, natip, port, TCP_SYN);
+        send_pkt(r.out_t, p, n);
+        CHECK(fwd_step(r.f, 100) == 0);
+        CHECK(recv_pkt(r.in_t, got, sizeof got) < 0);
+        CHECK(recv_pkt(r.out_t, got, sizeof got) < 0);      /* no answer either */
+        nat_get_stats(nat, &st);
+        CHECK(st.mappings_active == 0 && st.forwarded == 0);
+    }
+
+    static const uint8_t junk[64];
+    int queued = 0;
+    while (queued < 100000 && send(r.in_f, junk, sizeof junk, 0) == (ssize_t)sizeof junk) queued++;
+    CHECK(queued > 0);
+    size_t n = syn(p, ATTACKER, 5555, natip, 8082, TCP_SYN);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    fwd_counters_t c;
+    fwd_get_counters(r.f, &c);
+    CHECK(c.write_errors == 1);
+    nat_get_stats(nat, &st);
+    CHECK(st.mappings_active == 0 && st.forwarded == 0);
+    rig_down(&r);
+    nat_destroy(nat);
+}
+
 int main(void)
 {
     RUN(test_allowed_packets_cross_unchanged_in_both_directions);
@@ -815,5 +918,7 @@ int main(void)
     RUN(test_nat_translates_connections_started_from_the_inside);
     RUN(test_a_rejected_syn_is_answered_with_a_rst_on_its_own_side);
     RUN(test_a_reject_never_answers_from_an_address_the_nat_hides);
+    RUN(test_a_forwarded_port_reaches_the_inside_server_and_back);
+    RUN(test_a_forwarded_connection_the_engine_refuses_leaves_no_mapping);
     TEST_DONE();
 }

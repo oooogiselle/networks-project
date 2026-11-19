@@ -164,6 +164,10 @@ static void handle_packet(forwarder_t *f, dir_t dir, size_t len)
         }
     }
     const verdict_t v = engine_decide(f->engine, &pkt, dir, now, NULL);
+    /* A connection to a forwarded port that the engine refuses must not keep
+     * the mapping nat_inbound() just made for it. */
+    if (v != VERDICT_ALLOW && nat_translated_in)
+        nat_undo_inbound(f->nat);
     if (v == VERDICT_REJECT) {
         /* A packet the NAT translated now carries the hidden inside address
          * as its destination; an answer would leak it as its source. Such a
@@ -196,8 +200,10 @@ static void handle_packet(forwarder_t *f, dir_t dir, size_t len)
     } else {
         f->counters.write_errors++;
         f->counters.last_write_errno = errno;
-        /* Nobody saw this packet: do not leave a flow behind that it started. */
+        /* Nobody saw this packet: do not leave a flow behind that it started,
+         * nor a port-forward mapping. */
         engine_undo_new_flow(f->engine, &pkt, dir, now);
+        if (nat_translated_in) nat_undo_inbound(f->nat);
     }
 }
 

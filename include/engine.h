@@ -214,4 +214,13 @@ bool engine_flow_origin(engine_t *e, const pkt_t *p, uint64_t now_ns, dir_t *ori
 bool engine_reload_rules(engine_t *e, const char *path, char *err, size_t errlen);
 bool engine_replace_rules(engine_t *e, rules_t *r);
 
+/*
+ * engine_load_rules: load path and check it is usable by an engine (declares
+ * an inside network). NULL with err filled (naming the file) otherwise. For
+ * callers that check more before engine_replace_rules (tunwall checks the
+ * `forward` lines against its NAT). engine_rules: the rules in use.
+ */
+rules_t       *engine_load_rules(const char *path, char *err, size_t errlen);
+const rules_t *engine_rules(const engine_t *e);
+
 #endif

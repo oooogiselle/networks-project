@@ -87,17 +87,24 @@ bool engine_set_limits(engine_t *e, size_t max_per_source, size_t max_outside)
     return ft_set_limits(e->ft, max_per_source, max_outside);
 }
 
-engine_t *engine_create(const char *rules_path, char *err, size_t errlen)
+rules_t *engine_load_rules(const char *path, char *err, size_t errlen)
 {
-    rules_t *r = rules_load_file(rules_path, err, errlen);
+    rules_t *r = rules_load_file(path, err, errlen);
     if (!r) return NULL;
     if (r->ninside == 0) {
         if (err && errlen)
             snprintf(err, errlen, "%s: declares no inside network (add e.g. "
-                     "'inside 10.0.1.0/24'): anti-spoofing needs one", rules_path);
+                     "'inside 10.0.1.0/24'): anti-spoofing needs one", path);
         rules_free(r);
         return NULL;
     }
+    return r;
+}
+
+engine_t *engine_create(const char *rules_path, char *err, size_t errlen)
+{
+    rules_t *r = engine_load_rules(rules_path, err, errlen);
+    if (!r) return NULL;
     engine_t *e = engine_create_with_rules(r);       /* frees r if it fails */
     if (!e && err && errlen) snprintf(err, errlen, "out of memory");
     return e;
@@ -482,16 +489,13 @@ bool engine_replace_rules(engine_t *e, rules_t *r)
 
 bool engine_reload_rules(engine_t *e, const char *path, char *err, size_t errlen)
 {
-    rules_t *r = rules_load_file(path, err, errlen);
-    if (!r) return false;
-    if (r->ninside == 0) {
-        if (err && errlen)
-            snprintf(err, errlen, "%s: declares no inside network (add e.g. "
-                     "'inside 10.0.1.0/24'): anti-spoofing needs one", path);
-        rules_free(r);
-        return false;
-    }
-    return engine_replace_rules(e, r);
+    rules_t *r = engine_load_rules(path, err, errlen);
+    return r && engine_replace_rules(e, r);
+}
+
+const rules_t *engine_rules(const engine_t *e)
+{
+    return e->rules;
 }
 
 void engine_get_stats(const engine_t *e, engine_stats_t *out)
