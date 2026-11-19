@@ -27,7 +27,7 @@ LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
-TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail test_forwarder test_appid test_nat
+TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine test_fuzz test_log test_alloc_fail test_forwarder test_appid test_nat test_reload
 # tun_open() uses the Linux tun driver, so its tests only run on Linux.
 ifeq ($(shell uname -s),Linux)
 TESTS += test_tun_io
