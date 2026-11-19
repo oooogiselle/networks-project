@@ -46,6 +46,12 @@ struct engine {
     uint64_t     clock_ns;       /* time of the packet/sweep being handled, for log lines */
     uint64_t     last_reclaim_ns;
     bool         reclaimed_once;
+    /* The existing flow the last engine_decide() changed, and a copy of it as
+     * it was before, so engine_undo_new_flow() can put it back if the packet
+     * is never delivered. NULL when the last decision changed no flow. */
+    flow_t      *undo_flow;
+    flow_t       undo_copy;
+    bool         undo_icmp_related;
 };
 
 engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows)
@@ -111,6 +117,13 @@ static verdict_t do_drop(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now,
     log_drop(p, dir, why, now);
     if (out) *out = why;
     return VERDICT_DROP;
+}
+
+/* Remember f as it is now, before this packet changes it. */
+static void save_for_undo(engine_t *e, flow_t *f)
+{
+    e->undo_flow = f;
+    e->undo_copy = *f;
 }
 
 static verdict_t do_allow(engine_t *e, drop_reason_t *out)
@@ -187,6 +200,8 @@ static verdict_t decide_icmp_error(engine_t *e, const pkt_t *p, dir_t dir,
     }
     if (f->icmp_err_count >= ICMP_ERRORS_PER_FLOW_PER_SEC)
         return do_drop(e, p, dir, now, DROP_ICMP_RATE, reason);
+    save_for_undo(e, f);
+    e->undo_icmp_related = true;
     f->icmp_err_count++;
 
     e->st.icmp_related++;
@@ -214,6 +229,8 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
 {
     e->st.pkts_total++;
     e->clock_ns = now_ns;
+    e->undo_flow = NULL;
+    e->undo_icmp_related = false;
 
     /* Anti-spoofing: the outside may not use inside addresses, the inside must
      * use them. engine creation guarantees an `inside` network exists. */
@@ -259,6 +276,11 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         if (p->proto == FW_PROTO_ICMP &&
             p->icmp_type != (from_orig ? ICMP_ECHO_REQUEST : ICMP_ECHO_REPLY))
             return do_drop(e, p, dir, now_ns, DROP_ICMP_TYPE, reason);
+
+        /* From here on the packet changes the flow. Keep a copy, in case the
+         * other side never receives it (see engine_undo_new_flow). A packet
+         * tcp_track_ex() rejects leaves the flow untouched. */
+        save_for_undo(e, f);
 
         /* A finished TCP connection (TIME_WAIT, CLOSED) must not be kept alive
          * by traffic: only the packet that closed it starts its short timer. */
@@ -386,11 +408,28 @@ bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_n
     /* Only the very packet that created the flow: it was the first from its
      * originator and nothing has come back. */
     const bool created_by_it = f && !is_reply && dir == f->orig_dir &&
-                               f->pkts[0] == 1 && f->pkts[1] == 0;
+                               f->pkts[0] == 1 && f->pkts[1] == 0 && f != e->undo_flow;
     if (created_by_it) {
         ft_remove(e->ft, f);
         e->st.flows_created--;
+    } else if (e->undo_flow) {
+        /* A packet on an existing flow: the other side never saw it, so it
+         * must not count, move the TCP state (a FIN that was never delivered
+         * must not close the flow), refresh the timer, or use up an ICMP
+         * error budget. Two things stay: the hash-chain link, which may have
+         * changed, and the application label, which describes what the
+         * payload was and has already been counted and logged. */
+        flow_t *u = e->undo_flow;
+        flow_t *next = u->next;
+        const uint8_t app = u->app, app_tries = u->app_tries;
+        *u = e->undo_copy;
+        u->next = next;
+        u->app = app;
+        u->app_tries = app_tries;
+        if (e->undo_icmp_related) e->st.icmp_related--;
     }
+    e->undo_flow = NULL;
+    e->undo_icmp_related = false;
     e->st.pkts_allowed--;                  /* it was never delivered */
     e->st.pkts_dropped++;
     e->st.drops[DROP_WRITE_FAILED]++;
