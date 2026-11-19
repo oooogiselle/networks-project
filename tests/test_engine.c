@@ -1217,6 +1217,59 @@ static void test_undoing_a_write_that_failed_forgets_only_the_new_flow(void)
     engine_destroy(e);
 }
 
+/* A packet on an existing flow that could not be delivered must leave the
+ * flow exactly as it was: here a FIN that never reached the server must not
+ * half-close the connection, or the server's own FIN would then end it and
+ * the client's next data would be refused. */
+static void test_undoing_a_lost_fin_leaves_the_connection_open(void)
+{
+    engine_t *e = make_engine(RULES);
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN | TCP_ACK), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+
+    pkt_t fin = mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_FIN | TCP_ACK);
+    CHECK(send_pkt(e, fin, DIR_IN, 2 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(!engine_undo_new_flow(e, &fin, DIR_IN, 2 * SEC));      /* the flow stays */
+
+    /* The server closes its side. Had the lost FIN counted, this would be the
+     * second FIN (TIME_WAIT) and the client's data below would be refused. */
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_FIN | TCP_ACK), DIR_OUT, 3 * SEC, &w) == VERDICT_ALLOW);
+    pkt_t data = mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_ACK | TCP_PSH);
+    uint8_t bytes[10] = { 0 };
+    data.payload = bytes;
+    data.payload_len = sizeof bytes;
+    CHECK(send_pkt(e, data, DIR_IN, 4 * SEC, &w) == VERDICT_ALLOW);
+
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_active == 1 && st.drops[DROP_WRITE_FAILED] == 1);
+    engine_destroy(e);
+}
+
+/* An allowed ICMP error that could not be delivered gives its slot in the
+ * flow's per-second budget back, and is not counted as related. */
+static void test_undoing_an_icmp_error_returns_its_budget(void)
+{
+    engine_t *e = make_engine(RULES_IN);
+    drop_reason_t w;
+    uint8_t syn[128], err[256];
+    size_t n = pb_tcp(syn, sizeof syn, NULL, CLIENT_A, 50000, SERVER, 80, TCP_SYN, NULL, 0);
+    CHECK(send_pkt(e, parsed(syn, n), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    pkt_t te = icmp_error(err, ROUTER_OUT, CLIENT_A, ICMP_TIME_EXCEEDED, syn);
+    /* every one of these is lost, so the budget never runs out */
+    for (int i = 0; i < 3 * ICMP_ERRORS_PER_FLOW_PER_SEC; i++) {
+        CHECK(send_pkt(e, te, DIR_OUT, SEC + 1, &w) == VERDICT_ALLOW);
+        engine_undo_new_flow(e, &te, DIR_OUT, SEC + 1);
+    }
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.icmp_related == 0 && st.flows_active == 1);
+    CHECK(st.drops[DROP_WRITE_FAILED] == 3 * ICMP_ERRORS_PER_FLOW_PER_SEC);
+    engine_destroy(e);
+}
+
 /* ---- application identification: labels only, never a verdict ---------------- */
 
 static const char *OPEN_RULES =
@@ -1579,6 +1632,8 @@ int main(void)
     RUN(test_a_spoofed_flood_from_outside_leaves_the_inside_working);
     RUN(test_the_default_engine_caps_one_source_at_a_sixteenth);
     RUN(test_undoing_a_write_that_failed_forgets_only_the_new_flow);
+    RUN(test_undoing_a_lost_fin_leaves_the_connection_open);
+    RUN(test_undoing_an_icmp_error_returns_its_budget);
     RUN(test_the_icmp_error_budget_resets_at_exactly_one_second);
     RUN(test_icmp_errors_about_a_time_wait_flow_are_dropped);
     RUN(test_the_reclaim_sweep_runs_at_exactly_one_second);

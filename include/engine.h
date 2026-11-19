@@ -170,10 +170,13 @@ void engine_get_stats(const engine_t *e, engine_stats_t *out);
 bool engine_set_limits(engine_t *e, size_t max_per_source, size_t max_outside);
 
 /*
- * The caller could not deliver a packet engine_decide() allowed. If that
- * packet created its flow, forget the flow (nobody ever saw its first packet)
- * and count the packet as dropped (DROP_WRITE_FAILED). A packet on an
- * existing flow leaves the flow as it is. Returns true if a flow was removed.
+ * The caller could not deliver a packet engine_decide() allowed. Call it
+ * right after that engine_decide(), for the same packet. If the packet
+ * created its flow, forget the flow (nobody ever saw its first packet). If it
+ * belonged to an existing flow, put the flow back as it was before the packet:
+ * counters, TCP state, timer and ICMP error budget (the application label is
+ * kept). Either way the packet counts as dropped (DROP_WRITE_FAILED).
+ * Returns true if a flow was removed.
  */
 bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_ns);
 

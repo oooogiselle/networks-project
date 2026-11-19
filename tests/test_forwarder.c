@@ -259,6 +259,45 @@ static void test_the_other_side_refusing_a_write_is_counted_not_fatal(void)
     rig_down(&r);
 }
 
+/* The write fails on a connection that already exists: the flow survives,
+ * and the packet nobody received is not counted on it. */
+static void test_a_refused_write_on_an_open_flow_leaves_the_flow_as_it_was(void)
+{
+    struct rig r;
+    if (!rig_up(&r, RULES)) return;
+    uint8_t p[256], got[512];
+    size_t n = syn(p, CLIENT, 40001, SERVER, 80, TCP_SYN);
+    send_pkt(r.in_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    CHECK(recv_pkt(r.out_t, got, sizeof got) == (ssize_t)n);
+
+    close(r.in_t);                                  /* the inside stops listening */
+    n = syn(p, SERVER, 80, CLIENT, 40001, TCP_SYN | TCP_ACK);
+    send_pkt(r.out_t, p, n);
+    CHECK(fwd_step(r.f, 100) == 0);
+    fwd_counters_t c;
+    fwd_get_counters(r.f, &c);
+    CHECK(c.write_errors == 1 && c.forwarded[DIR_OUT] == 0);
+
+    /* The SYN-ACK never arrived, so the flow is still waiting for one: an
+     * ACK from the client (completing a handshake it never saw) is refused,
+     * while a retransmitted SYN is still a legal packet. */
+    engine_stats_t st;
+    engine_get_stats(r.e, &st);
+    CHECK(st.flows_active == 1 && st.drops[DROP_WRITE_FAILED] == 1);
+    pkt_t next;
+    drop_reason_t why = DROP_NONE;
+    n = syn(p, CLIENT, 40001, SERVER, 80, TCP_ACK);
+    CHECK(parse_packet(p, n, &next) == PARSE_OK);
+    CHECK(engine_decide(r.e, &next, DIR_IN, fake_now, &why) == VERDICT_DROP);
+    CHECK(why == DROP_TCP_STATE);
+    n = syn(p, CLIENT, 40001, SERVER, 80, TCP_SYN);
+    CHECK(parse_packet(p, n, &next) == PARSE_OK);
+    CHECK(engine_decide(r.e, &next, DIR_IN, fake_now, NULL) == VERDICT_ALLOW);
+    r.in_t = open("/dev/null", O_RDONLY);           /* so rig_down can close it */
+    rig_down(&r);
+}
+
 static void test_a_failed_descriptor_stops_the_loop(void)
 {
     struct rig r;
@@ -616,6 +655,7 @@ int main(void)
     RUN(test_unparsable_packets_are_dropped_and_counted);
     RUN(test_a_burst_is_bounded_and_keeps_order);
     RUN(test_the_other_side_refusing_a_write_is_counted_not_fatal);
+    RUN(test_a_refused_write_on_an_open_flow_leaves_the_flow_as_it_was);
     RUN(test_a_failed_descriptor_stops_the_loop);
     RUN(test_a_read_error_stops_the_loop);
     RUN(test_end_of_file_and_hangup_are_failures_with_a_reason);
