@@ -27,6 +27,7 @@
 
 struct forwarder {
     engine_t      *engine;
+    nat_t         *nat;               /* source NAT, or NULL */
     int            fd[2];             /* indexed by dir_t: [DIR_IN]=inside, [DIR_OUT]=outside */
     uint8_t       *buf;               /* the one packet buffer, FWD_MAX_PACKET bytes */
     fwd_clock_fn   clock;
@@ -81,6 +82,11 @@ void fwd_set_sigmask(forwarder_t *f, const sigset_t *mask)
     if (mask) f->sigmask = *mask;
 }
 
+void fwd_set_nat(forwarder_t *f, nat_t *n)
+{
+    f->nat = n;
+}
+
 void fwd_set_clock(forwarder_t *f, fwd_clock_fn clock)
 {
     f->clock = clock;
@@ -122,8 +128,36 @@ static void handle_packet(forwarder_t *f, dir_t dir, size_t len)
         engine_parse_failed(f->engine, pr, dir, len, now);
         return;
     }
+    /* Source NAT, outside -> inside: give a reply to the NAT address back its
+     * inside destination first, so the engine only ever sees inside hosts.
+     * Unsolicited packets to the NAT address go no further (NAT counts them). */
+    if (f->nat && dir == DIR_OUT) {
+        const nat_result_t nr = nat_inbound(f->nat, f->buf, &pkt, now);
+        if (nr == NAT_NO_MAPPING) return;
+        if (nr == NAT_TRANSLATED) {
+            const parse_result_t again = parse_packet(f->buf, len, &pkt);
+            if (again != PARSE_OK) {          /* cannot happen: checksums are kept exact */
+                engine_parse_failed(f->engine, again, dir, len, now);
+                return;
+            }
+        }
+    }
     if (engine_decide(f->engine, &pkt, dir, now, NULL) != VERDICT_ALLOW)
         return;
+
+    /* Source NAT, inside -> outside: only connections the inside started get
+     * a mapping (a reply from an exposed inside service leaves as it is).
+     * With every NAT port in use the packet is dropped; its flow, if new,
+     * simply times out. */
+    if (f->nat && dir == DIR_IN) {
+        dir_t origin = DIR_OUT;
+        const bool icmp_err = pkt.proto == FW_PROTO_ICMP && icmp_is_error(pkt.icmp_type);
+        const bool from_inside = !icmp_err &&
+                                 engine_flow_origin(f->engine, &pkt, now, &origin) &&
+                                 origin == DIR_IN;
+        if (nat_outbound(f->nat, f->buf, &pkt, from_inside, now) == NAT_FULL)
+            return;
+    }
 
     give_back_one_hop(f->buf);
     /* A tun device takes exactly one packet per write(). */
@@ -157,6 +191,15 @@ static bool drain(forwarder_t *f, dir_t dir)
     return true;
 }
 
+/* A NAT mapping is kept while the engine still has its flow. */
+struct alive_ctx { engine_t *engine; uint64_t now; };
+
+static bool flow_alive(void *ud, const pkt_t *tuple)
+{
+    const struct alive_ctx *c = ud;
+    return engine_flow_origin(c->engine, tuple, c->now, NULL);
+}
+
 int fwd_step(forwarder_t *f, int timeout_ms)
 {
     struct pollfd pfd[2] = {
@@ -187,6 +230,10 @@ int fwd_step(forwarder_t *f, int timeout_ms)
     const uint64_t now = f->clock();
     if (now - f->last_expire_ns >= FWD_EXPIRE_INTERVAL_NS) {
         engine_expire(f->engine, now);
+        if (f->nat) {
+            struct alive_ctx ctx = { f->engine, now };
+            nat_sweep(f->nat, flow_alive, &ctx);   /* after the flows it depends on */
+        }
         f->last_expire_ns = now;
     }
     return 0;
@@ -209,5 +256,6 @@ void fwd_print_stats(const forwarder_t *f, FILE *out)
             (unsigned long long)f->counters.forwarded[DIR_IN],
             (unsigned long long)f->counters.forwarded[DIR_OUT],
             (unsigned long long)f->counters.write_errors);
+    if (f->nat) nat_stats_print(f->nat, out);
     fprintf(out, "log:     suppressed=%llu\n", (unsigned long long)fw_log_suppressed());
 }

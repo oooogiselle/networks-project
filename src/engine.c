@@ -398,6 +398,15 @@ bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_n
     return created_by_it;
 }
 
+bool engine_flow_origin(engine_t *e, const pkt_t *p, uint64_t now_ns, dir_t *orig_dir)
+{
+    const flow_key_t key = { p->src_ip, p->dst_ip, p->src_port, p->dst_port, p->proto };
+    bool is_reply = false;
+    const flow_t *f = ft_lookup(e->ft, &key, now_ns, &is_reply);
+    if (f && orig_dir) *orig_dir = f->orig_dir;
+    return f != NULL;
+}
+
 void engine_get_stats(const engine_t *e, engine_stats_t *out)
 {
     *out = e->st;
