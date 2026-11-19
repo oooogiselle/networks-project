@@ -5,17 +5,28 @@ CPPFLAGS += -Iinclude -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 BUILD := build
 
 # Firewall core library: packet parser + decision engine (flow table, TCP
-# state, rules, engine, logging). tun I/O and main() link against this.
-LIB_SRC := src/parser.c src/flowtable.c src/tcpstate.c src/rules.c \
-           src/engine.c src/log.c
+# state, rules, engine, logging) + the per-packet pipeline. Portable; the
+# Linux-only tun I/O and main() link against this to make ./tunwall.
+LIB_SRC := src/parser.c src/pipeline.c src/flowtable.c src/tcpstate.c \
+           src/rules.c src/engine.c src/log.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
-TESTS := test_parser test_flowtable test_tcpstate test_rules test_engine
+TESTS := test_parser test_pipeline test_flowtable test_tcpstate test_rules \
+         test_engine
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 .PHONY: all test asan clean
+
+# ./tunwall needs Linux (TUN devices); elsewhere `all` builds just the library.
+ifeq ($(shell uname -s),Linux)
+all: $(LIB) tunwall
+else
 all: $(LIB)
+endif
+
+tunwall: src/main.c src/tun_io.c $(wildcard include/*.h) $(LIB)
+	$(CC) $(CPPFLAGS) $(CFLAGS) src/main.c src/tun_io.c $(LIB) -o $@
 
 $(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
@@ -23,9 +34,9 @@ $(BUILD)/%.o: src/%.c $(wildcard include/*.h) | $(BUILD)
 $(LIB): $(LIB_OBJ)
 	$(AR) rcs $@ $^
 
-# The parser tests also need the test packet builder.
-$(BUILD)/test_parser: tests/test_parser.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
-	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_parser.c tests/pktbuild.c $(LIB) -o $@
+# Tests that build real wire packets also link the test packet builder.
+$(BUILD)/test_parser $(BUILD)/test_pipeline: $(BUILD)/test_%: tests/test_%.c tests/pktbuild.c tests/pktbuild.h tests/testutil.h $(LIB)
+	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) $< tests/pktbuild.c $(LIB) -o $@
 
 $(BUILD)/test_%: tests/test_%.c tests/testutil.h $(LIB)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) $< $(LIB) -o $@
@@ -44,4 +55,4 @@ asan:
 	$(MAKE) test CFLAGS="-std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer"
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) tunwall
