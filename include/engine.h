@@ -22,6 +22,9 @@
  *   - ICMP: set src_port = dst_port = echo identifier, and icmp_type.
  *     (Echo request type 8 and echo reply type 0 then form a reversible flow.)
  *   - Non-TCP packets: tcp_flags = 0. Non-ICMP packets: icmp_type = 0.
+ *   - TCP: tcp_seq, tcp_ack and tcp_win as on the wire (host order, window
+ *     unscaled). tcp_wscale is the SYN's window-scale option (0-14), or
+ *     TCP_NO_WSCALE when the packet is not a SYN or carries none.
  *   - Non-first IP fragments have no L4 header; drop them in the parser.
  *   - payload may be NULL when payload_len == 0.
  *   - ICMP errors (dest unreachable, time exceeded, parameter problem): pass
@@ -54,6 +57,9 @@
 #define TCP_ECE 0x40
 #define TCP_CWR 0x80
 
+#define TCP_NO_WSCALE  0xff  /* pkt_t.tcp_wscale: no window-scale option */
+#define TCP_MAX_WSCALE 14    /* RFC 7323: larger shifts are treated as 14 */
+
 #define ICMP_ECHO_REPLY   0
 #define ICMP_ECHO_REQUEST 8
 
@@ -62,6 +68,9 @@ typedef struct pkt {
     uint32_t src_ip, dst_ip;        /* host byte order */
     uint16_t src_port, dst_port;    /* host byte order; ICMP: echo id in both */
     uint8_t  tcp_flags;
+    uint8_t  tcp_wscale;            /* SYN only: window scale, or TCP_NO_WSCALE */
+    uint32_t tcp_seq, tcp_ack;      /* TCP sequence and acknowledgment numbers */
+    uint16_t tcp_win;               /* TCP window as sent (not scaled) */
     uint8_t  icmp_type;
     uint16_t ip_len;                /* total IP length, for byte counters */
     uint16_t payload_len;
