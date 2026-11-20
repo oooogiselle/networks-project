@@ -1979,6 +1979,93 @@ static void test_rate_limit_log_line_once_per_episode(void)
     engine_destroy(e);
 }
 
+/* ---- TCP sequence-number checks ------------------------------------------ */
+
+/* A TCP segment with real sequence numbers (window 64240, no window scale). */
+static pkt_t tseg(uint32_t src, uint16_t sp, uint32_t dst, uint16_t dp, uint8_t flags,
+                  uint32_t seq, uint32_t ack, uint16_t len)
+{
+    pkt_t p = mk_tcp(src, sp, dst, dp, flags);
+    p.tcp_seq = seq;
+    p.tcp_ack = ack;
+    p.tcp_win = 64240;
+    p.payload_len = len;
+    p.tcp_wscale = TCP_NO_WSCALE;
+    return p;
+}
+
+#define C_SEQ 1000u        /* client A's ISN */
+#define S_SEQ 5000u        /* the server's ISN */
+
+/* CLIENT_A:50000 -> SERVER:80, handshake done at t = SEC. */
+static engine_t *connected(bool checks)
+{
+    engine_t *e = make_engine(RULES);
+    engine_set_tcp_window(e, checks);
+    drop_reason_t w;
+    CHECK(send_pkt(e, tseg(CLIENT_A, 50000, SERVER, 80, TCP_SYN, C_SEQ, 0, 0), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, tseg(SERVER, 80, CLIENT_A, 50000, TCP_SYN | TCP_ACK, S_SEQ, C_SEQ + 1, 0), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, tseg(CLIENT_A, 50000, SERVER, 80, TCP_ACK, C_SEQ + 1, S_SEQ + 1, 0), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    return e;
+}
+
+static void test_tcp_window_blocks_blind_rst_and_injection(void)
+{
+    engine_t *e = connected(true);
+    drop_reason_t w;
+    const uint32_t c = C_SEQ + 1, s = S_SEQ + 1;
+    /* a blind RST and blind data, posing as the server */
+    for (uint32_t k = 0; k < 30; k++) {
+        CHECK(send_pkt(e, tseg(SERVER, 80, CLIENT_A, 50000, TCP_RST, 0x40000000u + k * 7919u, 0, 0),
+                       DIR_OUT, 2 * SEC, &w) == VERDICT_DROP);
+        CHECK(w == DROP_TCP_WINDOW);
+    }
+    CHECK(send_pkt(e, tseg(SERVER, 80, CLIENT_A, 50000, TCP_ACK | TCP_PSH, s + 900000, c, 8),
+                   DIR_OUT, 2 * SEC, &w) == VERDICT_DROP && w == DROP_TCP_WINDOW);
+    /* the connection is untouched and keeps working */
+    CHECK(send_pkt(e, tseg(CLIENT_A, 50000, SERVER, 80, TCP_ACK | TCP_PSH, c, s, 100), DIR_IN, 3 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, tseg(SERVER, 80, CLIENT_A, 50000, TCP_ACK | TCP_PSH, s, c + 100, 1000), DIR_OUT, 3 * SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.drops[DROP_TCP_WINDOW] == 31 && st.flows_active == 1);
+    CHECK(st.scans_detected == 0);
+    /* a real RST, at the server's next sequence number, still ends it */
+    CHECK(send_pkt(e, tseg(SERVER, 80, CLIENT_A, 50000, TCP_RST, s + 1000, 0, 0), DIR_OUT, 4 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, tseg(CLIENT_A, 50000, SERVER, 80, TCP_ACK, c + 100, s + 1000, 10), DIR_IN, 4 * SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_TCP_STATE);
+    engine_destroy(e);
+}
+
+static void test_tcp_window_checks_are_off_by_default(void)
+{
+    /* Without the checks (the library default), the same blind RST ends the
+     * connection: what tunwall -L does. */
+    engine_t *e = connected(false);
+    drop_reason_t w;
+    CHECK(send_pkt(e, tseg(SERVER, 80, CLIENT_A, 50000, TCP_RST, 0x40000000u, 0, 0), DIR_OUT, 2 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, tseg(CLIENT_A, 50000, SERVER, 80, TCP_ACK, C_SEQ + 1, S_SEQ + 1, 10), DIR_IN, 3 * SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_TCP_STATE);
+    engine_destroy(e);
+}
+
+static void test_tcp_window_undo_restores_the_windows(void)
+{
+    engine_t *e = connected(true);
+    drop_reason_t w;
+    const uint32_t c = C_SEQ + 1, s = S_SEQ + 1;
+    /* The server's 1000 bytes never reached the client... */
+    pkt_t data = tseg(SERVER, 80, CLIENT_A, 50000, TCP_ACK | TCP_PSH, s, c, 1000);
+    CHECK(send_pkt(e, data, DIR_OUT, 2 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(!engine_undo_new_flow(e, &data, DIR_OUT, 2 * SEC));
+    /* ...so an ack for them is acking data the server never (really) sent */
+    CHECK(send_pkt(e, tseg(CLIENT_A, 50000, SERVER, 80, TCP_ACK, c, s + 1000, 0), DIR_IN, 3 * SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_TCP_WINDOW);
+    /* once delivered, it can be acked */
+    CHECK(send_pkt(e, data, DIR_OUT, 3 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, tseg(CLIENT_A, 50000, SERVER, 80, TCP_ACK, c, s + 1000, 0), DIR_IN, 3 * SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
 
 /* ---- SYN-flood relief ---------------------------------------------------- */
 
@@ -2207,5 +2294,8 @@ int main(void)
     RUN(test_rate_limit_gives_back_connections_that_never_happened);
     RUN(test_rate_limits_are_per_rule_and_reset_by_a_reload);
     RUN(test_rate_limit_log_line_once_per_episode);
+    RUN(test_tcp_window_blocks_blind_rst_and_injection);
+    RUN(test_tcp_window_checks_are_off_by_default);
+    RUN(test_tcp_window_undo_restores_the_windows);
     TEST_DONE();
 }

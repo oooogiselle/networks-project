@@ -12,8 +12,9 @@
 /*
  * tcpstate.h - connection-tracking TCP state machine.
  *
- * Like Linux conntrack, we track state from observed flags only (we are a
- * middlebox, not an endpoint). Sequence-number validation is NOT done yet.
+ * Like Linux conntrack, the state is tracked from observed flags (we are a
+ * middlebox, not an endpoint). Sequence numbers are checked separately, in
+ * tcpseq.h, before a packet reaches tcp_track().
  *
  *   originator            responder
  *   SYN        ------->            SYN_SENT

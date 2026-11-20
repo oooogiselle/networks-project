@@ -123,6 +123,7 @@ typedef enum {
     DROP_RULE_REJECT,      /* new flow, a reject rule matched (and may be answered) */
     DROP_SCAN_BLOCKED,     /* source is blocked after a port scan (scandetect.h) */
     DROP_RATE_LIMITED,     /* new flow over its rule's `limit N/...` for this source */
+    DROP_TCP_WINDOW,       /* TCP segment outside the connection's sequence window */
     DROP_REASON_COUNT
 } drop_reason_t;
 
@@ -260,6 +261,15 @@ const rules_t *engine_rules(const engine_t *e);
  * window_s or block_s 0) or out of memory; the old settings then stay.
  */
 bool engine_set_scan(engine_t *e, const scan_cfg_t *cfg);
+
+/*
+ * TCP sequence-number checks (tcpseq.h): with them on, a segment of a tracked
+ * connection outside its sequence window is dropped (DROP_TCP_WINDOW), so a
+ * blind attacker cannot reset or inject into it. Every engine_create* leaves
+ * them off (the packets must then carry real sequence numbers, which the
+ * parser provides); tunwall turns them on. Call before traffic flows.
+ */
+void engine_set_tcp_window(engine_t *e, bool on);
 
 /*
  * A packet from the outside that was dropped before engine_decide() saw it:

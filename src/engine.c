@@ -18,6 +18,7 @@
  *   existing flow  -> FAST PATH: hash lookup + state update, no rules
  *   no flow        -> SLOW PATH: sanity-check, evaluate rules, maybe create
  *                     (an allow rule's `limit` is checked here, ratelimit.h)
+ *   TCP on a flow  -> also inside its sequence window (tcpseq.h), if on
  */
 #include "engine.h"
 
@@ -32,6 +33,7 @@
 #include "rules.h"
 #include "ratelimit.h"
 #include "scandetect.h"
+#include "tcpseq.h"
 #include "tcpstate.h"
 
 
@@ -49,6 +51,7 @@ struct engine {
     scan_t      *scan;           /* port-scan detection; NULL = off */
     scan_cfg_t   scan_cfg;
     rl_t        *rl;             /* per-rule connection rate limits (ratelimit.h) */
+    bool         tcp_window;     /* TCP sequence-number checks (tcpseq.h) */
     engine_stats_t st;
     uint64_t     clock_ns;       /* time of the packet/sweep being handled, for log lines */
     uint64_t     last_reclaim_ns;
@@ -368,8 +371,13 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         bool refresh = true;
         if (p->proto == FW_PROTO_TCP) {
             tcp_state_t before = f->tcp_state;
+            /* Outside the sequence window: forged (a blind RST or injected
+             * data) or hopelessly stale. Dropped before it touches the flow. */
+            if (e->tcp_window && !tcpseq_check(f, p, from_orig))
+                return do_drop(e, p, dir, now_ns, DROP_TCP_WINDOW, reason);
             if (!tcp_track_ex(f, p->tcp_flags, from_orig, p->payload_len))
                 return do_drop(e, p, dir, now_ns, DROP_TCP_STATE, reason);
+            tcpseq_update(f, p, from_orig);
             refresh = f->tcp_state != before ||
                       (f->tcp_state != TCPS_TIME_WAIT && f->tcp_state != TCPS_CLOSED);
             if (f->tcp_state != before &&
@@ -472,7 +480,10 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         e->undo_rl_rule = r;
         e->undo_rl_idx = ridx;
     }
-    if (p->proto == FW_PROTO_TCP) tcp_flow_init(f);
+    if (p->proto == FW_PROTO_TCP) {
+        tcp_flow_init(f);
+        tcpseq_init(f, p);         /* always kept, so turning checks on costs nothing */
+    }
     f->pkts[0] = 1;
     f->bytes[0] = p->ip_len;
     f->expires_ns = now_ns + flow_timeout_ns(f);
@@ -614,6 +625,11 @@ void engine_get_stats(const engine_t *e, engine_stats_t *out)
     out->flows_expired = ft_expired_total(e->ft);
     out->flows_active = ft_count(e->ft);
     out->hosts_blocked = e->scan ? scan_nblocked(e->scan) : 0;
+}
+
+void engine_set_tcp_window(engine_t *e, bool on)
+{
+    e->tcp_window = on;
 }
 
 bool engine_set_scan(engine_t *e, const scan_cfg_t *cfg)
