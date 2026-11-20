@@ -500,6 +500,59 @@ static void test_forward_errors(void)
     CHECK(parse_fails_with(text, "line 18:", "too many 'forward' lines"));
 }
 
+static void test_limit_clause(void)
+{
+    rules_t *r = parse("allow in tcp any 10.0.1.3 22 limit 5/min\n"
+                       "allow in tcp any 10.0.1.3 limit 2/sec       # no ports\n"
+                       "allow in udp from any port 1024-65535 to 10.0.1.3 port 53 limit 100/hour\n"
+                       "allow out icmp 10.0.1.0/24 any echo limit 10000/sec\n"
+                       "allow out tcp 10.0.1.0/24 any 80\n");
+    CHECK(r && r->n == 5);
+    if (r) {
+        CHECK(r->v[0].limit_n == 5 && r->v[0].limit_period_ns == 60 * SEC);
+        CHECK(r->v[0].dport.r[0].lo == 22 && r->v[0].dport.r[0].hi == 22);
+        CHECK(r->v[0].dir == DIR_OUT && r->v[0].dst.net == IP(10,0,1,3));
+        CHECK(r->v[1].limit_n == 2 && r->v[1].limit_period_ns == SEC);
+        CHECK(r->v[1].dport.r[0].lo == 0 && r->v[1].dport.r[0].hi == 65535);
+        CHECK(r->v[2].limit_n == 100 && r->v[2].limit_period_ns == 3600 * SEC);
+        CHECK(r->v[2].sport.r[0].lo == 1024 && r->v[2].dport.r[0].lo == 53);
+        CHECK(r->v[3].limit_n == 10000 && r->v[3].proto == FW_PROTO_ICMP);
+        CHECK(r->v[4].limit_n == 0 && r->v[4].limit_period_ns == 0);   /* no limit */
+    }
+    rules_free(r);
+}
+
+static void test_limit_errors(void)
+{
+    const char *in = "inside 10.0.1.0/24\n";
+    const char *bad[] = {
+        "allow in tcp any 10.0.1.3 22 limit 0/min",
+        "allow in tcp any 10.0.1.3 22 limit 10001/sec",
+        "allow in tcp any 10.0.1.3 22 limit 5/day",
+        "allow in tcp any 10.0.1.3 22 limit 5",
+        "allow in tcp any 10.0.1.3 22 limit 5/",
+        "allow in tcp any 10.0.1.3 22 limit /min",
+        "allow in tcp any 10.0.1.3 22 limit -5/min",
+        "allow in tcp any 10.0.1.3 22 limit",
+        "allow in tcp any 10.0.1.3 limit 5/min 22",
+        "allow in tcp any 10.0.1.3 22 limit 5/min limit 5/min",
+    };
+    char text[256];
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        snprintf(text, sizeof text, "%s%s\n", in, bad[k]);
+        CHECK(parse_fails_with(text, "line 2:", "expected 'limit N/sec|min|hour' (N = 1-10000) at the end"));
+    }
+    snprintf(text, sizeof text, "%sdeny in tcp any 10.0.1.3 22 limit 5/min\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "'limit' only works on allow rules"));
+    snprintf(text, sizeof text, "%sreject out tcp 10.0.1.0/24 any 23 limit 5/min\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "'limit' only works on allow rules"));
+    /* not a rule option on directives */
+    CHECK(parse_fails_with("inside 10.0.1.0/24 limit 5/min\n", "line 1:", "expected 'inside"));
+    /* with the limit removed, the rest of the rule is still checked */
+    snprintf(text, sizeof text, "%sallow in tcp any limit 5/min\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "expected destination address"));
+}
+
 int main(void)
 {
     RUN(test_parse_basic_and_comments);
@@ -527,5 +580,7 @@ int main(void)
     RUN(test_reject_is_an_action);
     RUN(test_forward_directive);
     RUN(test_forward_errors);
+    RUN(test_limit_clause);
+    RUN(test_limit_errors);
     TEST_DONE();
 }

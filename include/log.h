@@ -53,6 +53,12 @@ void log_scan(uint32_t ip, unsigned nports, uint64_t span_ns, uint32_t block_s,
 /* INFO: ip's scan block ended; dropped = its packets dropped meanwhile. */
 void log_unblock(uint32_t ip, uint64_t dropped, uint64_t now_ns);
 
+/* INFO: ip went over the `limit n/period` of the rule on rule_line; its new
+ * connections through that rule are dropped until it is under it again
+ * (logged once per episode by the engine, not per packet). */
+void log_ratelimit(uint32_t ip, uint32_t n, uint64_t period_ns, int rule_line,
+                   uint64_t now_ns);
+
 /* INFO: under a SYN flood, n half-open connections were evicted in the last
  * window_ns to admit new ones (one line per sweep at most). */
 void log_synflood(uint64_t n, uint64_t window_ns, uint64_t now_ns);

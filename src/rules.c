@@ -165,6 +165,27 @@ static bool parse_port1(const char *s, uint16_t *out)
     return true;
 }
 
+#define LIMIT_MAX_N 10000
+#define LIMIT_SYNTAX "expected 'limit N/sec|min|hour' (N = 1-10000) at the end of the rule"
+
+/* `N/sec`, `N/min` or `N/hour` (the value after `limit`). */
+static bool parse_limit(const char *s, rule_t *r)
+{
+    char *end;
+    if (!isdigit((unsigned char)*s)) return false;
+    long v = strtol(s, &end, 10);
+    if (*end != '/' || v < 1 || v > LIMIT_MAX_N) return false;
+    const char *unit = end + 1;
+    uint64_t secs;
+    if (strcmp(unit, "sec") == 0) secs = 1;
+    else if (strcmp(unit, "min") == 0) secs = 60;
+    else if (strcmp(unit, "hour") == 0) secs = 3600;
+    else return false;
+    r->limit_n = (uint32_t)v;
+    r->limit_period_ns = secs * 1000000000ull;
+    return true;
+}
+
 /* `forward (tcp|udp) <ext-port> <a.b.c.d> <port>` (tok[0] is "forward"). */
 static bool parse_forward(char **tok, int n, int lineno, forward_t *f,
                           char *err, size_t errlen)
@@ -232,6 +253,22 @@ static int parse_line(char *line, int lineno, rule_t *r, forward_t *fw,
     else if (strcmp(tok[i], "reject") == 0) r->action = ACT_REJECT;
     else { set_err(err, errlen, lineno, "expected 'allow', 'deny' or 'reject'"); return -1; }
     i++;
+
+    /* An optional `limit N/PERIOD` is always the last two tokens. Take it off
+     * here, so the compact and the from/to forms below never see it. */
+    for (int k = i; k < n; k++) {
+        if (strcmp(tok[k], "limit") != 0) continue;
+        if (k != n - 2 || !parse_limit(tok[n - 1], r)) {
+            set_err(err, errlen, lineno, LIMIT_SYNTAX);
+            return -1;
+        }
+        if (r->action != ACT_ALLOW) {
+            set_err(err, errlen, lineno, "'limit' only works on allow rules");
+            return -1;
+        }
+        n -= 2;
+        break;
+    }
 
     /* Keywords name the traffic direction, as in the spec: "out" = outbound
      * (first packet arrives on tun-in), "in" = inbound (arrives on tun-out).

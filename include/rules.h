@@ -63,6 +63,16 @@
  * then decided like any other, so it also needs a rule such as
  *   allow in tcp any 10.0.1.3 80
  *
+ * Rate limits (allow rules only), as the last two tokens of the rule:
+ *
+ *   ... limit N/(sec|min|hour)          N = 1..10000
+ *       e.g.  allow in tcp any 10.0.1.3 22 limit 5/min
+ *
+ * Each source address may open N new connections through the rule at once,
+ * then one more every PERIOD/N (a token bucket, see ratelimit.h); new
+ * connections over that are dropped silently. Connections already open are
+ * never affected.
+ *
  * `reject` refuses a new connection like `deny`, but also tells the sender
  * at once instead of letting it time out: a TCP RST for TCP, ICMP port
  * unreachable for UDP, ICMP administratively prohibited for an echo request
@@ -112,6 +122,8 @@ typedef struct rule {
     uint8_t      proto;          /* 0 = any */
     addr_match_t src, dst;
     port_set_t   sport, dport;
+    uint32_t     limit_n;        /* `limit N/...`: connections per period; 0 = no limit */
+    uint64_t     limit_period_ns;
     int          line;           /* source line number, for logs */
 } rule_t;
 

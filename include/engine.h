@@ -113,6 +113,7 @@ typedef enum {
     DROP_WRITE_FAILED,     /* allowed, but the other side would not take it */
     DROP_RULE_REJECT,      /* new flow, a reject rule matched (and may be answered) */
     DROP_SCAN_BLOCKED,     /* source is blocked after a port scan (scandetect.h) */
+    DROP_RATE_LIMITED,     /* new flow over its rule's `limit N/...` for this source */
     DROP_REASON_COUNT
 } drop_reason_t;
 

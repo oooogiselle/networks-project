@@ -17,6 +17,7 @@
  *   blocked source -> dropped (a port scanner, see scandetect.h)
  *   existing flow  -> FAST PATH: hash lookup + state update, no rules
  *   no flow        -> SLOW PATH: sanity-check, evaluate rules, maybe create
+ *                     (an allow rule's `limit` is checked here, ratelimit.h)
  */
 #include "engine.h"
 
@@ -29,6 +30,7 @@
 #include "log.h"
 #include "parser.h"
 #include "rules.h"
+#include "ratelimit.h"
 #include "scandetect.h"
 #include "tcpstate.h"
 
@@ -46,6 +48,7 @@ struct engine {
     flowtable_t *ft;
     scan_t      *scan;           /* port-scan detection; NULL = off */
     scan_cfg_t   scan_cfg;
+    rl_t        *rl;             /* per-rule connection rate limits (ratelimit.h) */
     engine_stats_t st;
     uint64_t     clock_ns;       /* time of the packet/sweep being handled, for log lines */
     uint64_t     last_reclaim_ns;
@@ -61,6 +64,10 @@ struct engine {
     flow_t      *undo_flow;
     flow_t       undo_copy;
     bool         undo_icmp_related;
+    /* The rate-limit admission the last engine_decide() used up, if any, so
+     * engine_undo_new_flow() can give it back. */
+    const rule_t *undo_rl_rule;
+    uint32_t     undo_rl_idx;
 };
 
 engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows)
@@ -75,6 +82,8 @@ engine_t *engine_create_with_rules_sized(rules_t *rules, size_t max_flows)
     /* about one bucket per flow slot keeps chains short at capacity */
     e->ft = ft_create(max_flows, max_flows);
     if (!e->ft) { rules_free(rules); free(e); return NULL; }
+    e->rl = rl_create();
+    if (!e->rl) { ft_destroy(e->ft); rules_free(rules); free(e); return NULL; }
     ft_set_expire_hook(e->ft, expire_cb, e);
     return e;
 }
@@ -124,6 +133,7 @@ void engine_destroy(engine_t *e)
 {
     if (!e) return;
     ft_destroy(e->ft);
+    rl_destroy(e->rl);
     scan_destroy(e->scan);
     rules_free(e->rules);
     free(e);
@@ -295,6 +305,7 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
     e->clock_ns = now_ns;
     e->undo_flow = NULL;
     e->undo_icmp_related = false;
+    e->undo_rl_rule = NULL;
 
     /* Anti-spoofing: the outside may not use inside addresses, the inside must
      * use them. engine creation guarantees an `inside` network exists. */
@@ -419,6 +430,20 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         return do_drop(e, p, dir, now_ns, DROP_RULE_DENY, reason);
     }
 
+    /* `limit N/PERIOD`: this source may only open so many connections
+     * through this rule. Only admitted connections count; the admission is
+     * given back below if the flow cannot be created after all. */
+    const uint32_t ridx = (uint32_t)(r - e->rules->v);
+    if (r->limit_n) {
+        bool first = false;
+        if (!rl_admit(e->rl, ridx, p->src_ip, r->limit_n, r->limit_period_ns,
+                      now_ns, &first)) {
+            if (first)
+                log_ratelimit(p->src_ip, r->limit_n, r->limit_period_ns, r->line, now_ns);
+            return do_drop(e, p, dir, now_ns, DROP_RATE_LIMITED, reason);
+        }
+    }
+
     ft_status_t why = FT_OK;
     f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);
     if (!f && reclaim_expired(e, now_ns))     /* timed-out flows may be holding the room */
@@ -434,6 +459,8 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         if (e->evicted_since_sweep++ == 0) e->first_evict_ns = now_ns;
         f = ft_insert_ex(e->ft, &key, dir, now_ns, &why);
     }
+    if (!f && r->limit_n)
+        rl_refund(e->rl, ridx, p->src_ip, r->limit_n, r->limit_period_ns);
     if (!f)
         return do_drop(e, p, dir, now_ns,
                        why == FT_SRC_LIMIT      ? DROP_SRC_LIMIT :
@@ -441,6 +468,10 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
                        reason);
 
     f->rule_line = r->line;
+    if (r->limit_n) {
+        e->undo_rl_rule = r;
+        e->undo_rl_idx = ridx;
+    }
     if (p->proto == FW_PROTO_TCP) tcp_flow_init(f);
     f->pkts[0] = 1;
     f->bytes[0] = p->ip_len;
@@ -513,6 +544,9 @@ bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_n
     if (created_by_it) {
         ft_remove(e->ft, f);
         e->st.flows_created--;
+        if (e->undo_rl_rule)       /* the connection never happened */
+            rl_refund(e->rl, e->undo_rl_idx, p->src_ip, e->undo_rl_rule->limit_n,
+                      e->undo_rl_rule->limit_period_ns);
     } else if (e->undo_flow) {
         /* A packet on an existing flow: the other side never saw it, so it
          * must not count, move the TCP state (a FIN that was never delivered
@@ -536,6 +570,7 @@ bool engine_undo_new_flow(engine_t *e, const pkt_t *p, dir_t dir, uint64_t now_n
     }
     e->undo_flow = NULL;
     e->undo_icmp_related = false;
+    e->undo_rl_rule = NULL;
     e->st.pkts_allowed--;                  /* it was never delivered */
     e->st.pkts_dropped++;
     e->st.drops[DROP_WRITE_FAILED]++;
@@ -557,6 +592,8 @@ bool engine_replace_rules(engine_t *e, rules_t *r)
     if (!r || r->ninside == 0) { rules_free(r); return false; }
     rules_free(e->rules);
     e->rules = r;
+    rl_clear(e->rl);               /* rule numbers changed: start counting afresh */
+    e->undo_rl_rule = NULL;        /* it pointed into the old rules */
     return true;
 }
 
