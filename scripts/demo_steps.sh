@@ -12,13 +12,16 @@
 #              and the matching log line, printing a tick or a cross. It waits
 #              for Enter before each step so the presenter controls the pace.
 #              DEMO_AUTO=1 runs every step without waiting and exits non-zero
-#              if any check failed; DEMO_LOG is the firewall's log file.
+#              if any check failed; DEMO_LOG is the firewall's log file and
+#              DEMO_RULES the rules file it was started with (one step
+#              rewrites it and reloads the firewall with SIGHUP).
 # ============================================================================
 set -u
 cd "$(dirname "$0")/.."
 AUTO=${DEMO_AUTO:-}
 LOG=${DEMO_LOG:-}
-TOTAL=13
+RULES=${DEMO_RULES:-}
+TOTAL=17
 
 B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; C=$'\033[36m'; Z=$'\033[0m'
 pass=0; failn=0; n=0
@@ -49,6 +52,21 @@ log_has() {
 }
 contains() { case $1 in *"$2"*) return 0;; *) return 1;; esac; }
 sha() { sha256sum | cut -c1-24; }
+# Client A keeps a connection to the echo server on 10.0.2.2:443 while an attacker
+# outside forges one segment posing as the server (tests/integration/inject.py).
+# Prints alive, dead, reset or injected.
+forge_attack() { inside python3 tests/integration/inject.py client 10.0.2.2 443 "$1"; }
+# What an SSH session looks like on the wire: a version banner, then binary key
+# exchange. Sent to the echo server on port 443; prints echoed, or cut if the
+# firewall stopped passing it.
+ssh_over_443() { inside python3 -c '
+import socket
+s = socket.create_connection(("10.0.2.2", 443), 3)
+s.sendall(b"SSH-2.0-OpenSSH_9.6\r\n")
+s.recv(64)
+s.sendall(b"\x00\x00\x05\xdc\x0a\x14 key exchange init")
+try: print("echoed" if s.recv(64) else "closed")
+except socket.timeout: print("cut")'; }
 
 echo "${B}tunwall: a stateful firewall in userspace${Z}"
 echo "${D}Every packet between the two networks passes through our program. Watch the log above.${Z}"
@@ -193,14 +211,81 @@ sudo pkill -USR1 -x tunwall; sleep 1
 check "half-open connections were evicted to make room" log_has "^flows: .* evicted=[1-9]"
 
 # ---------------------------------------------------------------------------
+step "A forged RST can't cut a connection" \
+     "Client A holds a connection to a server on 10.0.2.2:443. An attacker outside forges" \
+     "a TCP reset as if from the server. A blind attacker can't see the traffic, so it" \
+     "can only guess the sequence number. tunwall tracks each direction's window and" \
+     "drops segments outside it. Log: red DROPs with why=tcp-out-of-window."
+cmd "forge an RST far outside the server's window      (from the outside namespace)"
+out=$(forge_attack blind-rst); say "   connection: $out"
+check "the connection survives the forged RST" test "$out" = alive
+check "the forged RST was dropped as out of window" log_has "DROP tcp 10\\.0\\.2\\.2:443 -> 10\\.0\\.1\\.2:[0-9]+ flags=0x04 .*why=tcp-out-of-window"
+cmd "forge DATA far outside the window"
+out=$(forge_attack blind-data); say "   connection: $out"
+check "the forged data never reaches the client" test "$out" = alive
+check "the forged data was dropped as out of window" log_has "DROP tcp 10\\.0\\.2\\.2:443 -> 10\\.0\\.1\\.2:[0-9]+ flags=0x18 .*why=tcp-out-of-window"
+say "${D}An attacker who SEES the traffic can still send an RST with the exact number:${Z}"
+cmd "forge an RST at exactly the right sequence number"
+out=$(forge_attack onpath-rst); say "   connection: $out"
+check "an exact RST still ends it, as TCP requires (that is what TLS is for)" test "$out" = reset
+
+# ---------------------------------------------------------------------------
+step "Tighten the policy without a restart" \
+     "Two rules get a clause at the end: the web ports now take only HTTP and TLS," \
+     "and the SSH port takes at most 5 new connections a minute from each host." \
+     "SIGHUP reloads the file. Open connections keep the rules they started under."
+if [ -n "$RULES" ]; then
+    sed -i -e 's|^allow out tcp  10\.0\.1\.0/24 any 80,443$|& app http,tls|' \
+           -e 's|^allow in  tcp  any 10\.0\.1\.3 22$|& limit 5/min|' "$RULES"
+    cmd "grep -E ' (app|limit) ' rules.conf"
+    grep -E '^[a-z].* (app|limit) ' "$RULES" | sed 's/^/     /'
+    cmd "kill -HUP tunwall"
+    sudo pkill -HUP -x tunwall
+fi
+check "the firewall reloaded the new rules" log_has "^tunwall: rules reloaded from "
+
+# ---------------------------------------------------------------------------
+step "SSH over port 443 is cut" \
+     "Port 443 is open, so tunnelling SSH through it is the classic way around a" \
+     "firewall. Now the rule says 'app http,tls': the firewall looks at the bytes, and" \
+     "after three packets that are neither, it cuts the flow. Log: a bold red FLOW BLOCK."
+cmd "an SSH handshake to 10.0.2.2:443"
+out=$(ssh_over_443); say "   result: $out"
+check "the SSH-like session was cut" test "$out" = cut
+check "the flow was blocked as app=other" log_has "FLOW BLOCK +tcp 10\\.0\\.1\\.2:[0-9]+ -> 10\\.0\\.2\\.2:443 .*app=other"
+cmd "curl -s https://example.com      # real TLS on the same port"
+out=$(inside curl -s -m 15 https://example.com); echo "$out" | grep -o '<title>.*</title>' | sed 's/^/     /'
+check "real HTTPS still works" contains "$out" "</html>"
+
+# ---------------------------------------------------------------------------
+step "Password guessing on SSH is rate limited" \
+     "'limit 5/min' lets each outside host open 5 connections at once, then one every" \
+     "12 s. A brute-forcer opening connection after connection gets 5, then silence." \
+     "Log: one yellow LIMIT line, and red DROPs with why=rate-limited."
+cmd "for i in 1..6: curl -m 3 http://10.0.1.3:22/      (from 10.0.2.2)"
+got=0; codes=""
+for i in 1 2 3 4 5 6; do
+    outside curl -s -m 3 --interface 10.0.2.2 -o /dev/null http://10.0.1.3:22/; rc=$?
+    codes="$codes $rc"; [ $i -le 5 ] && [ $rc = 0 ] && got=$((got + 1))
+done
+say "   curl exit codes:$codes   (0 = connected, 28 = timed out)"
+check "the first 5 connections got in" test "$got" = 5
+check "the 6th was silently dropped" test "$rc" = 28
+check "going over the limit was reported" log_has "LIMIT +10\\.0\\.2\\.2 over 5/min on rule line [0-9]+"
+
+# ---------------------------------------------------------------------------
 step "The counters" \
      "Sending SIGUSR1 prints the statistics: packets allowed and dropped, drops by" \
-     "reason, flows, the identified applications, and any log lines suppressed."
+     "reason (including the forged segments and rate-limited connections), flows, the" \
+     "identified applications and blocked flows, and any log lines suppressed."
 cmd "kill -USR1 tunwall"
 sudo pkill -USR1 -x tunwall; sleep 1
 check "the counters were printed" log_has "^apps: +http=[1-9]"
 check "drops are broken down by reason" log_has "^drop\\[no-rule\\(default-deny\\)\\]=[1-9]"
 check "the scan is counted" log_has "^scan: +detected=1 "
+check "forged segments are counted" log_has "^drop\\[tcp-out-of-window\\]=[1-9]"
+check "rate-limited connections are counted" log_has "^drop\\[rate-limited\\]=[1-9]"
+check "blocked flows are counted" log_has "^apps: .* blocked=[1-9]"
 
 # ---------------------------------------------------------------------------
 step "Performance against the Linux kernel" \
