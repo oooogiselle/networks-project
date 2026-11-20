@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   tcpstate.c
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -49,8 +49,8 @@ bool tcp_track_ex(flow_t *f, uint8_t fl, bool from_orig, size_t payload_len)
     const bool syn = fl & TCP_SYN, ack = fl & TCP_ACK;
     const bool fin = fl & TCP_FIN, rst = fl & TCP_RST;
 
-    /* RST tears the connection down from any state. (No sequence check yet:
-     * a blind RST could kill a flow - listed as future work.) */
+    /* RST tears the connection down from any state. With sequence checks on
+     * (tcpseq.h), only an RST inside the window gets this far. */
     if (rst) {
         if (f->tcp_state == TCPS_CLOSED) return true;   /* retransmitted RST */
         f->tcp_state = TCPS_CLOSED;

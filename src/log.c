@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   log.c
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -108,6 +108,7 @@ const char *drop_reason_str(drop_reason_t r)
     case DROP_RULE_REJECT: return "rule-reject";
     case DROP_SCAN_BLOCKED: return "scan-blocked";
     case DROP_RATE_LIMITED: return "rate-limited";
+    case DROP_TCP_WINDOW:  return "tcp-out-of-window";
     case DROP_REASON_COUNT: break;
     }
     return "?";

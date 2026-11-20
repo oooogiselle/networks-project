@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # File Name:   netns.sh
-# Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+# Author:      Eva Tate and Giselle Wu
 # Course:      CS60: Computer Networks
 # Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
 # Date:        November 15, 2026

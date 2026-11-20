@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # File Name:   run_all.sh
-# Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+# Author:      Eva Tate and Giselle Wu
 # Course:      CS60: Computer Networks
 # Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
 # Date:        November 15, 2026
@@ -735,6 +735,49 @@ if start_fw; then
     else echo "skip rate-limit refill test (SKIP_SLOW set)"; fi
 else
     bad "tunwall did not start with the rate-limit rules"; cat "$LOGDIR/tunwall.log"
+fi
+RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+[ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+start_fw || bad "tunwall did not restart with the normal rules"
+
+echo "== TCP sequence-number checks (forged RST and data)"
+# Client A (10.0.1.2) holds a connection to an echo server on 10.0.2.3:7000.
+# An attacker in the outside namespace forges segments posing as the server
+# (tests/integration/inject.py): an RST or data with a wrong sequence number
+# (all a blind attacker can send), and an RST with the right one (which only
+# an attacker who sees the traffic can send). The client's own TCP ignores
+# out-of-window segments anyway (RFC 5961), but a firewall that accepted the
+# forged RST would mark the flow closed and cut the connection: the -L run
+# at the end shows exactly that.
+seq_attack(){ ip netns exec inside python3 tests/integration/inject.py client 10.0.2.3 7000 "$1"; }
+[ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+printf '%s\n' 'inside 10.0.1.0/24' \
+    'allow out tcp 10.0.1.0/24 10.0.2.3 7000' > "$LOGDIR/seq.conf"
+bg ip netns exec outside python3 tests/integration/inject.py server 10.0.2.3 7000
+wait_listen outside tcp 10.0.2.3 7000 "the echo server" || true
+ip -n outside route replace 10.0.1.0/24 via 10.0.2.1 2>/dev/null
+RULES=$LOGDIR/seq.conf; TUNWALL_ARGS=$SAVED_ARGS
+if start_fw; then
+    logged "it says the sequence checks are on" '^tunwall: TCP sequence checks on'
+    expect "a forged RST with a wrong sequence number does not end the connection" alive seq_attack blind-rst
+    logged "the forged RST is dropped as out of window" \
+        'DROP tcp 10\.0\.2\.3:7000 -> 10\.0\.1\.2:[0-9]+ flags=0x04 .*why=tcp-out-of-window'
+    expect "forged data with a wrong sequence number never reaches the client" alive seq_attack blind-data
+    logged "the forged data is dropped as out of window" \
+        'DROP tcp 10\.0\.2\.3:7000 -> 10\.0\.1\.2:[0-9]+ flags=0x18 .*why=tcp-out-of-window'
+    expect "an RST with the right sequence number still ends it" reset seq_attack onpath-rst
+    dump_stats
+    logged "stats: out-of-window drops are counted" '^drop\[tcp-out-of-window\]=[1-9][0-9]*'
+else
+    bad "tunwall did not start for the sequence-check test"; cat "$LOGDIR/tunwall.log"
+fi
+[ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+TUNWALL_ARGS="$SAVED_ARGS -L"
+if start_fw; then
+    logged "with -L it says the sequence checks are off" '^tunwall: TCP sequence checks off \(-L\)'
+    expect "control, -L: the same forged RST cuts the connection at the firewall" dead seq_attack blind-rst
+else
+    bad "tunwall did not start with -L"; cat "$LOGDIR/tunwall.log"
 fi
 RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
 [ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }

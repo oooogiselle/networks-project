@@ -10,17 +10,18 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | Path | Module | Written by |
 |---|---|---|
 | `include/engine.h` | Shared interface: `pkt_t`, `engine_decide()` | shared |
-| `include/parser.h`, `src/parser.c` | Packet parse + checksums → `pkt_t` | Giselle |
+| `include/parser.h`, `src/parser.c` | Packet parse + checksums → `pkt_t` (including TCP sequence numbers and window scale) | Giselle |
 | `include/reject.h`, `src/reject.c` | Builds the answer to a `reject` rule: a TCP RST or an ICMP unreachable, with checksums (pure function) | Giselle |
 | `include/nat.h`, `src/nat.c` | Source NAT with port translation and port forwarding: mapping table, RFC 1624 incremental checksums, ICMP error translation (`tunwall -n`, `forward` rules) | Giselle |
 | `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | Eva |
 | `src/flowtable.c` | 5-tuple hash table, expiry | Eva; half-open eviction queue for SYN-flood relief: Giselle |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
 | `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines and `limit`: Giselle |
-| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection, SYN-flood and rate-limit hooks: Giselle |
+| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection, SYN-flood, rate-limit and TCP sequence-check hooks: Giselle |
 | `src/log.c` | Per-flow logs, counters | Eva |
 | `include/scandetect.h`, `src/scandetect.c` | Port-scan detection: distinct ports per outside host in a sliding window, temporary blocking (`tunwall -s`) | Giselle |
 | `include/ratelimit.h`, `src/ratelimit.c` | Per-rule connection rate limits (`limit 5/min` on an allow rule): a token bucket (GCRA) per rule and source address in a fixed table | Giselle |
+| `include/tcpseq.h`, `src/tcpseq.c` | TCP sequence-number checks: each direction's sequence window, so forged RSTs and injected data are dropped (`tunwall -L` turns them off) | Giselle |
 | `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Eva; NAT, port forwarding and reject hooks: Giselle |
 | `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Eva; `-n`, `-s` and SIGHUP reload: Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Eva; the NAT test address: Giselle |
@@ -52,8 +53,9 @@ sudo ip netns exec inside curl http://10.0.2.2/   # in another terminal
 sudo scripts/netns.sh down
 ```
 
-`tunwall -r <rules> [-i tun-in] [-o tun-out] [-n ADDR] [-s P,W,B] [-f | -q]`
-(`-n` turns on source NAT, `-s` tunes port-scan detection, both below). By default every flow
+`tunwall -r <rules> [-i tun-in] [-o tun-out] [-n ADDR] [-s P,W,B] [-L] [-f | -q]`
+(`-n` turns on source NAT, `-s` tunes port-scan detection, `-L` turns off the
+TCP sequence-number checks, all below). By default every flow
 open/close and every dropped packet (with its reason) is logged to stderr. The
 logging is rate-limited to 1000 lines per second (bursts of 1000, shared by all
 kinds of line) so a flood or a scan cannot turn into a flood of log writes; when
@@ -305,6 +307,68 @@ done                          # open x5, then timeout; the log shows LIMIT 10.0.
 sleep 12; sudo ip netns exec outside python3 tests/integration/probe.py tcp 10.0.1.3 22   # open
 ```
 
+### TCP sequence-number checks (`-L` turns them off)
+
+Following a connection by its flags alone leaves a hole. Anyone who knows a
+connection's addresses and ports (a web server's, say, which are public) can
+end it with **one forged RST**, or slip data into it, without ever seeing a
+packet of it: the firewall would believe the RST, mark the flow closed and
+drop everything after. So tunwall also tracks each direction's **sequence
+window**, as Linux conntrack (`tcp_in_window`) and pf do, after van Rooij's
+"Real Stateful TCP Packet Filtering". A segment outside it is dropped as
+`tcp-out-of-window` before it can change anything.
+
+- **What is remembered.** For each direction: the highest sequence number it
+  has sent (`end`), the highest its peer has allowed it (`maxend` = the peer's
+  ack + window), and the largest window it has advertised (`maxwin`).
+- **The checks.** A segment from sender `s` to receiver `r`, with
+  `end = seq + length` (SYN and FIN count one each), must pass all four
+  (comparisons modulo 2^32, so sequence numbers may wrap):
+
+  | | Rule | Refuses |
+  |---|---|---|
+  | A | `seq <= s.maxend` | data beyond what the receiver allowed |
+  | B | `end >= s.end - r.maxwin` | segments more than a window old |
+  | C | `ack <= r.end` (if ACK) | acknowledging data never sent |
+  | D | `ack >= r.end - max(s.maxwin, 66000)` (if ACK) | stale acknowledgments |
+
+  A forged RST must therefore land inside the receiver's window: a blind
+  guess succeeds with probability about window / 2^32 instead of always.
+- **The handshake.** The SYN that creates the flow sets up the originator's
+  window. The SYN-ACK must acknowledge that SYN (ack between ISN + 1 and the
+  end of the SYN, since a TCP Fast Open server may ack only the SYN and not
+  its data) and sets up the responder's. A repeated SYN must carry the same
+  ISN, except that the originator may start over with a new one before any
+  answer. Window scaling (RFC 7323) is applied only if both SYNs offered it,
+  and windows in SYNs are never scaled. An RST refusing a connection must
+  acknowledge the SYN (RFC 793). Simultaneous open works.
+- **What is not checked.** SACK blocks and timestamps (PAWS), as in Linux by
+  default. Retransmissions, zero-window probes and keepalives fall inside the
+  window and pass.
+- **Cost.** A few comparisons per TCP packet on the fast path, and the parser
+  reads TCP options only on a SYN. The windows add 2 x 20 bytes to each
+  preallocated flow slot.
+- **On and off.** `tunwall` turns the checks on; `-L` ("liberal", like Linux's
+  `nf_conntrack_tcp_be_liberal`) turns them off. The library's
+  `engine_create*` leave them off (`engine_set_tcp_window()`), because most
+  unit tests drive the engine with flag-only packets. A dropped segment is
+  logged (`why=tcp-out-of-window`) and counted (`drop[tcp-out-of-window]=`),
+  never refreshes the flow's timer, and does not count toward scan detection.
+
+The end-to-end test attacks a live connection, from the outside namespace,
+with segments forged as the server (`tests/integration/inject.py`):
+
+```
+blind RST  (seq half the space away)   -> dropped, connection keeps working
+blind data (seq a quarter away)        -> dropped, never reaches the client
+RST at the exact next seq (on-path)    -> passes, connection reset
+blind RST again, with tunwall -L       -> passes, firewall cuts the connection
+```
+
+The last line is the hole this closes. The client's own TCP ignores the
+out-of-window RST (RFC 5961), but a firewall that believed it would mark the
+flow closed and drop everything after it.
+
 ## Tests
 
 Line coverage of the library (everything in `src/` except `main.c` and
@@ -323,7 +387,8 @@ the namespace topology against the real `tunwall` (curl with a SHA-256 match,
 DNS, ping, blocked inbound traffic that must be silently dropped rather than
 refused, reject rules, nmap SYN/ACK/FIN/NULL/Xmas scans, application
 identification, exact log lines, flow expiry, TTL and path MTU, source NAT,
-port forwarding, SYN-flood relief, connection rate limits, SIGHUP reload,
+port forwarding, SYN-flood relief, connection rate limits, forged TCP
+RSTs and data, SIGHUP reload,
 kill-the-firewall). They
 need root, `nmap`, `hping3` and `python3`.
 - **Source NAT.** The section restarts `tunwall` with `-n 10.0.2.254` and removes
@@ -348,6 +413,10 @@ need root, `nmap`, `hping3` and `python3`.
   `drop[rate-limited]` counter appear, 10.0.2.2 still connects, and no scan
   is reported. Unless `SKIP_SLOW` is set, 12 s later exactly one more
   connection gets in.
+- **TCP sequence checks.** A forged RST and forged data with wrong sequence
+  numbers are dropped (`why=tcp-out-of-window`) and the connection keeps
+  echoing. An RST with the right sequence number still resets it. With `-L`
+  the same blind RST cuts the connection at the firewall.
 
 CI sets `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
 `SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests (and the 12 s
@@ -490,6 +559,9 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
      (`DROP_ICMP_RATE`). The error's own source is not checked, since it is a
      router on the path. Errors never change the flow or refresh its timer.
    - **Flow exists** (fast path): update TCP state / timers, no rules evaluated.
+     A TCP segment must fall inside the connection's sequence window
+     (`tcp-out-of-window`, see
+     [TCP sequence-number checks](#tcp-sequence-number-checks--l-turns-them-off)).
      Packets travelling the wrong way for the flow (spoofing) are dropped. On
      an ICMP echo flow the originator may only send echo requests and its
      peer only echo replies (`DROP_ICMP_TYPE`), and a rejected packet never
@@ -605,7 +677,6 @@ refused" in milliseconds instead of hanging. The shipped config rejects telnet
 
 ## Not done yet / ideas
 
-- TCP sequence-number validation (blind RST/injection protection)
 - Application identification only labels flows: rules cannot match on
   the application, and a flow is never dropped for what it carries
 - Endpoint-independent NAT mappings (full-cone, for peer-to-peer). Source NAT

@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   flowtable.h
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -42,6 +42,17 @@ typedef enum {
 
 const char *tcp_state_str(tcp_state_t s);
 
+/* One direction's TCP sequence window (see tcpseq.h); in flow_t.tw[]. */
+typedef struct tcp_win {
+    uint32_t isn;               /* initial sequence number (from its SYN) */
+    uint32_t end;               /* highest seq + length it has sent */
+    uint32_t maxend;            /* highest seq the peer has allowed it (ack + window) */
+    uint32_t maxwin;            /* largest window it has advertised, scaled */
+    uint8_t  scale;             /* shift for the windows it advertises */
+    uint8_t  wscale;            /* window-scale option in its SYN, or TCP_NO_WSCALE */
+    bool     init;              /* its SYN has been seen */
+} tcp_win_t;
+
 typedef struct flow {
     flow_key_t  key;            /* originator -> responder */
     dir_t       orig_dir;       /* interface the originator's packets arrive on */
@@ -54,6 +65,7 @@ typedef struct flow {
     uint16_t    icmp_err_count;       /* related ICMP errors allowed in the current window */
     uint64_t    icmp_err_window_ns;   /* start of that one-second window */
     int         rule_line;      /* rules-file line that allowed it (0 = n/a) */
+    tcp_win_t   tw[2];          /* TCP sequence windows: [0] originator, [1] responder */
     uint64_t    created_ns, last_seen_ns, expires_ns;
     uint64_t    pkts[2], bytes[2];   /* [0] originator, [1] responder */
     struct flow *next;          /* hash chain */

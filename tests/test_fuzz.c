@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   test_fuzz.c
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -13,11 +13,15 @@
 /*
  * test_fuzz.c - "the program should never crash on bad input" (spec section 4).
  *
- * Three phases, all deterministic from a seed so a failure can be replayed:
+ * Phases, all deterministic from a seed so a failure can be replayed (phase D,
+ * the rules-file parser, is described where it is defined):
  *   A. pure random bytes of random lengths           -> parse_packet (-> engine)
  *   B. valid packets, randomly corrupted/truncated   -> parse_packet (-> engine)
  *   C. random pkt_t structs straight into the engine (bypasses the parser, so
  *      the engine itself is proven robust, e.g. ICMP errors with junk payload)
+ *   E. TCP conversations: handshakes, then segments that are mostly in order
+ *      and sometimes off by a little or a lot, for the sequence checks
+ *      (tcpseq.h; run on an engine with them on, and one with them off)
  *
  * Besides "did not crash" (run it under `make asan`), it checks invariants:
  * parse results are consistent, verdict and reason agree, counters add up,
@@ -264,6 +268,14 @@ static void phase_random_pkts(engine_t *e, unsigned long iters)
         p.src_ip = pick_addr();  p.dst_ip = pick_addr();
         p.src_port = pick_port(); p.dst_port = pick_port();
         p.tcp_flags = chance(70) ? (uint8_t)(1u << below(6)) : (uint8_t)rnd();
+        /* Sequence numbers from a small pool, so the window checks see
+         * handshakes that line up as well as ones that don't. */
+        static const uint32_t seqs[] = { 0, 1, 1000, 1001, 5000, 5001, 0xffffffffu, 0x80000000u };
+        static const uint8_t wscales[] = { TCP_NO_WSCALE, 0, 7, 14, TCP_NO_WSCALE, 3 };
+        p.tcp_seq = chance(80) ? seqs[below(sizeof seqs / sizeof *seqs)] : (uint32_t)rnd();
+        p.tcp_ack = chance(80) ? seqs[below(sizeof seqs / sizeof *seqs)] : (uint32_t)rnd();
+        p.tcp_win = chance(50) ? 64240 : (uint16_t)rnd();
+        p.tcp_wscale = wscales[below(sizeof wscales)];
         if (p.proto == FW_PROTO_ICMP) {
             p.icmp_type = icmp_types[below(sizeof icmp_types)];
             p.dst_port = p.src_port;          /* echo id lives in both */
@@ -275,6 +287,74 @@ static void phase_random_pkts(engine_t *e, unsigned long iters)
         }
         now = advance(now);
         feed(e, &p, below(2) ? DIR_IN : DIR_OUT, now);
+        if (chance(1)) engine_expire(e, now);
+    }
+}
+
+/* ---- phase E: TCP conversations ------------------------------------------ */
+
+/* A segment of the conversation between 10.0.1.2:sport and 93.184.216.34:80. */
+static pkt_t conv_seg(bool from_client, uint16_t sport, uint8_t flags, uint32_t seq,
+                      uint32_t ack, uint16_t len)
+{
+    pkt_t p;
+    memset(&p, 0, sizeof p);
+    p.proto = FW_PROTO_TCP;
+    p.src_ip = from_client ? IP(10,0,1,2) : IP(93,184,216,34);
+    p.dst_ip = from_client ? IP(93,184,216,34) : IP(10,0,1,2);
+    p.src_port = from_client ? sport : 80;
+    p.dst_port = from_client ? 80 : sport;
+    p.tcp_flags = flags;
+    p.tcp_seq = seq;
+    p.tcp_ack = ack;
+    p.tcp_win = chance(70) ? 64240 : (uint16_t)rnd();
+    p.tcp_wscale = (flags & TCP_SYN) && chance(50) ? (uint8_t)below(16) : TCP_NO_WSCALE;
+    p.payload_len = len;
+    p.ip_len = (uint16_t)(40 + len);
+    return p;
+}
+
+/* Handshakes followed by segments that are mostly right and sometimes not
+ * (off by a little, off by a lot, random flags), so the sequence checks see
+ * both sides of every comparison. Phases A-C rarely hit an existing flow. */
+static void phase_tcp_conversations(engine_t *e, unsigned long iters)
+{
+    static const uint8_t flags[] = { TCP_ACK, TCP_ACK | TCP_PSH, TCP_ACK | TCP_PSH,
+                                     TCP_FIN | TCP_ACK, TCP_RST, TCP_RST | TCP_ACK, TCP_SYN,
+                                     TCP_SYN | TCP_ACK };
+    uint64_t now = SEC;
+    for (unsigned long i = 0; i < iters; i++) {
+        const uint16_t sport = (uint16_t)(1024 + i % 60000);
+        uint32_t c = (uint32_t)rnd(), s = (uint32_t)rnd();     /* next seq of each side */
+        now = advance(now);
+        const pkt_t syn = conv_seg(true, sport, TCP_SYN, c, 0, 0);
+        feed(e, &syn, DIR_IN, now);
+        c++;
+        const pkt_t synack = conv_seg(false, sport, TCP_SYN | TCP_ACK, s,
+                                      chance(90) ? c : (uint32_t)rnd(), 0);
+        feed(e, &synack, DIR_OUT, now);
+        s++;
+        for (int k = 0; k < 12; k++) {
+            const bool cl = below(2);
+            const uint16_t len = chance(50) ? 0 : (uint16_t)below(1461);
+            uint32_t seq = cl ? c : s, ack = cl ? s : c;
+            if (chance(15)) seq += (uint32_t)below(200000) - 100000;  /* near misses */
+            if (chance(5))  seq = (uint32_t)rnd();                     /* blind guesses */
+            if (chance(10)) ack += (uint32_t)below(200000) - 100000;
+            const uint8_t fl = chance(85) ? flags[below(3)] : flags[below(sizeof flags)];
+            const pkt_t p = conv_seg(cl, sport, fl, seq, ack, len);
+            drop_reason_t why = DROP_REASON_COUNT;
+            const verdict_t v = engine_decide(e, &p, cl ? DIR_IN : DIR_OUT, now, &why);
+            if (v == VERDICT_ALLOW) {
+                allowed_seen++;
+                const uint32_t end = seq + len + (fl & TCP_SYN ? 1 : 0) + (fl & TCP_FIN ? 1 : 0);
+                if (cl && (int32_t)(end - c) > 0) c = end;
+                if (!cl && (int32_t)(end - s) > 0) s = end;
+            } else {
+                CHECK(v == VERDICT_DROP && why > DROP_NONE && why < DROP_REASON_COUNT);
+                if (why > DROP_NONE && why < DROP_REASON_COUNT) drop_seen[why]++;
+            }
+        }
         if (chance(1)) engine_expire(e, now);
     }
 }
@@ -354,8 +434,14 @@ static void fuzz_all(void)
     /* a 2-slot table with no caps and an allow-everything policy: flows that
      * start inside and go outside fill it at once and it stays under pressure */
     engine_t *small = make("inside 10.0.1.0/24\nallow any any any\nallow in any any any\n", SMALL_TABLE);
-    CHECK(big != NULL && small != NULL);
-    if (!big || !small) { engine_destroy(big); engine_destroy(small); return; }
+    /* the default policy with TCP sequence-number checks on, as tunwall runs */
+    engine_t *strict = make(POLICY, 0);
+    CHECK(big != NULL && small != NULL && strict != NULL);
+    if (!big || !small || !strict) {
+        engine_destroy(big); engine_destroy(small); engine_destroy(strict);
+        return;
+    }
+    engine_set_tcp_window(strict, true);
 
     phase_random_bytes(big, iters);
     phase_mutated(big, iters);
@@ -363,18 +449,27 @@ static void fuzz_all(void)
     phase_random_bytes(small, iters / 4);
     phase_mutated(small, iters / 4);
     phase_random_pkts(small, iters / 4);
+    phase_mutated(strict, iters / 2);
+    phase_random_pkts(strict, iters / 2);
+    phase_tcp_conversations(strict, iters / 10);
+    phase_tcp_conversations(big, iters / 20);          /* checks off: same traffic */
 
     phase_rules(iters / 5);
     check_stats(big, FW_DEFAULT_MAX_FLOWS);
     check_stats(small, SMALL_TABLE);
+    check_stats(strict, FW_DEFAULT_MAX_FLOWS);
 
     engine_stats_t s;
     engine_get_stats(small, &s);
     printf("   (small table: %llu flows created, %llu table-full drops)\n",
            (unsigned long long)s.flows_created,
            (unsigned long long)s.drops[DROP_TABLE_FULL]);
+    engine_get_stats(strict, &s);
+    printf("   (sequence checks: %llu out-of-window drops)\n",
+           (unsigned long long)s.drops[DROP_TCP_WINDOW]);
     engine_destroy(big);
     engine_destroy(small);
+    engine_destroy(strict);
 }
 
 /* The default run must actually reach the interesting code, or it proves
@@ -388,6 +483,7 @@ static void check_coverage(void)
     CHECK(drop_seen[DROP_TABLE_FULL] > 0);
     CHECK(drop_seen[DROP_BAD_SRC] > 0);
     CHECK(drop_seen[DROP_ICMP_ERR] > 0);
+    CHECK(drop_seen[DROP_TCP_WINDOW] > 0);
     (void)related_seen;
 }
 

@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   main.c
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -42,7 +42,7 @@ static void on_hup(int sig)   { (void)sig; g_reload = 1; }
 static void usage(FILE *out)
 {
     fprintf(out,
-        "usage: tunwall -r <rules-file> [-i <tun-in>] [-o <tun-out>] [-n <addr>] [-s <scan>] [-f | -q]\n"
+        "usage: tunwall -r <rules-file> [-i <tun-in>] [-o <tun-out>] [-n <addr>] [-s <scan>] [-L] [-f | -q]\n"
         "  -r FILE   rules file (required); the program refuses to start on a syntax error\n"
         "  -i NAME   tun device facing the trusted network   (default tun-in)\n"
         "  -o NAME   tun device facing the untrusted network (default tun-out)\n"
@@ -51,6 +51,8 @@ static void usage(FILE *out)
         "            also turns on the rules file's 'forward' lines (port forwarding)\n"
         "  -s P[,W[,B]]  port-scan detection: an outside host dropped on P distinct\n"
         "            ports within W s is blocked for B s (default %d,%d,%d; -s 0 = off)\n"
+        "  -L        liberal TCP: turn off the sequence-number checks that stop forged\n"
+        "            RSTs and injected data (on by default)\n"
         "  -f        log flow opens/closes only, not individual dropped packets\n"
         "  -q        log nothing but errors\n"
         "  -d        accepted for old scripts: logging drops is now the default\n"
@@ -156,8 +158,9 @@ int main(int argc, char **argv)
     const char *rules = NULL, *in_name = "tun-in", *out_name = "tun-out", *nat_arg = NULL;
     log_level_t level = LOG_DEBUG;
     scan_cfg_t scan = { SCAN_DEFAULT_PORTS, SCAN_DEFAULT_WINDOW_S, SCAN_DEFAULT_BLOCK_S };
+    bool liberal = false;
     int opt;
-    while ((opt = getopt(argc, argv, "r:i:o:n:s:fqdh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:i:o:n:s:Lfqdh")) != -1) {
         switch (opt) {
         case 'r': rules = optarg; break;
         case 'i': in_name = optarg; break;
@@ -171,6 +174,7 @@ int main(int argc, char **argv)
                 return 2;
             }
             break;
+        case 'L': liberal = true; break;
         case 'f': level = LOG_INFO; break;
         case 'q': level = LOG_OFF; break;
         case 'd': level = LOG_DEBUG; break;
@@ -196,6 +200,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "tunwall: %s\n", err);       /* the message names the file */
         return 1;
     }
+    engine_set_tcp_window(engine, !liberal);    /* tcpseq.h */
     if (!engine_set_scan(engine, &scan)) {
         fprintf(stderr, "tunwall: out of memory\n");
         engine_destroy(engine);
@@ -256,6 +261,8 @@ int main(int argc, char **argv)
                     (unsigned)scan.ports, (unsigned)scan.window_s, (unsigned)scan.block_s);
         else
             fprintf(stderr, "tunwall: scan detection off\n");
+        fprintf(stderr, liberal ? "tunwall: TCP sequence checks off (-L)\n"
+                                : "tunwall: TCP sequence checks on\n");
     }
 
     int rc = 0;

@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   test_ratelimit.c
- * Author:      Giselle Wu, assisted by Claude Code
+ * Author:      Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 19, 2026

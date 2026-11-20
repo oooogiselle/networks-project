@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   engine.h
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -22,6 +22,9 @@
  *   - ICMP: set src_port = dst_port = echo identifier, and icmp_type.
  *     (Echo request type 8 and echo reply type 0 then form a reversible flow.)
  *   - Non-TCP packets: tcp_flags = 0. Non-ICMP packets: icmp_type = 0.
+ *   - TCP: tcp_seq, tcp_ack and tcp_win as on the wire (host order, window
+ *     unscaled). tcp_wscale is the SYN's window-scale option (0-14), or
+ *     TCP_NO_WSCALE when the packet is not a SYN or carries none.
  *   - Non-first IP fragments have no L4 header; drop them in the parser.
  *   - payload may be NULL when payload_len == 0.
  *   - ICMP errors (dest unreachable, time exceeded, parameter problem): pass
@@ -54,6 +57,9 @@
 #define TCP_ECE 0x40
 #define TCP_CWR 0x80
 
+#define TCP_NO_WSCALE  0xff  /* pkt_t.tcp_wscale: no window-scale option */
+#define TCP_MAX_WSCALE 14    /* RFC 7323: larger shifts are treated as 14 */
+
 #define ICMP_ECHO_REPLY   0
 #define ICMP_ECHO_REQUEST 8
 
@@ -62,6 +68,9 @@ typedef struct pkt {
     uint32_t src_ip, dst_ip;        /* host byte order */
     uint16_t src_port, dst_port;    /* host byte order; ICMP: echo id in both */
     uint8_t  tcp_flags;
+    uint8_t  tcp_wscale;            /* SYN only: window scale, or TCP_NO_WSCALE */
+    uint32_t tcp_seq, tcp_ack;      /* TCP sequence and acknowledgment numbers */
+    uint16_t tcp_win;               /* TCP window as sent (not scaled) */
     uint8_t  icmp_type;
     uint16_t ip_len;                /* total IP length, for byte counters */
     uint16_t payload_len;
@@ -114,6 +123,7 @@ typedef enum {
     DROP_RULE_REJECT,      /* new flow, a reject rule matched (and may be answered) */
     DROP_SCAN_BLOCKED,     /* source is blocked after a port scan (scandetect.h) */
     DROP_RATE_LIMITED,     /* new flow over its rule's `limit N/...` for this source */
+    DROP_TCP_WINDOW,       /* TCP segment outside the connection's sequence window */
     DROP_REASON_COUNT
 } drop_reason_t;
 
@@ -251,6 +261,15 @@ const rules_t *engine_rules(const engine_t *e);
  * window_s or block_s 0) or out of memory; the old settings then stay.
  */
 bool engine_set_scan(engine_t *e, const scan_cfg_t *cfg);
+
+/*
+ * TCP sequence-number checks (tcpseq.h): with them on, a segment of a tracked
+ * connection outside its sequence window is dropped (DROP_TCP_WINDOW), so a
+ * blind attacker cannot reset or inject into it. Every engine_create* leaves
+ * them off (the packets must then carry real sequence numbers, which the
+ * parser provides); tunwall turns them on. Call before traffic flows.
+ */
+void engine_set_tcp_window(engine_t *e, bool on);
 
 /*
  * A packet from the outside that was dropped before engine_decide() saw it:

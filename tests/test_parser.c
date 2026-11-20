@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   test_parser.c
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -144,6 +144,104 @@ static void tcp_odd_length_payload(void)
     pkt_t p;
     CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
     CHECK_EQ(p.payload_len, 3);
+}
+
+/* ---- TCP sequence numbers and window scale ------------------------------------ */
+
+/* A SYN with the given option bytes (a multiple of 4, <= 40). */
+static size_t syn_with_opts(uint8_t *b, size_t cap, const uint8_t *opt, size_t optlen,
+                            uint8_t flags)
+{
+    struct pb_opts o = {.tcp_opt_len = (uint8_t)optlen};
+    size_t n = pb_tcp(b, cap, &o, CLIENT_A, 40000, SERVER, 80, flags, NULL, 0);
+    memcpy(b + 20 + 20, opt, optlen);
+    pb_fix_csums(b, n);
+    return n;
+}
+
+static void tcp_seq_ack_and_window(void)
+{
+    uint8_t b[128];
+    size_t n = pb_tcp(b, sizeof b, NULL, CLIENT_A, 40000, SERVER, 80,
+                      TCP_ACK | TCP_PSH, "hi", 2);
+    pb_wr32(b + 20 + 4, 0xfffffff0u);              /* seq near the wrap */
+    pb_wr32(b + 20 + 8, 0x01020304u);
+    pb_wr16(b + 20 + 14, 517);
+    pb_fix_csums(b, n);
+    pkt_t p;
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_seq, 0xfffffff0u);
+    CHECK_EQ(p.tcp_ack, 0x01020304u);
+    CHECK_EQ(p.tcp_win, 517);
+    CHECK_EQ(p.tcp_wscale, TCP_NO_WSCALE);         /* not a SYN */
+}
+
+static void tcp_window_scale_option(void)
+{
+    uint8_t b[128];
+    pkt_t p;
+    /* What Linux sends: MSS, SACK-permitted, timestamps, NOP, wscale 7. */
+    const uint8_t linux_syn[20] = { 2, 4, 0x05, 0xb4,  4, 2,  8, 10, 0, 0, 0, 1, 0, 0, 0, 0,
+                                    1,  3, 3, 7 };
+    size_t n = syn_with_opts(b, sizeof b, linux_syn, sizeof linux_syn, TCP_SYN);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, 7);
+    CHECK_EQ(p.tcp_seq, 1000);
+    CHECK_EQ(p.tcp_win, 65535);
+
+    /* a SYN-ACK carries it too */
+    n = syn_with_opts(b, sizeof b, linux_syn, sizeof linux_syn, TCP_SYN | TCP_ACK);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, 7);
+
+    /* shifts above 14 are treated as 14 (RFC 7323) */
+    const uint8_t big[4] = { 3, 3, 15, 0 };
+    n = syn_with_opts(b, sizeof b, big, sizeof big, TCP_SYN);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, TCP_MAX_WSCALE);
+
+    /* no options, or options without window scale: none */
+    n = pb_tcp(b, sizeof b, NULL, CLIENT_A, 40000, SERVER, 80, TCP_SYN, NULL, 0);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, TCP_NO_WSCALE);
+    const uint8_t mss_only[4] = { 2, 4, 0x05, 0xb4 };
+    n = syn_with_opts(b, sizeof b, mss_only, sizeof mss_only, TCP_SYN);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, TCP_NO_WSCALE);
+
+    /* window scale after an end-of-list is not read */
+    const uint8_t after_eol[4] = { 0, 3, 3, 7 };
+    n = syn_with_opts(b, sizeof b, after_eol, sizeof after_eol, TCP_SYN);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, TCP_NO_WSCALE);
+
+    /* a wscale option of the wrong length is not window scale */
+    const uint8_t wrong_len[4] = { 3, 4, 7, 0 };
+    n = syn_with_opts(b, sizeof b, wrong_len, sizeof wrong_len, TCP_SYN);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, TCP_NO_WSCALE);
+}
+
+static void tcp_malformed_options_are_ignored_not_dropped(void)
+{
+    uint8_t b[128];
+    pkt_t p;
+    const uint8_t *bad[] = {
+        (const uint8_t[]){ 2, 0, 3, 3 },      /* length 0 */
+        (const uint8_t[]){ 2, 1, 3, 3 },      /* length 1 */
+        (const uint8_t[]){ 2, 9, 3, 3 },      /* runs past the header */
+        (const uint8_t[]){ 1, 1, 1, 3 },      /* kind with no room for its length */
+    };
+    for (size_t k = 0; k < sizeof bad / sizeof *bad; k++) {
+        size_t n = syn_with_opts(b, sizeof b, bad[k], 4, TCP_SYN);
+        CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+        CHECK_EQ(p.tcp_wscale, TCP_NO_WSCALE);
+    }
+    /* Options on a packet that is not a SYN are never read. */
+    const uint8_t ws[4] = { 3, 3, 7, 0 };
+    size_t n = syn_with_opts(b, sizeof b, ws, sizeof ws, TCP_ACK);
+    CHECK_EQ(parse_packet(b, n, &p), PARSE_OK);
+    CHECK_EQ(p.tcp_wscale, TCP_NO_WSCALE);
 }
 
 static void udp_fields(void)
@@ -902,5 +1000,8 @@ int main(void)
     RUN(parsed_packets_drive_engine);
     RUN(random_buffers_never_crash);
     RUN(mutated_valid_packets_never_crash);
+    RUN(tcp_seq_ack_and_window);
+    RUN(tcp_window_scale_option);
+    RUN(tcp_malformed_options_are_ignored_not_dropped);
     TEST_DONE();
 }

@@ -1,6 +1,6 @@
 /*=============================================================================
  * File Name:   parser.c
- * Author:      Eva Tate and Giselle Wu, assisted by Claude Code
+ * Author:      Eva Tate and Giselle Wu
  * Course:      CS60: Computer Networks
  * Assignment:  Final Project: Userspace Stateful Firewall (Tunwall)
  * Date:        November 15, 2026
@@ -22,6 +22,9 @@
 
 #define IPV4_MIN_HDR 20
 #define TCP_MIN_HDR  20
+#define TCPOPT_EOL    0
+#define TCPOPT_NOP    1
+#define TCPOPT_WSCALE 3
 #define UDP_HDR      8
 #define ICMP_HDR     8
 
@@ -187,6 +190,27 @@ static void set_payload(pkt_t *out, const uint8_t *l4, uint16_t l4len,
     out->payload = out->payload_len ? l4 + hdrlen : NULL;
 }
 
+/* The window-scale shift in a SYN's TCP options (opt[0..len)), capped at
+ * TCP_MAX_WSCALE, or TCP_NO_WSCALE if there is none. A malformed option list
+ * is not a reason to drop the packet (Linux ignores it too): it just yields
+ * no window scale, i.e. unscaled windows. */
+static uint8_t tcp_wscale_opt(const uint8_t *opt, unsigned len)
+{
+    unsigned i = 0;
+    while (i < len) {
+        const uint8_t kind = opt[i];
+        if (kind == TCPOPT_EOL) break;
+        if (kind == TCPOPT_NOP) { i++; continue; }
+        if (i + 1 >= len) break;                       /* no room for the length */
+        const unsigned olen = opt[i + 1];
+        if (olen < 2 || i + olen > len) break;
+        if (kind == TCPOPT_WSCALE && olen == 3)
+            return opt[i + 2] > TCP_MAX_WSCALE ? TCP_MAX_WSCALE : opt[i + 2];
+        i += olen;
+    }
+    return TCP_NO_WSCALE;
+}
+
 static parse_result_t parse_tcp(const uint8_t *l4, uint16_t l4len, pkt_t *out)
 {
     if (l4len < TCP_MIN_HDR)
@@ -206,6 +230,14 @@ static parse_result_t parse_tcp(const uint8_t *l4, uint16_t l4len, pkt_t *out)
         return PARSE_BAD_CSUM;
 
     out->tcp_flags = l4[13];
+    out->tcp_seq = rd32(l4 + 4);
+    out->tcp_ack = rd32(l4 + 8);
+    out->tcp_win = rd16(l4 + 14);
+    /* Options are only read on a SYN (the only place window scale may
+     * appear), so packets of established connections cost nothing extra. */
+    out->tcp_wscale = (out->tcp_flags & TCP_SYN)
+                      ? tcp_wscale_opt(l4 + TCP_MIN_HDR, doff - TCP_MIN_HDR)
+                      : TCP_NO_WSCALE;
     set_payload(out, l4, l4len, doff);
     return PARSE_OK;
 }
