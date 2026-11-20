@@ -653,6 +653,57 @@ if [ -f "$LOGDIR/nat.conf" ] && need_tool nmap; then
     RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
 fi
 
+echo "== SYN-flood relief (half-open eviction)"
+# A spoofed SYN flood from forged sources fills the outside share of the flow
+# table with half-open connections; without relief a real outside client is
+# locked out of the exposed service. tunwall evicts the oldest half-open
+# outside connection to admit new ones, as the Linux SYN backlog does.
+#
+# Backscatter: client B answers each forged SYN toward a random address. This
+# topology (plain "netns.sh up", INTERNET unset) gives the firewall NO default
+# route, so those SYN-ACKs have nowhere to go and are dropped inside the
+# firewall namespace. Nothing leaves the machine; no guard is needed here.
+if need_tool hping3; then
+    [ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+    ip -n outside route replace 10.0.1.0/24 via 10.0.2.1 2>/dev/null
+    RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+    if start_fw; then
+        # The exposed ssh-like server on 10.0.1.3:22 is still up from setup.
+        wait_listen inside tcp 10.0.1.3 22 "the exposed service" || true
+        expect "before the flood: a real outside client reaches 10.0.1.3:22" \
+            open probe_from 10.0.2.2 10.0.1.3 22
+        # Fill the outside share of the table (3/4 of 65536) with half-open
+        # connections, then STOP the flood and probe. The probe still has to
+        # evict a half-open connection to get in -- the table is full and none
+        # has timed out (30 s) -- so it proves the relief, without the probe
+        # competing with the flood for the single firewall core (--flood
+        # injects as fast as a core can, which would starve a probe on a shared
+        # CI runner: that tests scheduling, not the feature). timeout bounds
+        # the flood even if the kill below is missed.
+        outside timeout 10 hping3 -q -S --flood --rand-source -p 22 10.0.1.3 >/dev/null 2>&1 &
+        HPING_PID=$!
+        if wait_log_count 'SYNFLOOD table under pressure' 1 15; then
+            ok "log: the table filled with half-open connections (SYNFLOOD)"
+        else bad "log: no SYNFLOOD line within 15 s of starting the flood"; fi
+        # Stop the flood: killing the "ip netns exec" wrapper may not reach
+        # hping3 (network, not PID, namespaces), so also kill it by name; then
+        # let the firewall drain its small backlog.
+        kill "$HPING_PID" 2>/dev/null; pkill -x hping3 2>/dev/null; wait "$HPING_PID" 2>/dev/null
+        sleep 2
+        # The table is still full of half-open attack connections: a real
+        # client can only get in by eviction.
+        expect "a real outside client gets in despite the full half-open table" \
+            open probe_from 10.0.2.2 10.0.1.3 22
+        expect "an inside client is unaffected" \
+            open probe inside tcp 10.0.2.2 80
+        dump_stats
+        logged "stats: half-open connections were evicted" '^flows: .* evicted=[1-9][0-9]*'
+    else
+        bad "tunwall did not restart for the SYN-flood test"; cat "$LOGDIR/tunwall.log"
+    fi
+    RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+fi
+
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID"; rc=$?; FW_PID=""
 [ "$rc" = 0 ] && ok "tunwall exits 0 on SIGTERM" || bad "tunwall exited $rc on SIGTERM"

@@ -18,7 +18,7 @@ set -u
 cd "$(dirname "$0")/.."
 AUTO=${DEMO_AUTO:-}
 LOG=${DEMO_LOG:-}
-TOTAL=12
+TOTAL=13
 
 B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; R=$'\033[31m'; C=$'\033[36m'; Z=$'\033[0m'
 pass=0; failn=0; n=0
@@ -165,6 +165,32 @@ say "   from 10.0.2.3: curl exit $rc (28 = timed out)"
 check "the scanner can no longer reach port 22" test "$rc" = 28
 out=$(outside curl -s -m 5 --interface 10.0.2.2 http://10.0.1.3:22/)
 check "10.0.2.2 still can" contains "$out" "tunwall demo server"
+
+# ---------------------------------------------------------------------------
+step "A SYN flood can't lock out the service" \
+     "A flood of SYNs from thousands of forged addresses fills the firewall's" \
+     "connection table with half-open connections, to shut real clients out. We flood" \
+     "until the table is full (a yellow SYNFLOOD line), stop, and then a normal client" \
+     "STILL connects: tunwall evicted the oldest half-open one, like the Linux SYN backlog."
+# Backscatter guard: in the Internet-connected demo topology, drop client B's
+# SYN-ACKs to the forged addresses so they never leave the machine; the real
+# client at 10.0.2.2 (in 10.0.2.0/24) is still answered. Removed after the step.
+GUARD="OUTPUT -p tcp --tcp-flags SYN,ACK SYN,ACK ! -d 10.0.2.0/24 -j DROP"
+sudo ip netns exec inside iptables -I $GUARD 2>/dev/null
+cmd "hping3 -S --flood --rand-source -p 22 10.0.1.3      (forged SYNs from the outside)"
+sudo ip netns exec outside timeout 15 hping3 -q -S --flood --rand-source -p 22 10.0.1.3 >/dev/null 2>&1 &
+HPING=$!
+say "   flooding until the table fills..."
+check "the firewall reports the table under pressure" log_has "SYNFLOOD table under pressure"
+# Stop the flood, then connect: the table is still full of half-open attack
+# connections, so getting in requires an eviction.
+sudo kill "$HPING" 2>/dev/null; sudo pkill -x hping3 2>/dev/null; wait "$HPING" 2>/dev/null; sleep 2
+sudo ip netns exec inside iptables -D $GUARD 2>/dev/null
+cmd "curl http://10.0.1.3:22/     (from 10.0.2.2, table still full of half-open connections)"
+out=$(outside curl -s -m 6 --interface 10.0.2.2 http://10.0.1.3:22/)
+check "a real client still reaches the service despite the full table" contains "$out" "tunwall demo server"
+sudo pkill -USR1 -x tunwall; sleep 1
+check "half-open connections were evicted to make room" log_has "^flows: .* evicted=[1-9]"
 
 # ---------------------------------------------------------------------------
 step "The counters" \

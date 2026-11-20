@@ -129,6 +129,7 @@ typedef struct engine_stats {
     uint64_t fastpath;             /* hit an existing flow: hash lookup only */
     uint64_t slowpath;             /* no flow: rules evaluated               */
     uint64_t flows_created, flows_expired, flows_active;
+    uint64_t flows_evicted;        /* half-open outside flows evicted to admit new ones (SYN flood) */
     uint64_t drops[DROP_REASON_COUNT];
     /* Application identification (appid.h): flows labelled by what their
      * payload is, and how many of them used a port that suggests a different

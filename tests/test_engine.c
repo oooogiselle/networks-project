@@ -1154,11 +1154,21 @@ static void test_outside_flows_cannot_take_the_inside_users_reserve(void)
     engine_t *e = make_engine("allow in tcp from any to 10.0.0.3 port 22\nallow tcp from 10.0.0.0/24 to any port 80\n");
     CHECK(engine_set_limits(e, 0, 4));
     drop_reason_t w;
-    for (int i = 0; i < 4; i++)
-        CHECK(send_pkt(e, mk_tcp(IP(198,51,100,i + 1), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    /* Four outside connections that complete their handshake fill the quota. */
+    for (int i = 0; i < 4; i++) {
+        const uint32_t src = IP(198,51,100,i + 1);
+        CHECK(send_pkt(e, mk_tcp(src, 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+        CHECK(send_pkt(e, mk_tcp(CLIENT_B, 22, src, 4000, TCP_SYN|TCP_ACK), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+        CHECK(send_pkt(e, mk_tcp(src, 4000, CLIENT_B, 22, TCP_ACK), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    }
+    /* Established connections are never evicted, so a fifth is refused... */
     CHECK(send_pkt(e, mk_tcp(IP(198,51,100,99), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
     CHECK(w == DROP_OUTSIDE_QUOTA);
+    /* ...and the inside users' reserve is untouched. */
     CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_evicted == 0);
     engine_destroy(e);
 }
 
@@ -1174,8 +1184,15 @@ static void test_a_spoofed_flood_from_outside_leaves_the_inside_working(void)
         verdict_t v = send_pkt(e, mk_tcp(src, 4444, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w);
         if (v == VERDICT_ALLOW) allowed++; else if (w == DROP_OUTSIDE_QUOTA) quota++;
     }
-    CHECK(allowed == FW_DEFAULT_MAX_OUTSIDE);
-    CHECK(quota == 60000 - FW_DEFAULT_MAX_OUTSIDE);
+    /* Past the quota, each new SYN evicts the oldest half-open one (SYN-flood
+     * relief), so all are admitted but the outside never holds more than its
+     * share of the table. */
+    CHECK(allowed == 60000);
+    CHECK(quota == 0);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_active == FW_DEFAULT_MAX_OUTSIDE);
+    CHECK(st.flows_evicted == 60000 - FW_DEFAULT_MAX_OUTSIDE);
     /* the inside users still get through, over and over */
     for (int i = 0; i < 100; i++)
         CHECK(send_pkt(e, mk_tcp(CLIENT_A, (uint16_t)(40000 + i), SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
@@ -1836,6 +1853,144 @@ static void test_scan_log_lines(void)
     engine_destroy(e);
 }
 
+
+/* ---- SYN-flood relief ---------------------------------------------------- */
+
+#define FLOOD_RULES "allow in tcp from any to 10.0.0.3 port 22\nallow tcp from 10.0.0.0/24 to any port 80\n"
+
+/* n SYNs from fresh forged sources (198.18/15) to CLIENT_B:22, spread over
+ * [t, t + span). Sources start at *next and advance, so no two repeat. */
+static void forged_syns(engine_t *e, uint32_t n, uint32_t *next, uint64_t t, uint64_t span)
+{
+    drop_reason_t w;
+    for (uint32_t i = 0; i < n; i++, (*next)++)
+        send_pkt(e, mk_tcp(IP(198,18,0,0) + (*next & 0x1ffff), (uint16_t)(1024 + (*next >> 17)),
+                           CLIENT_B, 22, TCP_SYN), DIR_OUT, t + span * i / n, &w);
+}
+
+static void test_a_real_client_gets_in_during_and_after_a_syn_flood(void)
+{
+    engine_t *e = make_engine(FLOOD_RULES);
+    drop_reason_t w;
+    uint32_t next = 1;
+    const uint64_t t0 = 10 * SEC;
+    forged_syns(e, 60000, &next, t0, SEC);         /* one second, more than the outside share */
+    /* Before eviction this client was refused (outside-quota) for 30 s. */
+    for (int dt = 1; dt <= 29; dt += 14)
+        CHECK(send_pkt(e, mk_tcp(OTHER_OUT, (uint16_t)(40000 + dt), CLIENT_B, 22, TCP_SYN), DIR_OUT,
+                       t0 + (uint64_t)dt * SEC, &w) == VERDICT_ALLOW);
+    /* A sustained flood: 30k forged SYNs a second for 30 s, a real client every 5 s. */
+    int ok = 0, tries = 0;
+    for (int sec = 0; sec < 30; sec++) {
+        const uint64_t t = 60 * SEC + (uint64_t)sec * SEC;
+        forged_syns(e, 30000, &next, t, SEC);
+        engine_expire(e, t + SEC - 1);
+        if (sec % 5 == 4) {
+            tries++;
+            ok += send_pkt(e, mk_tcp(OTHER_OUT, (uint16_t)(41000 + sec), CLIENT_B, 22, TCP_SYN), DIR_OUT,
+                           t + SEC - 1, &w) == VERDICT_ALLOW;
+        }
+    }
+    CHECK(tries == 6 && ok == tries);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.flows_active <= FW_DEFAULT_MAX_OUTSIDE);   /* the outside never exceeds its share */
+    CHECK(s.flows_evicted > 0);
+    CHECK(s.drops[DROP_OUTSIDE_QUOTA] == 0);
+    /* and the inside users never noticed */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, 90 * SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_a_syn_flood_never_evicts_established_connections(void)
+{
+    engine_t *e = make_engine(FLOOD_RULES);
+    drop_reason_t w;
+    /* A real outside client and an inside one, both fully connected. */
+    CHECK(send_pkt(e, mk_tcp(OTHER_OUT, 5555, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 22, OTHER_OUT, 5555, TCP_SYN|TCP_ACK), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(OTHER_OUT, 5555, CLIENT_B, 22, TCP_ACK), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50000, SERVER, 80, TCP_SYN), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    uint32_t next = 1;
+    forged_syns(e, 120000, &next, 2 * SEC, SEC);   /* the whole queue turns over twice */
+    CHECK(send_pkt(e, mk_tcp(OTHER_OUT, 5555, CLIENT_B, 22, TCP_ACK|TCP_PSH), DIR_OUT, 4 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 22, OTHER_OUT, 5555, TCP_ACK|TCP_PSH), DIR_IN, 4 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(SERVER, 80, CLIENT_A, 50000, TCP_SYN|TCP_ACK), DIR_OUT, 4 * SEC, &w) == VERDICT_ALLOW);
+    engine_destroy(e);
+}
+
+static void test_no_eviction_for_a_source_over_its_own_cap(void)
+{
+    engine_t *e = make_engine(FLOOD_RULES);
+    CHECK(engine_set_limits(e, 2, 4));
+    drop_reason_t w;
+    const uint32_t capped = IP(198,51,100,9);
+    /* The outside quota of 4 holds two older half-open flows from others and
+     * the two newest from `capped`, which is now at its own cap of 2. */
+    CHECK(send_pkt(e, mk_tcp(IP(198,51,100,1), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(IP(198,51,100,2), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(capped, 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(capped, 4001, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    /* Its next SYN is refused, and must not push the others' flows out. */
+    CHECK(send_pkt(e, mk_tcp(capped, 4002, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.flows_evicted == 0);
+    CHECK(s.flows_active == 4);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 22, IP(198,51,100,1), 4000, TCP_SYN|TCP_ACK), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    /* Anyone else under their cap still gets in, by evicting the oldest. */
+    CHECK(send_pkt(e, mk_tcp(IP(198,51,100,3), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    engine_get_stats(e, &s);
+    CHECK(s.flows_evicted == 1);
+    engine_destroy(e);
+}
+
+static void test_syn_flood_log_line_once_per_sweep(void)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *out = open_memstream(&buf, &len);
+    fw_log_set(out, LOG_INFO);
+    engine_t *e = make_engine(FLOOD_RULES);
+    engine_expire(e, 10 * SEC);                       /* a sweep with nothing to report */
+    uint32_t next = 1;
+    forged_syns(e, FW_DEFAULT_MAX_OUTSIDE + 500, &next, 10 * SEC, SEC / 2);
+    engine_expire(e, 11 * SEC);
+    engine_expire(e, 12 * SEC);                       /* no evictions since: no line */
+    fflush(out);
+    CHECK(strstr(buf, "SYNFLOOD table under pressure: evicted 500 half-open connections "
+                      "in the last 1.0s to admit new ones\n") != NULL);
+    int lines = 0;
+    for (const char *q = buf; (q = strstr(q, "SYNFLOOD")); q++) lines++;
+    CHECK(lines == 1);
+    fw_log_set(NULL, LOG_OFF);
+    fclose(out);
+    free(buf);
+    engine_destroy(e);
+}
+
+/* A packet on a queued flow that is never delivered is undone; the flow must
+ * stay correctly linked in the half-open queue. */
+static void test_undo_keeps_the_half_open_queue_intact(void)
+{
+    engine_t *e = make_engine(FLOOD_RULES);
+    CHECK(engine_set_limits(e, 0, 3));
+    drop_reason_t w;
+    for (int i = 0; i < 3; i++)
+        CHECK(send_pkt(e, mk_tcp(IP(198,51,100,i + 1), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    /* the middle flow's SYN-ACK is allowed, then its write fails: undone */
+    pkt_t synack = mk_tcp(CLIENT_B, 22, IP(198,51,100,2), 4000, TCP_SYN|TCP_ACK);
+    CHECK(send_pkt(e, synack, DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(!engine_undo_new_flow(e, &synack, DIR_IN, SEC));
+    /* three new SYNs evict all three, oldest first, without crashing */
+    for (int i = 0; i < 3; i++)
+        CHECK(send_pkt(e, mk_tcp(IP(198,51,100,10 + i), 4000, CLIENT_B, 22, TCP_SYN), DIR_OUT, 2 * SEC, &w) == VERDICT_ALLOW);
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.flows_evicted == 3 && s.flows_active == 3);
+    engine_destroy(e);
+}
+
 int main(void)
 {
     RUN(test_web_fetch_allowed);
@@ -1917,5 +2072,10 @@ int main(void)
     RUN(test_scan_settings);
     RUN(test_scan_counts_packets_nat_dropped);
     RUN(test_scan_log_lines);
+    RUN(test_a_real_client_gets_in_during_and_after_a_syn_flood);
+    RUN(test_a_syn_flood_never_evicts_established_connections);
+    RUN(test_no_eviction_for_a_source_over_its_own_cap);
+    RUN(test_syn_flood_log_line_once_per_sweep);
+    RUN(test_undo_keeps_the_half_open_queue_intact);
     TEST_DONE();
 }

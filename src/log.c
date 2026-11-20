@@ -153,6 +153,17 @@ void log_unblock(uint32_t ip, uint64_t dropped, uint64_t now_ns)
             now_ns / 1e9, ip_str(ip, a, sizeof a), dropped);
 }
 
+void log_synflood(uint64_t n, uint64_t window_ns, uint64_t now_ns)
+{
+    /* Emitted at most once per engine_expire() (about once a second), so it
+     * cannot flood; it skips the per-line limiter deliberately, or a flood
+     * of FLOW NEW lines would suppress the very summary that reports it. */
+    if (!fw_log_enabled(LOG_INFO)) return;
+    fprintf(g_out, "[%10.6f] SYNFLOOD table under pressure: evicted %" PRIu64
+            " half-open connections in the last %.1fs to admit new ones\n",
+            now_ns / 1e9, n, window_ns / 1e9);
+}
+
 void log_drop(const pkt_t *p, dir_t dir, drop_reason_t why, uint64_t now_ns)
 {
     if (!fw_log_enabled(LOG_DEBUG) || !log_allowed(now_ns)) return;
@@ -182,8 +193,9 @@ void engine_stats_print(const engine_stats_t *s, FILE *out)
             " mismatched=%" PRIu64 "\n",
             s->app_flows[APP_HTTP], s->app_flows[APP_TLS], s->app_flows[APP_DNS],
             s->app_flows[APP_OTHER], s->app_mismatch);
-    fprintf(out, "flows:   created=%" PRIu64 " expired=%" PRIu64 " active=%" PRIu64 "\n",
-            s->flows_created, s->flows_expired, s->flows_active);
+    fprintf(out, "flows:   created=%" PRIu64 " expired=%" PRIu64 " active=%" PRIu64
+            " evicted=%" PRIu64 "\n",
+            s->flows_created, s->flows_expired, s->flows_active, s->flows_evicted);
     fprintf(out, "scan:    detected=%" PRIu64 " blocked-now=%" PRIu64 "\n",
             s->scans_detected, s->hosts_blocked);
     for (int i = 1; i < PARSE_RESULT_COUNT; i++)

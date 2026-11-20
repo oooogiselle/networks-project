@@ -57,6 +57,10 @@ typedef struct flow {
     uint64_t    created_ns, last_seen_ns, expires_ns;
     uint64_t    pkts[2], bytes[2];   /* [0] originator, [1] responder */
     struct flow *next;          /* hash chain */
+    /* Queue of TCP flows started from the outside, oldest first, for
+     * ft_evict_halfopen(). Linked while ho_linked. */
+    struct flow *ho_prev, *ho_next;
+    bool        ho_linked;
 } flow_t;
 
 typedef struct flowtable flowtable_t;
@@ -118,6 +122,19 @@ void    ft_remove(flowtable_t *ft, flow_t *f);
 /* Remove every flow with expires_ns <= now. cb (optional) sees each first. */
 typedef void (*ft_expire_cb)(const flow_t *f, void *ud);
 size_t ft_expire(flowtable_t *ft, uint64_t now_ns, ft_expire_cb cb, void *ud);
+
+/*
+ * SYN-flood relief. Remove the OLDEST TCP flow started from the outside that
+ * never completed its handshake (still SYN_SENT or SYN_RECV); cb (optional)
+ * sees it first. False if there is none. Established connections and flows
+ * started from the inside are never chosen. Every outside TCP flow is queued
+ * at creation; entries that have since completed the handshake are dropped
+ * from the queue as they are passed over, so each costs O(1) once.
+ */
+bool ft_evict_halfopen(flowtable_t *ft, ft_expire_cb cb, void *ud);
+
+/* Does src_ip already hold its share of flows (see ft_set_limits)? */
+bool ft_source_at_limit(const flowtable_t *ft, uint32_t src_ip);
 
 /* Called for a flow that ft_lookup() finds already expired and removes, so a
  * flow that times out between sweeps is still reported. */

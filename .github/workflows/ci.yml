@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y nmap ethtool
+        run: sudo apt-get update && sudo apt-get install -y nmap ethtool hping3
       - name: Environment
         run: |
           uname -r; python3 --version; ip -V; curl --version | head -1

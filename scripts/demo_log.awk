@@ -10,14 +10,15 @@
 #              duration) and colours the lines. red = dropped packet, green =
 #              flow opened, cyan = application identified, magenta = the port
 #              disagrees with the payload, grey = flow closed or expired,
-#              yellow = a port scanner was blocked (SCAN) or let go (UNBLOCK).
+#              yellow = a port scanner was blocked (SCAN) or let go (UNBLOCK), or
+#              the table was under SYN-flood pressure (SYNFLOOD).
 # ============================================================================
 {
     gsub(/ rule=[0-9]+/, "")
     gsub(/ pkts=[0-9\/]+ bytes=[0-9\/]+/, "")
     gsub(/ dur=[0-9.]+s/, "")
     if      ($0 ~ /mismatch\(/)           c = "1;35"
-    else if ($0 ~ / (SCAN|UNBLOCK) /)     c = "1;33"
+    else if ($0 ~ / (SCAN|UNBLOCK|SYNFLOOD) /) c = "1;33"
     else if ($0 ~ / DROP /)               c = "31"
     else if ($0 ~ /FLOW NEW/)             c = "32"
     else if ($0 ~ /FLOW APP/)             c = "36"
