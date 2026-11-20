@@ -16,10 +16,11 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | Eva |
 | `src/flowtable.c` | 5-tuple hash table, expiry | Eva; half-open eviction queue for SYN-flood relief: Giselle |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
-| `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines: Giselle |
-| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection and SYN-flood hooks: Giselle |
+| `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines and `limit`: Giselle |
+| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection, SYN-flood and rate-limit hooks: Giselle |
 | `src/log.c` | Per-flow logs, counters | Eva |
 | `include/scandetect.h`, `src/scandetect.c` | Port-scan detection: distinct ports per outside host in a sliding window, temporary blocking (`tunwall -s`) | Giselle |
+| `include/ratelimit.h`, `src/ratelimit.c` | Per-rule connection rate limits (`limit 5/min` on an allow rule): a token bucket (GCRA) per rule and source address in a fixed table | Giselle |
 | `src/forwarder.c`, `include/forwarder.h` | Packet loop: read, parse, decide, write to the other side, 1 s expiry sweep (works on any pair of fds, so it is unit-tested with socket pairs) | Eva; NAT, port forwarding and reject hooks: Giselle |
 | `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Eva; `-n`, `-s` and SIGHUP reload: Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Eva; the NAT test address: Giselle |
@@ -243,6 +244,67 @@ the Linux SYN backlog has the same property. A **UDP** flood to an allowed port
 is not covered: UDP has no handshake that tells a real datagram from a forged
 one.
 
+### Per-rule connection rate limits (`limit`)
+
+An `allow` rule can cap how many **new connections** each source address may
+open through it, which slows down password guessing against an exposed
+service:
+
+```
+allow in tcp any 10.0.1.3 22 limit 5/min
+```
+
+Each outside host may open 5 SSH connections straight away, then one more
+every 12 s. A connection over the limit is dropped silently, so the client
+just times out, as it would for a firewalled port. Other hosts are not
+affected, and connections that are already open never are.
+
+```
+[  31.204518] LIMIT   10.0.2.3 over 5/min on rule line 2, dropping its new connections
+```
+
+- **Syntax.** `limit N/sec`, `N/min` or `N/hour` (N from 1 to 10000), as the
+  last two words of an `allow` rule, in either rule form, with or without
+  ports. On `deny` or `reject` it is a syntax error (naming the line).
+- **Token bucket.** The limit is a bucket of N tokens, refilled at N per
+  period, kept separately for each (rule, source address) pair, as with
+  iptables' `hashlimit` in `srcip` mode. It is implemented as GCRA (the
+  generic cell rate algorithm), which keeps one number per pair: the time at
+  which the bucket would be full again. With `T = period/N`, a connection is
+  admitted if `now >= tat - (period - T)`, and then `tat = max(tat, now) + T`.
+  All the arithmetic is in integer nanoseconds.
+- **What counts.** Only connections the rule actually admits. A refused SYN
+  costs nothing, so a client that keeps retrying is not locked out for longer.
+  A retransmitted SYN of an admitted connection belongs to its flow and is not
+  counted again. A connection that is admitted but then never set up (flow
+  table full, or its first packet could not be written) is given back.
+  Rate-limited drops do not count toward port-scan detection.
+- **Log and counters.** One `LIMIT` line when a source first goes over the
+  limit, and another only after it has been admitted again (not one per
+  packet). Each refused packet is counted as `drop[rate-limited]=` and logged
+  at debug level with `why=rate-limited`.
+- **Bounded.** The table tracks 4096 (rule, source) pairs (1024 sets x 4,
+  about 96 KB, allocated at start-up; nothing per packet). Sets are chosen
+  with a keyed SipHash. When a set is full, the pair whose bucket is fullest
+  gives way. A pair whose bucket is already full again loses nothing by this.
+- **Reload.** SIGHUP resets all counts (rule numbers may have changed).
+- **Limitations.** It limits connections, not password attempts inside one
+  connection (sshd's `MaxAuthTries`, 6 by default, still applies). Someone
+  sending from very many forged addresses can push a real attacker's pair out
+  of a full set, which resets that attacker's bucket.
+
+By hand (`sudo scripts/netns.sh up` first):
+
+```
+sudo ip netns exec inside python3 -m http.server 22 --bind 10.0.1.3 &   # an ssh-like listener
+printf 'inside 10.0.1.0/24\nallow in tcp any 10.0.1.3 22 limit 5/min\n' > /tmp/limit.conf
+sudo ip netns exec firewall build/tunwall -r /tmp/limit.conf &
+for i in 1 2 3 4 5 6; do
+    sudo ip netns exec outside python3 tests/integration/probe.py tcp 10.0.1.3 22
+done                          # open x5, then timeout; the log shows LIMIT 10.0.2.2
+sleep 12; sudo ip netns exec outside python3 tests/integration/probe.py tcp 10.0.1.3 22   # open
+```
+
 ## Tests
 
 Line coverage of the library (everything in `src/` except `main.c` and
@@ -261,7 +323,8 @@ the namespace topology against the real `tunwall` (curl with a SHA-256 match,
 DNS, ping, blocked inbound traffic that must be silently dropped rather than
 refused, reject rules, nmap SYN/ACK/FIN/NULL/Xmas scans, application
 identification, exact log lines, flow expiry, TTL and path MTU, source NAT,
-port forwarding, SYN-flood relief, SIGHUP reload, kill-the-firewall). They
+port forwarding, SYN-flood relief, connection rate limits, SIGHUP reload,
+kill-the-firewall). They
 need root, `nmap`, `hping3` and `python3`.
 - **Source NAT.** The section restarts `tunwall` with `-n 10.0.2.254` and removes
   the outside's route back to the inside, so replies can only come back through
@@ -280,9 +343,15 @@ need root, `nmap`, `hping3` and `python3`.
   detected, nmap never finds port 22, 10.0.2.3 is cut off while 10.0.2.2 still
   connects, and 10.0.2.3 gets back in after the block. Then a scan of the NAT
   address is detected and closes the port forward to the scanner only.
+- **Rate limits.** With `allow in tcp any 10.0.1.3 22 limit 5/min`, 10.0.2.3
+  opens 5 connections and the 6th times out. The `LIMIT` line and the
+  `drop[rate-limited]` counter appear, 10.0.2.2 still connects, and no scan
+  is reported. Unless `SKIP_SLOW` is set, 12 s later exactly one more
+  connection gets in.
 
 CI sets `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
-`SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests. `INTERNET=1`
+`SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests (and the 12 s
+rate-limit refill). `INTERNET=1`
 also builds the NAT path and tests the real Internet through the firewall (the
 same page, byte for byte, as the host fetches directly; non-web ports dropped;
 flows labelled; and that tearing down restores the host). It needs the host to
@@ -432,7 +501,9 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
      outside-to-outside, or anything aimed at an inside network's broadcast
      address is dropped as `wrong-destination` whatever the rules say. Then the
      rule list is evaluated in order (first match wins). No match means drop.
-     On allow, a flow is created.
+     On allow, a flow is created, unless the rule has a `limit` and this
+     source has used it up (`rate-limited`, see
+     [Per-rule connection rate limits](#per-rule-connection-rate-limits-limit)).
    The flow table holds 65,536 flows by default (`FW_DEFAULT_MAX_FLOWS`). All
    slots are allocated once at startup, so no memory is allocated per
    connection or per packet. Two caps stop one party starving the rest:
@@ -500,6 +571,8 @@ the address anti-spoofing check, and without it the firewall refuses to start.
 `out` = connection initiated from the inside (the default); `in` = initiated
 from the outside (exposed services). With source NAT on, `forward tcp|udp <port> <ip> <port>`
 publishes an inside service on the NAT address (see Port forwarding above).
+An `allow` rule may end in `limit N/sec|min|hour` to cap the new connections
+each source opens through it (see Per-rule connection rate limits above).
 
 ### Reject rules
 
