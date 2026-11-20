@@ -704,6 +704,42 @@ if need_tool hping3; then
     RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
 fi
 
+echo "== per-rule connection rate limit (limit 5/min)"
+# SSH on client B allows 5 new connections per minute from each source, then
+# one every 12 s. probe_from gives up after 3 s, well before the next one is
+# due, so the 6th attempt is a plain silent timeout. Its own rules file: the
+# shipped one leaves SSH unlimited, since the tests above connect to it often.
+[ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+printf '%s\n' 'inside 10.0.1.0/24' \
+    'allow in tcp any 10.0.1.3 22 limit 5/min' > "$LOGDIR/limit.conf"
+RULES=$LOGDIR/limit.conf; TUNWALL_ARGS=$SAVED_ARGS
+if start_fw; then
+    ip -n outside route replace 10.0.1.0/24 via 10.0.2.1 2>/dev/null
+    wait_listen inside tcp 10.0.1.3 22 "the exposed service" || true
+    for i in 1 2 3 4 5; do
+        expect "connection $i of 5 from 10.0.2.3 gets in" open probe_from 10.0.2.3 10.0.1.3 22
+    done
+    expect "the 6th connection from 10.0.2.3 times out (silently dropped)" timeout probe_from 10.0.2.3 10.0.1.3 22
+    logged "the source going over the limit is reported once" \
+        'LIMIT +10\.0\.2\.3 over 5/min on rule line 2, dropping its new connections'
+    expect "another outside host (10.0.2.2) has its own limit" open probe_from 10.0.2.2 10.0.1.3 22
+    dump_stats
+    logged "stats: rate-limited drops are counted" '^drop\[rate-limited\]=[1-9][0-9]*'
+    logged "rate-limited packets are logged with their reason" \
+        'DROP tcp 10\.0\.2\.3:[0-9]+ -> 10\.0\.1\.3:22 .*why=rate-limited'
+    not_logged "being rate-limited is not taken for a port scan" 'SCAN +10\.0\.2\.3 '
+    if [ -z "${SKIP_SLOW:-}" ]; then
+        sleep 12
+        expect "12 s later 10.0.2.3 gets one more connection" open probe_from 10.0.2.3 10.0.1.3 22
+        expect "and only one"                                  timeout probe_from 10.0.2.3 10.0.1.3 22
+    else echo "skip rate-limit refill test (SKIP_SLOW set)"; fi
+else
+    bad "tunwall did not start with the rate-limit rules"; cat "$LOGDIR/tunwall.log"
+fi
+RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+[ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+start_fw || bad "tunwall did not restart with the normal rules"
+
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID"; rc=$?; FW_PID=""
 [ "$rc" = 0 ] && ok "tunwall exits 0 on SIGTERM" || bad "tunwall exited $rc on SIGTERM"
