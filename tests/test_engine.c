@@ -1853,6 +1853,132 @@ static void test_scan_log_lines(void)
     engine_destroy(e);
 }
 
+/* ---- per-rule connection rate limits ------------------------------------- */
+
+#define LIMIT_SSH "allow in tcp any 10.0.0.3 22 limit 5/min\n" \
+                  "allow out udp 10.0.0.0/24 any 53\n"
+
+static verdict_t ssh_syn(engine_t *e, uint32_t src, uint16_t sport, uint64_t t,
+                         drop_reason_t *w)
+{
+    return send_pkt(e, mk_tcp(src, sport, CLIENT_B, 22, TCP_SYN), DIR_OUT, t, w);
+}
+
+static void test_rate_limit_admits_n_then_drops(void)
+{
+    engine_t *e = make_engine(LIMIT_SSH);
+    drop_reason_t w;
+    for (uint16_t i = 0; i < 5; i++)
+        CHECK(ssh_syn(e, ATTACKER, 40000 + i, SEC, &w) == VERDICT_ALLOW);
+    CHECK(ssh_syn(e, ATTACKER, 40005, SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_RATE_LIMITED);
+    /* another source has its own count */
+    CHECK(ssh_syn(e, OTHER_OUT, 40000, SEC, &w) == VERDICT_ALLOW);
+    /* connections already admitted keep working, and a retransmitted SYN of
+     * one of them is on its flow, not a new connection */
+    CHECK(send_pkt(e, mk_tcp(CLIENT_B, 22, ATTACKER, 40000, TCP_SYN | TCP_ACK), DIR_IN, SEC + 1, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40000, CLIENT_B, 22, TCP_ACK), DIR_OUT, SEC + 2, &w) == VERDICT_ALLOW);
+    CHECK(ssh_syn(e, ATTACKER, 40001, SEC + 2, &w) == VERDICT_ALLOW);
+    /* refused attempts cost nothing (and are not a port scan) */
+    for (uint16_t i = 0; i < 30; i++)
+        CHECK(ssh_syn(e, ATTACKER, 41000 + i, 2 * SEC, &w) == VERDICT_DROP && w == DROP_RATE_LIMITED);
+    /* 12 s after the burst, exactly one more */
+    CHECK(ssh_syn(e, ATTACKER, 42000, 13 * SEC - 1, &w) == VERDICT_DROP);
+    CHECK(ssh_syn(e, ATTACKER, 42001, 13 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(ssh_syn(e, ATTACKER, 42002, 13 * SEC, &w) == VERDICT_DROP);
+    /* a rule without a limit is not limited */
+    for (uint16_t i = 0; i < 20; i++)
+        CHECK(send_pkt(e, mk_udp(CLIENT_A, 5000 + i, SERVER, 53), DIR_IN, 14 * SEC, &w) == VERDICT_ALLOW);
+
+    engine_stats_t s;
+    engine_get_stats(e, &s);
+    CHECK(s.drops[DROP_RATE_LIMITED] == 33);
+    CHECK(s.scans_detected == 0 && s.hosts_blocked == 0);
+    CHECK(s.flows_created == 5 + 1 + 1 + 20);
+    engine_destroy(e);
+}
+
+static void test_rate_limit_gives_back_connections_that_never_happened(void)
+{
+    /* Table full: one slot, held by an inside flow (never evicted). */
+    engine_t *e = engine_create_with_rules_sized(
+        rules_of("allow in tcp any 10.0.0.3 22 limit 1/min\nallow out udp 10.0.0.0/24 any 53\n"), 1);
+    drop_reason_t w;
+    CHECK(send_pkt(e, mk_udp(CLIENT_A, 5000, SERVER, 53), DIR_IN, SEC, &w) == VERDICT_ALLOW);
+    CHECK(ssh_syn(e, ATTACKER, 40000, SEC, &w) == VERDICT_DROP && w == DROP_TABLE_FULL);
+    engine_expire(e, 40 * SEC);                       /* the UDP flow times out */
+    CHECK(ssh_syn(e, ATTACKER, 40000, 40 * SEC, &w) == VERDICT_ALLOW);  /* not used up */
+    engine_destroy(e);
+
+    /* The first packet could not be written: the connection never happened. */
+    e = make_engine("allow in tcp any 10.0.0.3 22 limit 1/min\n");
+    pkt_t syn = mk_tcp(ATTACKER, 40000, CLIENT_B, 22, TCP_SYN);
+    CHECK(send_pkt(e, syn, DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(engine_undo_new_flow(e, &syn, DIR_OUT, SEC));
+    CHECK(send_pkt(e, syn, DIR_OUT, SEC + 1, &w) == VERDICT_ALLOW);     /* the retry */
+    /* An undone packet on an existing flow gives nothing back. */
+    pkt_t sa = mk_tcp(CLIENT_B, 22, ATTACKER, 40000, TCP_SYN | TCP_ACK);
+    CHECK(send_pkt(e, sa, DIR_IN, SEC + 2, &w) == VERDICT_ALLOW);
+    CHECK(!engine_undo_new_flow(e, &sa, DIR_IN, SEC + 2));
+    CHECK(ssh_syn(e, ATTACKER, 40001, SEC + 3, &w) == VERDICT_DROP && w == DROP_RATE_LIMITED);
+    engine_destroy(e);
+}
+
+static void test_rate_limits_are_per_rule_and_reset_by_a_reload(void)
+{
+    engine_t *e = make_engine("allow in tcp any 10.0.0.3 22 limit 1/min\n"
+                              "allow in tcp any 10.0.0.3 80 limit 1/min\n");
+    drop_reason_t w;
+    CHECK(ssh_syn(e, ATTACKER, 40000, SEC, &w) == VERDICT_ALLOW);
+    CHECK(ssh_syn(e, ATTACKER, 40001, SEC, &w) == VERDICT_DROP);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40002, CLIENT_B, 80, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_pkt(e, mk_tcp(ATTACKER, 40003, CLIENT_B, 80, TCP_SYN), DIR_OUT, SEC, &w) == VERDICT_DROP);
+
+    /* the undo record must not survive a reload (it points at the old rules) */
+    pkt_t syn = mk_tcp(OTHER_OUT, 40000, CLIENT_B, 22, TCP_SYN);
+    CHECK(send_pkt(e, syn, DIR_OUT, 2 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(engine_replace_rules(e, rules_of("allow in tcp any 10.0.0.3 22 limit 1/min\n")));
+    engine_undo_new_flow(e, &syn, DIR_OUT, 2 * SEC);
+
+    /* new rules: counting starts afresh */
+    CHECK(ssh_syn(e, ATTACKER, 40004, 3 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(ssh_syn(e, ATTACKER, 40005, 3 * SEC, &w) == VERDICT_DROP && w == DROP_RATE_LIMITED);
+    engine_destroy(e);
+}
+
+static void test_rate_limit_log_line_once_per_episode(void)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *out = open_memstream(&buf, &len);
+    fw_log_set(out, LOG_INFO);
+    engine_t *e = make_engine("allow in tcp any 10.0.0.3 22 limit 5/min\n"
+                              "allow in tcp any 10.0.0.3 80 limit 3/sec\n"
+                              "allow in tcp any 10.0.0.3 443 limit 1/hour\n");
+    drop_reason_t w;
+    for (uint16_t i = 0; i < 9; i++)
+        ssh_syn(e, ATTACKER, 40000 + i, 10 * SEC, &w);        /* 5 in, 4 refused */
+    ssh_syn(e, ATTACKER, 41000, 22 * SEC, &w);                  /* in again */
+    ssh_syn(e, ATTACKER, 41001, 22 * SEC, &w);                  /* a new episode */
+    for (uint16_t i = 0; i < 4; i++) {
+        send_pkt(e, mk_tcp(ATTACKER, 42000 + i, CLIENT_B, 80, TCP_SYN), DIR_OUT, 30 * SEC, &w);
+        send_pkt(e, mk_tcp(ATTACKER, 43000 + i, CLIENT_B, 443, TCP_SYN), DIR_OUT, 30 * SEC, &w);
+    }
+    fflush(out);
+    const char *l1 = "] LIMIT   198.51.100.66 over 5/min on rule line 2, dropping its new connections\n";
+    const char *first = strstr(buf, l1);
+    CHECK(first != NULL);
+    CHECK(first && strstr(first + 1, l1) != NULL);              /* exactly two */
+    CHECK(first && strstr(first + 1, l1) && !strstr(strstr(first + 1, l1) + 1, l1));
+    CHECK(strstr(buf, "[ 10.000000] LIMIT ") != NULL);
+    CHECK(strstr(buf, "LIMIT   198.51.100.66 over 3/sec on rule line 3,") != NULL);
+    CHECK(strstr(buf, "LIMIT   198.51.100.66 over 1/hour on rule line 4,") != NULL);
+    fw_log_set(NULL, LOG_OFF);
+    fclose(out);
+    free(buf);
+    engine_destroy(e);
+}
+
 
 /* ---- SYN-flood relief ---------------------------------------------------- */
 
@@ -2077,5 +2203,9 @@ int main(void)
     RUN(test_no_eviction_for_a_source_over_its_own_cap);
     RUN(test_syn_flood_log_line_once_per_sweep);
     RUN(test_undo_keeps_the_half_open_queue_intact);
+    RUN(test_rate_limit_admits_n_then_drops);
+    RUN(test_rate_limit_gives_back_connections_that_never_happened);
+    RUN(test_rate_limits_are_per_rule_and_reset_by_a_reload);
+    RUN(test_rate_limit_log_line_once_per_episode);
     TEST_DONE();
 }

@@ -107,6 +107,7 @@ const char *drop_reason_str(drop_reason_t r)
     case DROP_WRITE_FAILED: return "write-failed";
     case DROP_RULE_REJECT: return "rule-reject";
     case DROP_SCAN_BLOCKED: return "scan-blocked";
+    case DROP_RATE_LIMITED: return "rate-limited";
     case DROP_REASON_COUNT: break;
     }
     return "?";
@@ -151,6 +152,18 @@ void log_unblock(uint32_t ip, uint64_t dropped, uint64_t now_ns)
     char a[16];
     fprintf(g_out, "[%10.6f] UNBLOCK %s (dropped %" PRIu64 " packets while blocked)\n",
             now_ns / 1e9, ip_str(ip, a, sizeof a), dropped);
+}
+
+void log_ratelimit(uint32_t ip, uint32_t n, uint64_t period_ns, int rule_line,
+                   uint64_t now_ns)
+{
+    if (!fw_log_enabled(LOG_INFO) || !log_allowed(now_ns)) return;
+    char a[16];
+    const char *unit = period_ns >= 3600 * 1000000000ull ? "hour" :
+                       period_ns >= 60 * 1000000000ull   ? "min"  : "sec";
+    fprintf(g_out, "[%10.6f] LIMIT   %s over %" PRIu32 "/%s on rule line %d, "
+            "dropping its new connections\n",
+            now_ns / 1e9, ip_str(ip, a, sizeof a), n, unit, rule_line);
 }
 
 void log_synflood(uint64_t n, uint64_t window_ns, uint64_t now_ns)

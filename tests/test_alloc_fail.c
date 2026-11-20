@@ -158,7 +158,8 @@ static void test_engine_create_survives_each_failure(void)
         failures++;
         CHECK(e == NULL);
     }
-    CHECK(failures == 5);       /* engine, then the flow table's four */
+    CHECK(failures == 8);       /* engine, the flow table's four, the rate limiter's
+                                 * three (struct, slots, hash key) */
     fw_alloc_fail_nth(0);
 
     CHECK(engine_create_with_rules(NULL) == NULL);
@@ -184,8 +185,9 @@ static void test_default_engine_with_limits_survives_each_failure(void)
         CHECK(e == NULL);               /* and nothing leaks: run under make asan */
     }
     fw_alloc_fail_nth(0);
-    CHECK(failures == 10);   /* engine, the flow table's four, the per-source counters,
-                              * the scan tracker's four (struct, slots, ports, hash key) */
+    CHECK(failures == 13);   /* engine, the flow table's four, the rate limiter's three,
+                              * the per-source counters, the scan tracker's four
+                              * (struct, slots, ports, hash key) */
 }
 
 static void test_engine_create_from_file_survives_each_failure(void)
