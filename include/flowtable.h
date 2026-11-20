@@ -62,6 +62,8 @@ typedef struct flow {
     bool        close_logged;   /* the CLOSE line was written; EXPIRE is then skipped */
     uint8_t     app;            /* app_t: what the payload turned out to be (appid.h) */
     uint8_t     app_tries;      /* data packets examined so far while still unknown */
+    uint8_t     app_allow;      /* apps its rule allows (rule_t.apps bits); 0 = any */
+    bool        app_blocked;    /* its payload is an app its rule does not allow */
     uint16_t    icmp_err_count;       /* related ICMP errors allowed in the current window */
     uint64_t    icmp_err_window_ns;   /* start of that one-second window */
     int         rule_line;      /* rules-file line that allowed it (0 = n/a) */

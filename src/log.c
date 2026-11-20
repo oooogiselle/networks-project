@@ -109,6 +109,7 @@ const char *drop_reason_str(drop_reason_t r)
     case DROP_SCAN_BLOCKED: return "scan-blocked";
     case DROP_RATE_LIMITED: return "rate-limited";
     case DROP_TCP_WINDOW:  return "tcp-out-of-window";
+    case DROP_APP_BLOCKED: return "app-not-allowed";
     case DROP_REASON_COUNT: break;
     }
     return "?";
@@ -204,9 +205,9 @@ void engine_stats_print(const engine_stats_t *s, FILE *out)
     fprintf(out, "icmp:    related-errors-allowed=%" PRIu64 "\n", s->icmp_related);
     fprintf(out, "path:    fast=%" PRIu64 " slow=%" PRIu64 "\n", s->fastpath, s->slowpath);
     fprintf(out, "apps:    http=%" PRIu64 " tls=%" PRIu64 " dns=%" PRIu64 " other=%" PRIu64
-            " mismatched=%" PRIu64 "\n",
+            " mismatched=%" PRIu64 " blocked=%" PRIu64 "\n",
             s->app_flows[APP_HTTP], s->app_flows[APP_TLS], s->app_flows[APP_DNS],
-            s->app_flows[APP_OTHER], s->app_mismatch);
+            s->app_flows[APP_OTHER], s->app_mismatch, s->apps_blocked);
     fprintf(out, "flows:   created=%" PRIu64 " expired=%" PRIu64 " active=%" PRIu64
             " evicted=%" PRIu64 "\n",
             s->flows_created, s->flows_expired, s->flows_active, s->flows_evicted);

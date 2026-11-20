@@ -135,13 +135,13 @@ static void test_stats_show_the_application_counts(void)
     memset(&st, 0, sizeof st);
     FILE *f = tmpfile();
     engine_stats_print(&st, f);
-    CHECK(strstr(slurp(f), "apps:    http=0 tls=0 dns=0 other=0 mismatched=0") != NULL);
+    CHECK(strstr(slurp(f), "apps:    http=0 tls=0 dns=0 other=0 mismatched=0 blocked=0") != NULL);
     st.app_flows[APP_HTTP] = 3; st.app_flows[APP_TLS] = 2; st.app_flows[APP_DNS] = 1;
-    st.app_flows[APP_OTHER] = 4; st.app_mismatch = 5;
+    st.app_flows[APP_OTHER] = 4; st.app_mismatch = 5; st.apps_blocked = 6;
     fclose(f);
     f = tmpfile();
     engine_stats_print(&st, f);
-    CHECK(strstr(slurp(f), "apps:    http=3 tls=2 dns=1 other=4 mismatched=5\n") != NULL);
+    CHECK(strstr(slurp(f), "apps:    http=3 tls=2 dns=1 other=4 mismatched=5 blocked=6\n") != NULL);
     fclose(f);
 }
 

@@ -41,9 +41,10 @@ _Static_assert(PARSE_RESULT_COUNT <= ENGINE_PARSE_KINDS,
                "grow ENGINE_PARSE_KINDS in engine.h");
 
 static void expire_cb(const flow_t *f, void *ud);
-static void identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns);
+static bool identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns);
 
 #define RECLAIM_MIN_INTERVAL_NS 1000000000ull   /* 1 s: table-reclaim and ICMP-error windows */
+#define APP_BLOCKED_LINGER_NS  (10 * 1000000000ull) /* a blocked flow's slot is freed this long after */
 
 struct engine {
     rules_t     *rules;
@@ -265,8 +266,8 @@ static verdict_t decide_icmp_error(engine_t *e, const pkt_t *p, dir_t dir,
     if (dir == inner_sent_on)
         return do_drop(e, p, dir, now, DROP_SPOOF, reason);
 
-    if (f->key.proto == FW_PROTO_TCP &&
-        (f->tcp_state == TCPS_TIME_WAIT || f->tcp_state == TCPS_CLOSED))
+    if (f->app_blocked || (f->key.proto == FW_PROTO_TCP &&
+        (f->tcp_state == TCPS_TIME_WAIT || f->tcp_state == TCPS_CLOSED)))
         return do_drop(e, p, dir, now, DROP_ICMP_ERR, reason);
 
     /* Per-flow budget in one-second windows. */
@@ -346,6 +347,11 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
         e->st.fastpath++;
         const bool from_orig = !is_reply;
 
+        /* Cut for carrying an app its rule does not allow: nothing more gets
+         * through, either way, and nothing refreshes it. */
+        if (f->app_blocked)
+            return do_drop(e, p, dir, now_ns, DROP_APP_BLOCKED, reason);
+
         /* A packet on this flow's tuple always arrives on the right interface
          * by now: the anti-spoofing check above makes every inside source
          * arrive on the inside and every outside source on the outside, and a
@@ -397,7 +403,8 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
             f->last_seen_ns = now_ns;
             f->expires_ns = now_ns + flow_timeout_ns(f);
         }
-        identify_app(e, f, p, now_ns);
+        if (identify_app(e, f, p, now_ns))     /* this payload is not allowed */
+            return do_drop(e, p, dir, now_ns, DROP_APP_BLOCKED, reason);
         return do_allow(e, reason);
     }
 
@@ -476,6 +483,7 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
                        reason);
 
     f->rule_line = r->line;
+    f->app_allow = r->apps;
     if (r->limit_n) {
         e->undo_rl_rule = r;
         e->undo_rl_idx = ridx;
@@ -489,7 +497,8 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
     f->expires_ns = now_ns + flow_timeout_ns(f);
     e->st.flows_created++;
     log_flow("NEW", f, now_ns);
-    identify_app(e, f, p, now_ns);          /* e.g. a DNS query, or data in a SYN */
+    if (identify_app(e, f, p, now_ns))      /* e.g. a DNS query, or data in a SYN */
+        return do_drop(e, p, dir, now_ns, DROP_APP_BLOCKED, reason);
     return do_allow(e, reason);
 }
 
@@ -497,17 +506,21 @@ verdict_t engine_decide(engine_t *e, const pkt_t *p, dir_t dir,
  * Label a flow by what its payload is (see appid.h). The first few
  * data-carrying packets of either direction are examined; the first
  * recognized protocol wins, and after APPID_MAX_TRIES unrecognized data
- * packets the flow is called "other". It is logged once when decided. This
- * only labels: it is called after the verdict, and never changes it.
+ * packets the flow is called "other". It is logged once when decided.
+ *
+ * If the flow's rule has an `app` list and the label just decided is not on
+ * it, the flow is blocked (logged as BLOCK, freed APP_BLOCKED_LINGER_NS
+ * later) and true is returned: the caller drops this packet, and the fast
+ * path drops every later one. Otherwise it only labels and returns false.
  */
-static void identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns)
+static bool identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns)
 {
     if (f->app != APP_UNKNOWN || p->payload_len == 0 ||
         (p->proto != FW_PROTO_TCP && p->proto != FW_PROTO_UDP))
-        return;
+        return false;
     app_t a = appid_detect(p->proto, p->payload, p->payload_len);
     if (a == APP_UNKNOWN) {
-        if (++f->app_tries < APPID_MAX_TRIES) return;
+        if (++f->app_tries < APPID_MAX_TRIES) return false;
         a = APP_OTHER;
     }
     f->app = (uint8_t)a;
@@ -515,6 +528,13 @@ static void identify_app(engine_t *e, flow_t *f, const pkt_t *p, uint64_t now_ns
     const app_t expected = appid_expected_for_port(f->key.proto, f->key.dst_port);
     if (expected != APP_UNKNOWN && expected != a) e->st.app_mismatch++;
     log_flow("APP", f, now_ns);
+    if (!f->app_allow || (f->app_allow & (1u << a)))
+        return false;
+    f->app_blocked = true;
+    f->expires_ns = now_ns + APP_BLOCKED_LINGER_NS;
+    e->st.apps_blocked++;
+    log_flow("BLOCK", f, now_ns);
+    return true;
 }
 
 /* A flow whose CLOSE was logged is already reported; do not log it again. */
