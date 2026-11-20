@@ -26,7 +26,7 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `src/tun_io.c`, `src/main.c` | Opens the tun devices; `tunwall` program: arguments, signals, stats | Eva; `-n`, `-s` and SIGHUP reload: Giselle |
 | `scripts/netns.sh` | Three-namespace test topology with policy routing into the tun devices | Eva; the NAT test address: Giselle |
 | `bench/` | iperf3 and latency-percentile benchmark (`run_bench.sh`, `summary.py`), the CPU profile (`profile.sh`), and the rule files | Eva |
-| `scripts/demo.sh`, `scripts/demo_steps.sh`, `scripts/demo_log.awk`, `scripts/dns_forwarder.py` | The recorded demo: a tmux window with the live firewall log above and narrated, self-checking steps below, using the real Internet (see `DEMO.md`) | Eva |
+| `scripts/demo.sh`, `scripts/demo_steps.sh`, `scripts/demo_log.awk`, `scripts/dns_forwarder.py` | The recorded demo: a tmux window with the live firewall log above and narrated, self-checking steps below, using the real Internet (see `DEMO.md`) | Eva; steps 11 to 14 (forged RST, live reload, SSH over 443, rate limit): Giselle |
 | `tests/` | Unit tests (`tests/pktbuild.c`, by Giselle, builds real wire packets); each module's tests are by its author | shared |
 | `tests/integration/run_all.sh` | End-to-end tests in the namespace topology | Eva; NAT, port forwarding, reload and port-scan sections: Giselle |
 
