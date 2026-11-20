@@ -24,7 +24,7 @@ FLAGS_STAMP := $(BUILD)/.flags
 # state, rules, engine, logging). tun I/O and main() link against this.
 LIB_SRC := src/parser.c src/reject.c src/flowtable.c src/tcpstate.c src/rules.c \
            src/engine.c src/log.c src/fwalloc.c src/siphash.c src/forwarder.c src/appid.c src/nat.c \
-           src/scandetect.c src/ratelimit.c
+           src/scandetect.c src/ratelimit.c src/tcpseq.c
 LIB_OBJ := $(LIB_SRC:src/%.c=$(BUILD)/%.o)
 LIB     := $(BUILD)/libfwengine.a
 
@@ -39,6 +39,8 @@ TESTS += test_reject
 TESTS += test_scan
 # Per-rule connection rate limits (ratelimit.h).
 TESTS += test_ratelimit
+# TCP sequence-number checks (tcpseq.h).
+TESTS += test_tcpseq
 TEST_BINS := $(TESTS:%=$(BUILD)/%)
 
 .PHONY: all test asan clean tunwall
