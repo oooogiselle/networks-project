@@ -553,6 +553,66 @@ static void test_limit_errors(void)
     CHECK(parse_fails_with(text, "line 2:", "expected destination address"));
 }
 
+#define APPBIT(a) (1u << (a))
+
+static void test_app_clause(void)
+{
+    rules_t *r = parse("allow out tcp 10.0.1.0/24 any 80,443 app http\n"
+                       "allow out tcp 10.0.1.0/24 any 443 app http,tls\n"
+                       "allow out udp 10.0.1.0/24 10.0.2.2 53 app dns limit 20/sec\n"
+                       "allow in tcp any 10.0.1.3 22 limit 5/min app other\n"
+                       "allow out tcp from 10.0.1.0/24 to any port 8080 app tls,other,dns,http\n"
+                       "allow out tcp 10.0.1.0/24 any 80\n");
+    CHECK(r && r->n == 6);
+    if (r) {
+        CHECK(r->v[0].apps == APPBIT(APP_HTTP));
+        CHECK(r->v[0].dport.n == 2 && r->v[0].dport.r[1].lo == 443);
+        CHECK(r->v[1].apps == (APPBIT(APP_HTTP) | APPBIT(APP_TLS)));
+        CHECK(r->v[2].apps == APPBIT(APP_DNS) && r->v[2].limit_n == 20);
+        CHECK(r->v[2].limit_period_ns == SEC && r->v[2].proto == FW_PROTO_UDP);
+        CHECK(r->v[3].apps == APPBIT(APP_OTHER) && r->v[3].limit_n == 5);
+        CHECK(r->v[4].apps == (APPBIT(APP_HTTP) | APPBIT(APP_TLS) | APPBIT(APP_DNS) |
+                               APPBIT(APP_OTHER)));
+        CHECK(r->v[4].dport.r[0].lo == 8080);
+        CHECK(r->v[5].apps == 0);                      /* any app */
+    }
+    rules_free(r);
+}
+
+static void test_app_errors(void)
+{
+    const char *in = "inside 10.0.1.0/24\n";
+    const char *syntax[] = {
+        "allow out tcp 10.0.1.0/24 any 80 app ssh",
+        "allow out tcp 10.0.1.0/24 any 80 app HTTP",
+        "allow out tcp 10.0.1.0/24 any 80 app http,,tls",
+        "allow out tcp 10.0.1.0/24 any 80 app http,",
+        "allow out tcp 10.0.1.0/24 any 80 app ,http",
+        "allow out tcp 10.0.1.0/24 any 80 app",
+        "allow out tcp 10.0.1.0/24 any app http 80",
+        "allow out tcp 10.0.1.0/24 any 80 app http app tls",
+        "allow out tcp 10.0.1.0/24 any 80 app http limit 5/min app tls",
+    };
+    char text[256];
+    for (size_t k = 0; k < sizeof syntax / sizeof *syntax; k++) {
+        snprintf(text, sizeof text, "%s%s\n", in, syntax[k]);
+        CHECK(parse_fails_with(text, "line 2:", "expected 'app NAME[,NAME...]'"));
+    }
+    snprintf(text, sizeof text, "%sdeny out tcp 10.0.1.0/24 any 80 app http\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "'app' only works on allow rules"));
+    snprintf(text, sizeof text, "%sreject out tcp 10.0.1.0/24 any 23 app other\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "'app' only works on allow rules"));
+    snprintf(text, sizeof text, "%sdeny out tcp 10.0.1.0/24 any 80 app http limit 5/min\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "'limit' only works on allow rules"));
+    snprintf(text, sizeof text, "%sallow out icmp 10.0.1.0/24 any echo app other\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "'app' needs a tcp or udp rule"));
+    snprintf(text, sizeof text, "%sallow out any 10.0.1.0/24 any app http\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "'app' needs a tcp or udp rule"));
+    /* a misplaced limit is still reported as one */
+    snprintf(text, sizeof text, "%sallow out tcp 10.0.1.0/24 any limit 5/min 80 app http\n", in);
+    CHECK(parse_fails_with(text, "line 2:", "expected 'limit N/sec|min|hour'"));
+}
+
 int main(void)
 {
     RUN(test_parse_basic_and_comments);
@@ -582,5 +642,7 @@ int main(void)
     RUN(test_forward_errors);
     RUN(test_limit_clause);
     RUN(test_limit_errors);
+    RUN(test_app_clause);
+    RUN(test_app_errors);
     TEST_DONE();
 }

@@ -186,6 +186,33 @@ static bool parse_limit(const char *s, rule_t *r)
     return true;
 }
 
+#define APP_SYNTAX "expected 'app NAME[,NAME...]' (http, tls, dns, other) at the end of the rule"
+
+/* `http,tls,...` (the value after `app`) as a bitmask of 1u << app_t. Split
+ * by hand, as in parse_ports, so an empty item ("http,,tls") is an error. */
+static bool parse_apps(const char *s, uint8_t *out)
+{
+    static const struct { const char *name; app_t app; } names[] = {
+        { "http", APP_HTTP }, { "tls", APP_TLS }, { "dns", APP_DNS }, { "other", APP_OTHER },
+    };
+    uint8_t mask = 0;
+    const char *item = s;
+    for (;;) {
+        const char *comma = strchr(item, ',');
+        const size_t len = comma ? (size_t)(comma - item) : strlen(item);
+        size_t k = 0;
+        while (k < sizeof names / sizeof *names &&
+               (strlen(names[k].name) != len || strncmp(item, names[k].name, len) != 0))
+            k++;
+        if (k == sizeof names / sizeof *names) return false;
+        mask |= (uint8_t)(1u << names[k].app);
+        if (!comma) break;
+        item = comma + 1;
+    }
+    *out = mask;
+    return true;
+}
+
 /* `forward (tcp|udp) <ext-port> <a.b.c.d> <port>` (tok[0] is "forward"). */
 static bool parse_forward(char **tok, int n, int lineno, forward_t *f,
                           char *err, size_t errlen)
@@ -254,20 +281,37 @@ static int parse_line(char *line, int lineno, rule_t *r, forward_t *fw,
     else { set_err(err, errlen, lineno, "expected 'allow', 'deny' or 'reject'"); return -1; }
     i++;
 
-    /* An optional `limit N/PERIOD` is always the last two tokens. Take it off
-     * here, so the compact and the from/to forms below never see it. */
-    for (int k = i; k < n; k++) {
-        if (strcmp(tok[k], "limit") != 0) continue;
-        if (k != n - 2 || !parse_limit(tok[n - 1], r)) {
-            set_err(err, errlen, lineno, LIMIT_SYNTAX);
-            return -1;
-        }
-        if (r->action != ACT_ALLOW) {
-            set_err(err, errlen, lineno, "'limit' only works on allow rules");
-            return -1;
+    /* Optional `limit N/PERIOD` and `app NAME,...` clauses are always the
+     * last tokens, in either order. Take them off here, so the compact and
+     * the from/to forms below never see them. */
+    bool have_limit = false, have_app = false;
+    while (n - i >= 2) {
+        const char *kw = tok[n - 2];
+        if (strcmp(kw, "limit") == 0) {
+            if (have_limit || !parse_limit(tok[n - 1], r)) {
+                set_err(err, errlen, lineno, LIMIT_SYNTAX);
+                return -1;
+            }
+            have_limit = true;
+        } else if (strcmp(kw, "app") == 0) {
+            if (have_app || !parse_apps(tok[n - 1], &r->apps)) {
+                set_err(err, errlen, lineno, APP_SYNTAX);
+                return -1;
+            }
+            have_app = true;
+        } else {
+            break;
         }
         n -= 2;
-        break;
+    }
+    for (int k = i; k < n; k++) {         /* one left anywhere else is misplaced */
+        if (strcmp(tok[k], "limit") == 0) { set_err(err, errlen, lineno, LIMIT_SYNTAX); return -1; }
+        if (strcmp(tok[k], "app") == 0)   { set_err(err, errlen, lineno, APP_SYNTAX);   return -1; }
+    }
+    if ((have_limit || have_app) && r->action != ACT_ALLOW) {
+        set_err(err, errlen, lineno, have_limit ? "'limit' only works on allow rules"
+                                                : "'app' only works on allow rules");
+        return -1;
     }
 
     /* Keywords name the traffic direction, as in the spec: "out" = outbound
@@ -284,6 +328,12 @@ static int parse_line(char *line, int lineno, rule_t *r, forward_t *fw,
     else if (strcmp(tok[i], "any") == 0) r->proto = 0;
     else { set_err(err, errlen, lineno, "unknown protocol"); return -1; }
     i++;
+    /* Only TCP and UDP payloads are identified: an ICMP flow would never get
+     * a label, so `app` on it would silently mean nothing. */
+    if (have_app && r->proto != FW_PROTO_TCP && r->proto != FW_PROTO_UDP) {
+        set_err(err, errlen, lineno, "'app' needs a tcp or udp rule");
+        return -1;
+    }
 
     /* Anything other than `from` after the protocol is the compact form:
      *   <src> <dst> [<ports> | echo]      (as in the requirements spec) */
