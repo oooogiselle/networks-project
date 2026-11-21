@@ -26,7 +26,7 @@
 set -u
 cd "$(dirname "$0")/.."
 SESSION=tunwall-demo
-RULES=config/rules.example.conf
+RULES=/tmp/tunwall-demo-rules.conf   # a copy of config/rules.example.conf: a step tightens it live
 LOG=/tmp/tunwall-demo.log
 WEBDIR=/tmp/tunwall-demo-web
 UPSTREAM=${DEMO_UPSTREAM_DNS:-1.1.1.1}
@@ -57,7 +57,7 @@ kill_in_namespaces() {
 stop() {
     kill_in_namespaces
     sudo scripts/netns.sh down >/dev/null 2>&1
-    rm -rf "$WEBDIR"
+    rm -rf "$WEBDIR" "$RULES"
     echo "demo stopped: namespaces, host rules and helper processes are gone."
     # The tmux session goes LAST: when the demo ends by itself, this very function
     # is running inside one of its panes, and killing the session first would kill
@@ -83,6 +83,9 @@ setup() {
     in_ns_bg outside python3 -m http.server 443 --bind 10.0.2.3 --directory "$WEBDIR"
     in_ns_bg inside  python3 -m http.server 22   --bind 10.0.1.3 --directory "$WEBDIR"
     in_ns_bg inside  python3 -m http.server 3389 --bind 10.0.1.3 --directory "$WEBDIR"
+    # an echo server on an allowed web port, for the forged-RST and SSH-over-443 steps
+    in_ns_bg outside python3 tests/integration/inject.py server 10.0.2.2 443
+    cp config/rules.example.conf "$RULES"
     sleep 1
 }
 
@@ -95,7 +98,7 @@ auto)
     : > "$LOG"
     in_ns firewall build/tunwall -r "$RULES" > "$LOG" 2>&1 &
     sleep 1
-    DEMO_AUTO=1 DEMO_LOG="$LOG" scripts/demo_steps.sh
+    DEMO_AUTO=1 DEMO_LOG="$LOG" DEMO_RULES="$RULES" scripts/demo_steps.sh
     exit $?
     ;;
 
@@ -110,7 +113,7 @@ start)
     tmux new-session -d -s "$SESSION" -x "$cols" -y "$rows" \
         "sudo ip netns exec firewall build/tunwall -r $RULES 2>&1 | tee $LOG | awk -f scripts/demo_log.awk; read -rp 'firewall stopped - press Enter '"
     # bottom pane: the narrated steps
-    tmux split-window -v -p 62 -t "$SESSION" "DEMO_LOG=$LOG scripts/demo_steps.sh; scripts/demo.sh stop"
+    tmux split-window -v -p 62 -t "$SESSION" "DEMO_LOG=$LOG DEMO_RULES=$RULES scripts/demo_steps.sh; scripts/demo.sh stop"
     tmux set-option -t "$SESSION" pane-border-status top
     tmux select-pane -t "$SESSION:0.0" -T " FIREWALL LOG (live) "
     tmux select-pane -t "$SESSION:0.1" -T " DEMO - Enter runs the next step "

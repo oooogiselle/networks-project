@@ -7,13 +7,13 @@ scripts/demo.sh        # builds, sets up, opens the split-pane window
 ```
 
 You get a tmux window split in two. The **top pane** is the firewall's live log
-(colour-coded). The **bottom pane** walks through 13 steps and waits for
+(colour-coded). The **bottom pane** walks through 17 steps and waits for
 **Enter** before each one, so the presenter sets the pace. Every step runs the
 real command and *checks* the result and the matching log line, printing a tick
 or a cross. After the last step, press Enter once more and everything is torn
 down.
 
-Other commands: `scripts/demo.sh auto` runs all 13 steps unattended (no tmux)
+Other commands: `scripts/demo.sh auto` runs all 17 steps unattended (no tmux)
 and exits 0 only if every check passed, which is the quickest way to find out
 the demo is healthy before recording. `scripts/demo.sh stop` cleans up from any
 state, for example after closing the terminal in the middle.
@@ -22,12 +22,15 @@ state, for example after closing the terminal in the middle.
 
 - Use a **wide, full-screen terminal** (160 columns or more) and a large font.
   The log lines are about 100 characters.
-- Run `scripts/demo.sh auto` once. It should end with `Demo checks: 31 passed, 0 failed`.
+- Run `scripts/demo.sh auto` once. It should end with `Demo checks: 46 passed, 0 failed`.
 - The VM must be online (it fetches example.com and talks to 1.1.1.1).
 - Needs `sudo`, `tmux`, `nmap`, `hping3`, `dig`, `curl`. Nothing else.
 - **What it changes on the machine, temporarily:** a veth pair, `ip_forward`
   (restored), and three iptables rules tagged `tunwall-demo`. `scripts/demo.sh
   stop` removes exactly those and nothing else.
+- The firewall runs on a copy of `config/rules.example.conf` in
+  `/tmp/tunwall-demo-rules.conf`. Step 12 edits that copy, never the file in
+  the repo.
 
 ## The log colours (top pane)
 
@@ -37,8 +40,9 @@ state, for example after closing the terminal in the middle.
 | cyan | the application was identified (`FLOW APP ... app=tls`) |
 | **magenta** | the port disagrees with the payload (`mismatch(port suggests tls)`) |
 | red | a packet was dropped, with the reason (`why=no-rule(default-deny)`) |
+| **bold red** | a flow was cut because its payload is not an application its rule allows (`FLOW BLOCK ... app=other`) |
 | grey | a flow closed or expired |
-| **yellow** | a port scanner was blocked (`SCAN`) or let go (`UNBLOCK`), or the table was under SYN-flood pressure (`SYNFLOOD`) |
+| **yellow** | a port scanner was blocked (`SCAN`) or let go (`UNBLOCK`), the table was under SYN-flood pressure (`SYNFLOOD`), or a host went over a rate limit (`LIMIT`) |
 
 ## The steps, with a line to say for each
 
@@ -54,20 +58,24 @@ state, for example after closing the terminal in the middle.
 | 8 | Exposed service | green inbound `FLOW NEW` | "Port 22 has a rule allowing it in, so that one works and is tracked." |
 | 9 | Port scanner cut off | the **yellow** `SCAN` line, `Not shown: 100 filtered`, then `curl exit 28` | "Now 10.0.2.3 scans ports 1 to 100. After 20 dropped ports in 5 seconds the firewall calls it a scan and drops everything from that host for a minute. So port 22, open a moment ago, is never found, while 10.0.2.2 can still use it." |
 | 10 | SYN flood blocked | the **yellow** `SYNFLOOD` line, then a working `curl` from 10.0.2.2 | "Thousands of forged SYNs fill the table with half-open connections to lock real clients out. We fill it, stop, and 10.0.2.2 still connects: the firewall evicted the oldest half-open one to make room, like the Linux SYN backlog." |
-| 11 | Counters | the stats block in the top pane, including `scan: detected=1` and `evicted=` | "SIGUSR1 prints packets, drops by reason, the applications seen, scans detected, half-open connections evicted, and any log lines suppressed." |
-| 12 | Performance | the benchmark table | "About 1.3 Gbit/s versus 5 for the kernel on this VM, adding about 0.12 ms at the median. We are single-threaded, and the profile shows most of the time is the kernel forwarding each packet twice. Well above our 200 Mbit/s goal." |
-| 13 | Kill the firewall | ping fails, curl times out | "The tun devices are persistent, so with no program reading them the kernel drops everything. No firewall, no traffic." |
+| 11 | Forged RST | `connection: alive` twice, red `why=tcp-out-of-window` drops, then `connection: reset` | "An attacker outside forges a reset as if from the server. Blind, it can only guess the sequence number, and the firewall tracks each direction's window, so the guess is dropped and the connection lives. Forged data too. Only an attacker who sees the traffic can hit the exact number, and stopping that is TLS's job." |
+| 12 | Tighten the policy live | the two rules with `app http,tls` and `limit 5/min`, `rules reloaded` | "Two clauses at the end of two rules, then SIGHUP. No restart, and connections already open keep the rules they started under." |
+| 13 | SSH over port 443 | `result: cut`, the **bold red** `FLOW BLOCK ... app=other`, then example.com still loads | "Tunnelling SSH through 443 is the classic way around a firewall. The port is open, but the rule now says HTTP or TLS only, so after three packets that are neither, the flow is cut. Real HTTPS on the same port still works." |
+| 14 | SSH rate limit | `curl exit codes: 0 0 0 0 0 28`, the **yellow** `LIMIT` line | "A password guesser opens connection after connection. Each outside host gets 5 at once, then one every 12 s; the 6th just times out. Other hosts have their own budget." |
+| 15 | Counters | the stats block in the top pane, including `scan: detected=1`, `evicted=`, `drop[tcp-out-of-window]`, `drop[rate-limited]` and `blocked=` | "SIGUSR1 prints packets, drops by reason, the applications seen and flows blocked, scans detected, half-open connections evicted, and any log lines suppressed." |
+| 16 | Performance | the benchmark table | "About 1.3 Gbit/s versus 5 for the kernel on this VM, adding about 0.12 ms at the median. We are single-threaded, and the profile shows most of the time is the kernel forwarding each packet twice. Well above our 200 Mbit/s goal." |
+| 17 | Kill the firewall | ping fails, curl times out | "The tun devices are persistent, so with no program reading them the kernel drops everything. No firewall, no traffic." |
 
 ## Suggested split of the ~10 minutes
 
 | Time | Part | Presenter |
 |---|---|---|
 | 0:00 to 1:30 | The problem, the design, the diagram | Eva |
-| 1:30 to 3:30 | How a packet is decided: parse, anti-spoofing, fast and slow path, TCP state machine, caps | Eva |
-| 3:30 to 6:30 | The live demo, steps 1 to 10 | Giselle |
-| 6:30 to 8:00 | The tun loop, persistent devices that fail closed, application identification | Giselle |
-| 8:00 to 9:15 | Testing and performance, steps 10 and 11 | Giselle |
-| 9:15 to 10:00 | Changes from the plan and what is not done, step 12 to close | Both |
+| 1:30 to 3:00 | How a packet is decided: parse, anti-spoofing, fast and slow path, TCP state machine, caps | Eva |
+| 3:00 to 6:00 | The live demo, steps 1 to 10 | Giselle |
+| 6:00 to 7:30 | Attacks on a live policy: forged RST, live reload, SSH over 443, rate limit, steps 11 to 14 | Giselle |
+| 7:30 to 9:15 | The tun loop, testing and performance, steps 15 and 16 | Giselle |
+| 9:15 to 10:00 | Changes from the plan and what is not done, step 17 to close | Both |
 
 Swap the roles if you like: each of you is graded on your own portion.
 
@@ -80,10 +88,12 @@ Swap the roles if you like: each of you is graded on your own portion.
 - **Application identification** was added (HTTP, TLS, DNS by payload).
 - **Port-scan detection** was added: 20 dropped ports in 5 s blocks the host for 60 s.
 - **SYN-flood relief** was added: the oldest half-open connection is evicted under table pressure.
+- **Source NAT** (`-n`), **port forwarding** (`forward`) and **reload without a restart** (SIGHUP) were added.
+- **Per-rule rate limits** (`limit 5/min`), **TCP sequence-number checks** (forged RSTs and data are dropped) and **app-aware rules** (`app http,tls`) were added.
 - The tun devices are **persistent** and the routing **fails closed**.
 - Two review rounds, fuzzing, mutation testing and sanitizers found and fixed about 40 issues.
 
-Not done: source NAT inside the firewall, TCP sequence validation, full SYN-flood protection (no SYN cookies), and a larger-scale architecture such as multi-threading.
+Not done: full SYN-flood protection (no SYN cookies), and a larger-scale architecture such as multi-threading.
 
 ## If something goes wrong
 
