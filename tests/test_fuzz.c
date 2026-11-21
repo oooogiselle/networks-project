@@ -71,7 +71,8 @@ static uint16_t pick_port(void) { return PORTS[below(sizeof PORTS / sizeof *PORT
 
 static const char *POLICY =
     "inside 10.0.1.0/24\n"
-    "allow out tcp 10.0.1.0/24 any 80,443\n"
+    "allow out tcp 10.0.1.0/24 any 80 app http\n"   /* cut once not HTTP (phase E) */
+    "allow out tcp 10.0.1.0/24 any 443\n"
     "allow out udp 10.0.1.0/24 any 53\n"
     "allow out icmp 10.0.1.0/24 any echo\n"
     "deny  out udp any any 53\n"
@@ -484,6 +485,7 @@ static void check_coverage(void)
     CHECK(drop_seen[DROP_BAD_SRC] > 0);
     CHECK(drop_seen[DROP_ICMP_ERR] > 0);
     CHECK(drop_seen[DROP_TCP_WINDOW] > 0);
+    CHECK(drop_seen[DROP_APP_BLOCKED] > 0);
     (void)related_seen;
 }
 

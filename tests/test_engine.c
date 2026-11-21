@@ -2066,6 +2066,144 @@ static void test_tcp_window_undo_restores_the_windows(void)
     engine_destroy(e);
 }
 
+/* ---- app-aware rules ------------------------------------------------------ */
+
+#define APP_RULES "allow out tcp 10.0.0.0/24 any 80,443 app http\n" \
+                  "allow out udp 10.0.0.0/24 any 53 app dns\n" \
+                  "allow out tcp 10.0.0.0/24 any 8080\n"
+
+static const char SSH_BANNER[] = "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n";
+static const char SSH_KEX[] = "\x00\x00\x05\xdc\x0a\x14 key exchange init";
+
+static void test_app_rule_lets_http_through_on_any_allowed_port(void)
+{
+    engine_t *e = make_engine(APP_RULES);
+    drop_reason_t w;
+    uint64_t t = handshake(e, 50000, 80, SEC);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50000, SERVER, 80, FW_PROTO_TCP, HTTP_GET, strlen(HTTP_GET), t, &w) == VERDICT_ALLOW);
+    CHECK(send_data(e, DIR_OUT, SERVER, 80, CLIENT_A, 50000, FW_PROTO_TCP, HTTP_OK, strlen(HTTP_OK), t + 1, &w) == VERDICT_ALLOW);
+    CHECK(send_data(e, DIR_OUT, SERVER, 80, CLIENT_A, 50000, FW_PROTO_TCP, SSH_KEX, 20, t + 2, &w) == VERDICT_ALLOW);
+    /* HTTP on 443 is HTTP: the payload decides, not the port */
+    t = handshake(e, 50001, 443, t + 3);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50001, SERVER, 443, FW_PROTO_TCP, HTTP_GET, strlen(HTTP_GET), t, &w) == VERDICT_ALLOW);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_HTTP] == 2 && st.apps_blocked == 0);
+    engine_destroy(e);
+}
+
+static void test_app_rule_cuts_tls_at_the_client_hello(void)
+{
+    engine_t *e = make_engine(APP_RULES);
+    drop_reason_t w;
+    uint8_t hello[64];
+    const size_t hn = tls_client_hello(hello);
+    uint64_t t = handshake(e, 50002, 443, SEC);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50002, SERVER, 443, FW_PROTO_TCP, hello, hn, t, &w) == VERDICT_DROP);
+    CHECK(w == DROP_APP_BLOCKED);
+    /* nothing more, either way */
+    CHECK(send_data(e, DIR_OUT, SERVER, 443, CLIENT_A, 50002, FW_PROTO_TCP, HTTP_OK, strlen(HTTP_OK), t + 1, &w) == VERDICT_DROP);
+    CHECK(w == DROP_APP_BLOCKED);
+    CHECK(send_pkt(e, mk_tcp(CLIENT_A, 50002, SERVER, 443, TCP_ACK), DIR_IN, t + 2, &w) == VERDICT_DROP);
+    CHECK(w == DROP_APP_BLOCKED);
+    /* the same TLS on a rule without `app` is only labelled */
+    t = handshake(e, 50003, 8080, t + 3);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50003, SERVER, 8080, FW_PROTO_TCP, hello, hn, t, &w) == VERDICT_ALLOW);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.apps_blocked == 1 && st.drops[DROP_APP_BLOCKED] == 3);
+    CHECK(st.app_flows[APP_TLS] == 2 && st.scans_detected == 0);
+    engine_destroy(e);
+}
+
+static void test_app_rule_cuts_unrecognized_traffic_after_three_packets(void)
+{
+    /* An SSH session on port 80: nothing in it is HTTP. */
+    engine_t *e = make_engine(APP_RULES);
+    drop_reason_t w;
+    uint64_t t = handshake(e, 50004, 80, SEC);
+    CHECK(send_data(e, DIR_OUT, SERVER, 80, CLIENT_A, 50004, FW_PROTO_TCP, SSH_BANNER, strlen(SSH_BANNER), t, &w) == VERDICT_ALLOW);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50004, SERVER, 80, FW_PROTO_TCP, SSH_BANNER, strlen(SSH_BANNER), t + 1, &w) == VERDICT_ALLOW);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50004, SERVER, 80, FW_PROTO_TCP, SSH_KEX, 20, t + 2, &w) == VERDICT_DROP);
+    CHECK(w == DROP_APP_BLOCKED);
+    CHECK(send_data(e, DIR_OUT, SERVER, 80, CLIENT_A, 50004, FW_PROTO_TCP, SSH_KEX, 20, t + 3, &w) == VERDICT_DROP);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.app_flows[APP_OTHER] == 1 && st.apps_blocked == 1);
+    engine_destroy(e);
+}
+
+static void test_app_rule_checks_syn_data_and_udp(void)
+{
+    engine_t *e = make_engine(APP_RULES);
+    drop_reason_t w;
+    uint8_t hello[64], b[256], q[64];
+    /* a ClientHello carried in the SYN (TCP Fast Open) is cut at once */
+    const size_t hn = tls_client_hello(hello);
+    size_t n = pb_tcp(b, sizeof b, NULL, CLIENT_A, 50005, SERVER, 443, TCP_SYN, hello, hn);
+    CHECK(send_pkt(e, parsed(b, n), DIR_IN, SEC, &w) == VERDICT_DROP && w == DROP_APP_BLOCKED);
+    CHECK(send_pkt(e, parsed(b, n), DIR_IN, SEC + 1, &w) == VERDICT_DROP && w == DROP_APP_BLOCKED);
+    /* real DNS passes */
+    const size_t qn = dns_query(q);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 6000, SERVER, 53, FW_PROTO_UDP, q, qn, 2 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_data(e, DIR_OUT, SERVER, 53, CLIENT_A, 6000, FW_PROTO_UDP, q, qn, 2 * SEC, &w) == VERDICT_ALLOW);
+    /* anything else on 53 is cut once it is called "other" (third datagram) */
+    for (int k = 0; k < 2; k++)
+        CHECK(send_data(e, DIR_IN, CLIENT_A, 6001, SERVER, 53, FW_PROTO_UDP, "tunnel", 6, 3 * SEC, &w) == VERDICT_ALLOW);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 6001, SERVER, 53, FW_PROTO_UDP, "tunnel", 6, 3 * SEC, &w) == VERDICT_DROP);
+    CHECK(w == DROP_APP_BLOCKED);
+    engine_destroy(e);
+}
+
+static void test_a_blocked_flow_is_freed_and_gets_no_icmp_errors(void)
+{
+    engine_t *e = make_engine(APP_RULES);
+    drop_reason_t w;
+    uint8_t hello[64], b[256], err[256];
+    const size_t hn = tls_client_hello(hello);
+    uint64_t t = handshake(e, 50006, 443, SEC);
+    const size_t n = pb_tcp(b, sizeof b, NULL, CLIENT_A, 50006, SERVER, 443, TCP_ACK | TCP_PSH, hello, hn);
+    CHECK(send_pkt(e, parsed(b, n), DIR_IN, t, &w) == VERDICT_DROP);
+    /* a router's error about the cut connection is not let in */
+    CHECK(send_pkt(e, icmp_error(err, IP(192,0,2,1), CLIENT_A, 3, b), DIR_OUT, t + 1, &w) == VERDICT_DROP);
+    CHECK(w == DROP_ICMP_ERR);
+    /* the slot is freed 10 s later, however much is still sent */
+    for (int k = 1; k < 10; k++)
+        send_pkt(e, mk_tcp(CLIENT_A, 50006, SERVER, 443, TCP_ACK), DIR_IN, t + (uint64_t)k * SEC, &w);
+    engine_stats_t st;
+    engine_get_stats(e, &st);
+    CHECK(st.flows_active == 1);
+    CHECK(engine_expire(e, t + 10 * SEC) == 1);
+    engine_destroy(e);
+}
+
+static void test_app_block_log_line_and_reload(void)
+{
+    char *buf = NULL;
+    size_t len = 0;
+    FILE *out = open_memstream(&buf, &len);
+    fw_log_set(out, LOG_INFO);
+    engine_t *e = make_engine(APP_RULES);
+    drop_reason_t w;
+    uint8_t hello[64];
+    const size_t hn = tls_client_hello(hello);
+    uint64_t t = handshake(e, 50007, 443, SEC);
+    /* a reload: the open connection keeps the rule it was admitted by */
+    CHECK(engine_replace_rules(e, rules_of("allow out tcp 10.0.0.0/24 any 443\n")));
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50007, SERVER, 443, FW_PROTO_TCP, hello, hn, t, &w) == VERDICT_DROP);
+    CHECK(w == DROP_APP_BLOCKED);
+    /* a new one follows the new rule, which has no `app` */
+    t = handshake(e, 50008, 443, t + 1);
+    CHECK(send_data(e, DIR_IN, CLIENT_A, 50008, SERVER, 443, FW_PROTO_TCP, hello, hn, t, &w) == VERDICT_ALLOW);
+    fflush(out);
+    CHECK(strstr(buf, "FLOW BLOCK  tcp 10.0.0.2:50007 -> 93.184.216.34:443 state=ESTABLISHED rule=2 app=tls") != NULL);
+    CHECK(strstr(buf, "FLOW BLOCK  tcp 10.0.0.2:50008") == NULL);
+    fw_log_set(NULL, LOG_OFF);
+    fclose(out);
+    free(buf);
+    engine_destroy(e);
+}
+
 
 /* ---- SYN-flood relief ---------------------------------------------------- */
 
@@ -2297,5 +2435,11 @@ int main(void)
     RUN(test_tcp_window_blocks_blind_rst_and_injection);
     RUN(test_tcp_window_checks_are_off_by_default);
     RUN(test_tcp_window_undo_restores_the_windows);
+    RUN(test_app_rule_lets_http_through_on_any_allowed_port);
+    RUN(test_app_rule_cuts_tls_at_the_client_hello);
+    RUN(test_app_rule_cuts_unrecognized_traffic_after_three_packets);
+    RUN(test_app_rule_checks_syn_data_and_udp);
+    RUN(test_a_blocked_flow_is_freed_and_gets_no_icmp_errors);
+    RUN(test_app_block_log_line_and_reload);
     TEST_DONE();
 }

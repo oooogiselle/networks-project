@@ -783,6 +783,48 @@ RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
 [ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
 start_fw || bad "tunwall did not restart with the normal rules"
 
+echo "== app-aware rules (app http, app dns)"
+# Web ports allow only HTTP, whatever the port: HTTP on 443 passes, a real TLS
+# handshake on 443 is cut at its ClientHello, and an SSH-like session through
+# the echo server on 10.0.2.3:7000 (still running from the section above) is
+# cut once three of its packets turned out not to be HTTP.
+ssh_like(){ ip netns exec inside python3 -c '
+import socket
+s = socket.create_connection(("10.0.2.3", 7000), 3)
+s.sendall(b"SSH-2.0-OpenSSH_9.6\r\n")
+assert s.recv(64) == b"SSH-2.0-OpenSSH_9.6\r\n"   # the echo is its second packet
+s.sendall(b"\x00\x00\x05\xdc\x0a\x14 key exchange init")
+try: print("echoed" if s.recv(64) else "closed")
+except socket.timeout: print("cut")'; }
+[ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+printf '%s\n' 'inside 10.0.1.0/24' \
+    'allow out tcp 10.0.1.0/24 any 80,443 app http' \
+    'allow out udp 10.0.1.0/24 10.0.2.2 53 app dns' \
+    'allow out tcp 10.0.1.0/24 10.0.2.3 7000 app http' > "$LOGDIR/app.conf"
+RULES=$LOGDIR/app.conf; TUNWALL_ARGS=$SAVED_ARGS
+if start_fw; then
+    check "HTTP on port 80 passes 'app http'"            pass inside curl -sf --max-time 5 -o "$LOGDIR/got-app.bin" http://10.0.2.2/index.bin
+    check "and the page is byte for byte the same"       pass same_sha256 "$SRV/index.bin" "$LOGDIR/got-app.bin"
+    check "HTTP on port 443 passes too (payload, not port)" pass inside curl -s --max-time 5 -o /dev/null http://10.0.2.3:443/
+    if [ -f "$LOGDIR/tls.crt" ]; then
+        check "TLS on port 443 is cut by 'app http'"     fail inside curl -sk --max-time 5 -o /dev/null https://10.0.2.2:443/
+        logged "the TLS connection is reported as blocked" \
+            'FLOW BLOCK +tcp 10\.0\.1\.[0-9]+:[0-9]+ -> 10\.0\.2\.2:443 .*rule=2 app=tls'
+    fi
+    check "a real DNS query passes 'app dns'"            pass dns_query
+    expect "an SSH-like session on an 'app http' port is cut" cut ssh_like
+    logged "the SSH-like connection is reported as blocked" \
+        'FLOW BLOCK +tcp 10\.0\.1\.[0-9]+:[0-9]+ -> 10\.0\.2\.3:7000 .*rule=4 app=other'
+    dump_stats
+    logged "stats: packets of blocked flows are counted" '^drop\[app-not-allowed\]=[1-9][0-9]*'
+    logged "stats: blocked flows are counted"            '^apps: .* blocked=[1-9][0-9]*'
+else
+    bad "tunwall did not start with the app rules"; cat "$LOGDIR/tunwall.log"
+fi
+RULES=$SAVED_RULES; TUNWALL_ARGS=$SAVED_ARGS
+[ -n "$FW_PID" ] && { kill "$FW_PID"; wait "$FW_PID" 2>/dev/null; FW_PID=""; }
+start_fw || bad "tunwall did not restart with the normal rules"
+
 echo "== killing the firewall stops all traffic"
 kill "$FW_PID"; wait "$FW_PID"; rc=$?; FW_PID=""
 [ "$rc" = 0 ] && ok "tunwall exits 0 on SIGTERM" || bad "tunwall exited $rc on SIGTERM"

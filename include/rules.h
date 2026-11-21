@@ -73,6 +73,17 @@
  * connections over that are dropped silently. Connections already open are
  * never affected.
  *
+ * App-aware rules (allow rules on tcp or udp only), also at the end:
+ *
+ *   ... app NAME[,NAME...]              NAME = http | tls | dns | other
+ *       e.g.  allow out tcp 10.0.1.0/24 any 80,443 app http
+ *             allow out udp 10.0.1.0/24 10.0.2.2 53 app dns limit 20/sec
+ *
+ * The rule still matches on the first packet as usual; the connection is then
+ * cut as soon as its payload is identified (appid.h) as anything else, e.g.
+ * TLS or an SSH banner on an `app http` port. `limit` and `app` may both be
+ * given, in either order, as the last tokens of the rule.
+ *
  * `reject` refuses a new connection like `deny`, but also tells the sender
  * at once instead of letting it time out: a TCP RST for TCP, ICMP port
  * unreachable for UDP, ICMP administratively prohibited for an echo request
@@ -122,6 +133,7 @@ typedef struct rule {
     uint8_t      proto;          /* 0 = any */
     addr_match_t src, dst;
     port_set_t   sport, dport;
+    uint8_t      apps;           /* `app ...`: bit (1u << app_t) per allowed app; 0 = any */
     uint32_t     limit_n;        /* `limit N/...`: connections per period; 0 = no limit */
     uint64_t     limit_period_ns;
     int          line;           /* source line number, for logs */

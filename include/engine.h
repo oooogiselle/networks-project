@@ -124,6 +124,7 @@ typedef enum {
     DROP_SCAN_BLOCKED,     /* source is blocked after a port scan (scandetect.h) */
     DROP_RATE_LIMITED,     /* new flow over its rule's `limit N/...` for this source */
     DROP_TCP_WINDOW,       /* TCP segment outside the connection's sequence window */
+    DROP_APP_BLOCKED,      /* flow's payload is an app its rule's `app` list excludes */
     DROP_REASON_COUNT
 } drop_reason_t;
 
@@ -148,6 +149,7 @@ typedef struct engine_stats {
      * never change a verdict. */
     uint64_t app_flows[APP_COUNT];
     uint64_t app_mismatch;
+    uint64_t apps_blocked;         /* flows cut because their rule's `app` list excludes them */
     uint64_t rejects_limited;      /* reject matches dropped silently: over REJECTS_PER_SEC */
     uint64_t scans_detected;       /* outside hosts that crossed the scan threshold */
     uint64_t hosts_blocked;        /* blocked for scanning right now */

@@ -16,8 +16,8 @@ CS 60 final project (Giselle Wu, Eva Tate). See `requirements-spec.pdf`.
 | `include/appid.h`, `src/appid.c` | Application identification: recognizes HTTP, TLS and DNS from the payload (pure functions) | Eva |
 | `src/flowtable.c` | 5-tuple hash table, expiry | Eva; half-open eviction queue for SYN-flood relief: Giselle |
 | `src/tcpstate.c` | TCP state machine, per-state timeouts | Eva |
-| `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines and `limit`: Giselle |
-| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection, SYN-flood, rate-limit and TCP sequence-check hooks: Giselle |
+| `src/rules.c` | Rule file parser + first-match evaluation | Eva; `forward` lines, `limit` and `app`: Giselle |
+| `src/engine.c` | Fast path / slow path decision logic | Eva; swapping the rules on reload, the scan-detection, SYN-flood, rate-limit, TCP sequence-check and app-rule hooks: Giselle |
 | `src/log.c` | Per-flow logs, counters | Eva |
 | `include/scandetect.h`, `src/scandetect.c` | Port-scan detection: distinct ports per outside host in a sliding window, temporary blocking (`tunwall -s`) | Giselle |
 | `include/ratelimit.h`, `src/ratelimit.c` | Per-rule connection rate limits (`limit 5/min` on an allow rule): a token bucket (GCRA) per rule and source address in a fixed table | Giselle |
@@ -369,6 +369,46 @@ The last line is the hole this closes. The client's own TCP ignores the
 out-of-window RST (RFC 5961), but a firewall that believed it would mark the
 flow closed and drop everything after it.
 
+### App-aware rules (`app`)
+
+A port rule says nothing about what runs on the port: `allow out tcp ... 80`
+lets an SSH tunnel, TLS or any covert channel out, as long as it uses port 80.
+An `allow` rule can therefore also name the applications it allows, using the
+labels from application identification (see "How a packet is decided"):
+
+```
+allow out tcp 10.0.1.0/24 any 80,443 app http      # only HTTP, on either port
+allow out udp 10.0.1.0/24 10.0.2.2 53 app dns      # only real DNS to the resolver
+```
+
+- **Syntax.** `app NAME[,NAME...]` with NAME `http`, `tls`, `dns` or `other`,
+  at the end of an `allow` rule for `tcp` or `udp` (ICMP is never labelled, so
+  `app` on an `icmp` or `any` rule is a syntax error). It may be combined with
+  `limit`, in either order.
+- **When a flow is cut.** The rule is chosen on the first packet as always.
+  The flow's payload is then identified as usual: the first recognized
+  protocol, or `other` after three data packets that are none of them. If
+  that label is not in the rule's list, the flow is **blocked**:
+  - the packet that decided it is dropped, and so is every later packet in
+    either direction (`why=app-not-allowed`);
+  - ICMP errors about the flow are refused;
+  - one line is logged:
+    `FLOW BLOCK  tcp 10.0.1.2:41000 -> 10.0.2.2:443 state=ESTABLISHED rule=2 app=tls ...`;
+  - its slot is freed 10 s later, instead of after the usual idle timeout.
+
+  A TLS connection is cut at its ClientHello and never completes its
+  handshake. Something unrecognized, such as an SSH banner, gets at most two
+  data packets through before it is called `other`, which is inherent to
+  identifying by payload. Data carried in a SYN (TCP Fast Open) or a UDP
+  flow's first datagram is checked as it creates the flow.
+- **A condition on the rule, not a new match.** A blocked flow does not fall
+  through to a later rule: rules are matched once, on the first packet, as in
+  the rest of the firewall. A reload (SIGHUP) leaves open connections under
+  the rule that admitted them.
+- **Counters.** `drop[app-not-allowed]=` counts the packets and
+  `apps: ... blocked=` the flows. These drops never count toward scan
+  detection. Rules without `app` only label, exactly as before.
+
 ## Tests
 
 Line coverage of the library (everything in `src/` except `main.c` and
@@ -388,7 +428,7 @@ DNS, ping, blocked inbound traffic that must be silently dropped rather than
 refused, reject rules, nmap SYN/ACK/FIN/NULL/Xmas scans, application
 identification, exact log lines, flow expiry, TTL and path MTU, source NAT,
 port forwarding, SYN-flood relief, connection rate limits, forged TCP
-RSTs and data, SIGHUP reload,
+RSTs and data, app-aware rules, SIGHUP reload,
 kill-the-firewall). They
 need root, `nmap`, `hping3` and `python3`.
 - **Source NAT.** The section restarts `tunwall` with `-n 10.0.2.254` and removes
@@ -417,6 +457,15 @@ need root, `nmap`, `hping3` and `python3`.
   numbers are dropped (`why=tcp-out-of-window`) and the connection keeps
   echoing. An RST with the right sequence number still resets it. With `-L`
   the same blind RST cuts the connection at the firewall.
+- **App-aware rules.** With `app http` on ports 80 and 443:
+  - curl over HTTP on port 80 works, and the SHA-256 matches;
+  - HTTP on port 443 works too;
+  - a real TLS handshake on 443 is cut, with a `FLOW BLOCK ... app=tls` line;
+  - an SSH-like session through an `app http` port is cut after its third
+    packet.
+
+  Real DNS passes `app dns`, and the counters show the blocked packets and
+  flows.
 
 CI sets `REQUIRE_INTEGRATION=1` so a missing piece fails instead of skipping. Set
 `SKIP_SLOW=1` to skip the 40 s expiry and 75 s half-close tests (and the 12 s
@@ -616,11 +665,12 @@ On macOS use `make CC=clang asan`: Homebrew gcc has no ASan runtime.
    mismatched=`. When the port suggests a different protocol than the payload
    (53 dns, 80 http, 443 tls) the `FLOW APP` line adds
    `mismatch(port suggests tls)` and the mismatch counter goes up, so HTTP on
-   443, TLS on 80, or junk on 53 stands out. **It only labels: it runs after the
-   verdict and never changes it** (it does not allow or drop anything), and a
-   packet with no payload, or ICMP, is never labelled. Rules cannot match on the
-   application, so, for example, TLS on 8080 is allowed or refused by the port
-   rules exactly as before.
+   443, TLS on 80, or junk on 53 stands out. A packet with no payload, or ICMP,
+   is never labelled. **For a rule without `app`, it only labels**: it runs
+   after the verdict and never changes it, so TLS on 8080 is allowed or refused
+   by the port rules exactly as before. For a rule with an `app` list, a flow
+   whose label is not on the list is cut from that packet on
+   (`app-not-allowed`, see [App-aware rules](#app-aware-rules-app)).
 4. Caller forwards on `VERDICT_ALLOW`, discards on `VERDICT_DROP`, answers on
    `VERDICT_REJECT` (see [Reject rules](#reject-rules)), and calls
    `engine_expire()` about once a second.
@@ -644,7 +694,9 @@ the address anti-spoofing check, and without it the firewall refuses to start.
 from the outside (exposed services). With source NAT on, `forward tcp|udp <port> <ip> <port>`
 publishes an inside service on the NAT address (see Port forwarding above).
 An `allow` rule may end in `limit N/sec|min|hour` to cap the new connections
-each source opens through it (see Per-rule connection rate limits above).
+each source opens through it (see Per-rule connection rate limits above), and
+in `app http|tls|dns|other[,...]` to allow only those applications (see
+App-aware rules above).
 
 ### Reject rules
 
@@ -677,8 +729,9 @@ refused" in milliseconds instead of hanging. The shipped config rejects telnet
 
 ## Not done yet / ideas
 
-- Application identification only labels flows: rules cannot match on
-  the application, and a flow is never dropped for what it carries
+- App-aware rules only know the four labels application identification
+  gives (`http`, `tls`, `dns`, `other`); there is no SSH, QUIC or TLS-SNI
+  matching
 - Endpoint-independent NAT mappings (full-cone, for peer-to-peer). Source NAT
   is symmetric: one mapping per connection. Port forwarding has no hairpinning
 - Multi-threaded or offload-aware packet handling (the profile shows the remaining
